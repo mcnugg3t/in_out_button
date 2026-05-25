@@ -7,7 +7,7 @@ Lightweight Windows C# applet for syncing git repositories at the start and end 
 - Lets you select folders to scan for git repositories.
 - Recursively discovers repos under those folders.
 - `Sign in` runs `git pull` for every discovered repo.
-- `Sign out` runs `git add -A`, commits staged changes with `MM-DD-YY updates`, then runs `git push`.
+- `Sign out` rescans first, then runs `git add -A`, commits staged changes with `MM-DD-YY updates`, and runs `git push`.
 - Logs full git output, and flags failed commands and commands that time out.
 - Provides selected-repo actions for quick fixes:
   - `Pull selected`

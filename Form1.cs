@@ -245,6 +245,11 @@ public sealed class Form1 : Form
 
     private async Task RunForAllReposAsync(GitWorkflow workflow)
     {
+        if (workflow == GitWorkflow.SignOut)
+        {
+            await ScanReposAsync();
+        }
+
         if (_repos.Count == 0)
         {
             AppendLog("No repositories found. Add folders to scan, then scan again.");

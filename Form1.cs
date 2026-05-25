@@ -271,7 +271,7 @@ public sealed class Form1 : Form
                 ? await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds)
                 : await GitRunner.SignOutAsync(repo.Path, GitTimeoutSeconds);
 
-            repo.Status = result.Success ? "OK" : result.TimedOut ? "Timed out" : "Failed";
+            repo.Status = StatusFromResult(result);
             repo.LastMessage = result.Summary;
             _repoBinding.ResetBindings(false);
 
@@ -305,7 +305,7 @@ public sealed class Form1 : Form
         _repoBinding.ResetBindings(false);
 
         var result = await action(repo.Path, GitTimeoutSeconds);
-        repo.Status = result.Success ? "OK" : result.TimedOut ? "Timed out" : "Failed";
+        repo.Status = StatusFromResult(result);
         repo.LastMessage = result.Summary;
         _repoBinding.ResetBindings(false);
         AppendGitResult(repo, result);
@@ -375,6 +375,16 @@ public sealed class Form1 : Form
         {
             _logBox.AppendText(result.FullOutput.TrimEnd() + Environment.NewLine);
         }
+    }
+
+    private static string StatusFromResult(GitWorkflowResult result)
+    {
+        if (result.Success)
+        {
+            return result.HasWarnings ? "OK with warnings" : "OK";
+        }
+
+        return result.TimedOut ? "Timed out" : "Failed";
     }
 
     private RepoRow? GetSelectedRepo()
@@ -521,9 +531,10 @@ public static class GitRunner
         var add = await RunGitAsync(repoPath, timeoutSeconds, "add", "-A");
         outputs.Add(add.Summary);
         fullOutput.Add(add.FullOutput);
+        var hasWarnings = add.HasWarnings;
         if (!add.Success)
         {
-            return add with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+            return add with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
         }
 
         var hasStagedChanges = await RunGitAsync(repoPath, timeoutSeconds, "diff", "--cached", "--quiet");
@@ -533,16 +544,18 @@ public static class GitRunner
             var commit = await RunGitAsync(repoPath, timeoutSeconds, "commit", "-m", message);
             outputs.Add(commit.Summary);
             fullOutput.Add(commit.FullOutput);
+            hasWarnings |= commit.HasWarnings;
             if (!commit.Success)
             {
-                return commit with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+                return commit with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
             }
         }
         else if (!hasStagedChanges.Success)
         {
             outputs.Add(hasStagedChanges.Summary);
             fullOutput.Add(hasStagedChanges.FullOutput);
-            return hasStagedChanges with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+            hasWarnings |= hasStagedChanges.HasWarnings;
+            return hasStagedChanges with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
         }
         else
         {
@@ -552,7 +565,8 @@ public static class GitRunner
         var push = await RunGitAsync(repoPath, timeoutSeconds, "push");
         outputs.Add(push.Summary);
         fullOutput.Add(push.FullOutput);
-        return push with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+        hasWarnings |= push.HasWarnings;
+        return push with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
     }
 
     public static async Task<GitWorkflowResult> CommitSyncAsync(string repoPath, int timeoutSeconds)
@@ -563,9 +577,10 @@ public static class GitRunner
         var add = await RunGitAsync(repoPath, timeoutSeconds, "add", "-A");
         outputs.Add(add.Summary);
         fullOutput.Add(add.FullOutput);
+        var hasWarnings = add.HasWarnings;
         if (!add.Success)
         {
-            return add with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+            return add with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
         }
 
         var hasStagedChanges = await RunGitAsync(repoPath, timeoutSeconds, "diff", "--cached", "--quiet");
@@ -575,16 +590,18 @@ public static class GitRunner
             var commit = await RunGitAsync(repoPath, timeoutSeconds, "commit", "-m", message);
             outputs.Add(commit.Summary);
             fullOutput.Add(commit.FullOutput);
+            hasWarnings |= commit.HasWarnings;
             if (!commit.Success)
             {
-                return commit with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+                return commit with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
             }
         }
         else if (!hasStagedChanges.Success)
         {
             outputs.Add(hasStagedChanges.Summary);
             fullOutput.Add(hasStagedChanges.FullOutput);
-            return hasStagedChanges with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+            hasWarnings |= hasStagedChanges.HasWarnings;
+            return hasStagedChanges with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
         }
         else
         {
@@ -594,15 +611,17 @@ public static class GitRunner
         var pull = await RunGitAsync(repoPath, timeoutSeconds, "pull", "--rebase");
         outputs.Add(pull.Summary);
         fullOutput.Add(pull.FullOutput);
+        hasWarnings |= pull.HasWarnings;
         if (!pull.Success)
         {
-            return pull with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+            return pull with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
         }
 
         var push = await RunGitAsync(repoPath, timeoutSeconds, "push");
         outputs.Add(push.Summary);
         fullOutput.Add(push.FullOutput);
-        return push with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+        hasWarnings |= push.HasWarnings;
+        return push with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
     }
 
     public static async Task<GitWorkflowResult> DiscardAndPullAsync(string repoPath, int timeoutSeconds)
@@ -613,15 +632,17 @@ public static class GitRunner
         var reset = await RunGitAsync(repoPath, timeoutSeconds, "reset", "--hard", "HEAD");
         outputs.Add(reset.Summary);
         fullOutput.Add(reset.FullOutput);
+        var hasWarnings = reset.HasWarnings;
         if (!reset.Success)
         {
-            return reset with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+            return reset with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
         }
 
         var pull = await SignInAsync(repoPath, timeoutSeconds);
         outputs.Add(pull.Summary);
         fullOutput.Add(pull.FullOutput);
-        return pull with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput) };
+        hasWarnings |= pull.HasWarnings;
+        return pull with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
     }
 
     private static async Task<GitWorkflowResult> RunGitAsync(string workingDirectory, int timeoutSeconds, params string[] arguments)
@@ -678,7 +699,7 @@ public static class GitRunner
                     // Process may already have exited.
                 }
 
-                return new GitWorkflowResult(false, true, -1, $"{commandLabel}: timed out after {timeoutSeconds}s", $"{commandLabel}: timed out after {timeoutSeconds}s");
+                return new GitWorkflowResult(false, true, -1, $"{commandLabel}: timed out after {timeoutSeconds}s", $"{commandLabel}: timed out after {timeoutSeconds}s", false);
             }
 
             var text = output.ToString().Trim();
@@ -690,11 +711,11 @@ public static class GitRunner
                 ? $"{commandLabel}: exited {process.ExitCode}"
                 : $"{commandLabel}:{Environment.NewLine}{text}";
 
-            return new GitWorkflowResult(process.ExitCode == 0, false, process.ExitCode, summary, fullOutput);
+            return new GitWorkflowResult(process.ExitCode == 0, false, process.ExitCode, summary, fullOutput, ContainsWarning(text));
         }
         catch (Exception ex)
         {
-            return new GitWorkflowResult(false, false, -1, $"{commandLabel}: {ex.Message}", $"{commandLabel}: {ex}");
+            return new GitWorkflowResult(false, false, -1, $"{commandLabel}: {ex.Message}", $"{commandLabel}: {ex}", false);
         }
     }
 
@@ -712,9 +733,15 @@ public static class GitRunner
     {
         return text.Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault() ?? text;
     }
+
+    private static bool ContainsWarning(string text)
+    {
+        return text.Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries)
+            .Any(line => line.TrimStart().StartsWith("warning:", StringComparison.OrdinalIgnoreCase));
+    }
 }
 
-public sealed record GitWorkflowResult(bool Success, bool TimedOut, int ExitCode, string Summary, string FullOutput);
+public sealed record GitWorkflowResult(bool Success, bool TimedOut, int ExitCode, string Summary, string FullOutput, bool HasWarnings);
 
 public static class StartupManager
 {

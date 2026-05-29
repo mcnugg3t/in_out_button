@@ -22,14 +22,22 @@ public sealed class Form1 : Form
     private Button _pullSelectedButton = null!;
     private Button _commitSyncSelectedButton = null!;
     private Button _discardPullSelectedButton = null!;
+    private Button _pullDataSelectedButton = null!;
+    private Button _pushDataSelectedButton = null!;
     private Button _scanButton = null!;
     private Button _addRootButton = null!;
     private Button _removeRootButton = null!;
+    private Button _testRemoteButton = null!;
     private CheckBox _startupCheckBox = null!;
     private DataGridView _repoGrid = null!;
     private ListBox _rootList = null!;
     private TextBox _logBox = null!;
+    private TextBox _rcloneRemoteBox = null!;
+    private TextBox _rcloneRootBox = null!;
+    private NumericUpDown _rcloneTimeoutBox = null!;
     private ToolStripStatusLabel _statusLabel = null!;
+
+    private bool _rcloneAvailable;
 
     public Form1()
     {
@@ -41,6 +49,7 @@ public sealed class Form1 : Form
         {
             _startupCheckBox.Checked = StartupManager.IsEnabled();
             _rootBinding.ResetBindings(false);
+            _ = InitRcloneAsync();
             _ = ScanReposAsync();
         };
     }
@@ -61,7 +70,7 @@ public sealed class Form1 : Form
         };
         main.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 280));
         main.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        main.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+        main.RowStyles.Add(new RowStyle(SizeType.Absolute, 124));
         main.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         main.RowStyles.Add(new RowStyle(SizeType.Absolute, 150));
         Controls.Add(main);
@@ -71,18 +80,23 @@ public sealed class Form1 : Form
         _pullSelectedButton = new Button { Text = "Pull selected", Dock = DockStyle.Fill, Height = 32 };
         _commitSyncSelectedButton = new Button { Text = "Commit + sync selected", Dock = DockStyle.Fill, Height = 32 };
         _discardPullSelectedButton = new Button { Text = "Discard + pull selected", Dock = DockStyle.Fill, Height = 32 };
+        _pullDataSelectedButton = new Button { Text = "Pull data (selected)", Dock = DockStyle.Fill, Height = 32 };
+        _pushDataSelectedButton = new Button { Text = "Push data (selected)", Dock = DockStyle.Fill, Height = 32 };
         _signInButton.Click += async (_, _) => await RunForAllReposAsync(GitWorkflow.SignIn);
         _signOutButton.Click += async (_, _) => await RunForAllReposAsync(GitWorkflow.SignOut);
         _pullSelectedButton.Click += async (_, _) => await RunForSelectedRepoAsync("pull", GitRunner.SignInAsync);
         _commitSyncSelectedButton.Click += async (_, _) => await RunForSelectedRepoAsync("commit + sync", GitRunner.CommitSyncAsync);
         _discardPullSelectedButton.Click += async (_, _) => await DiscardAndPullSelectedRepoAsync();
+        _pullDataSelectedButton.Click += async (_, _) => await RunRcloneForSelectedRepoAsync(pull: true);
+        _pushDataSelectedButton.Click += async (_, _) => await RunRcloneForSelectedRepoAsync(pull: false);
 
-        var topButtons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 2 };
-        topButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        topButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        topButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        topButtons.RowStyles.Add(new RowStyle(SizeType.Percent, 55));
-        topButtons.RowStyles.Add(new RowStyle(SizeType.Percent, 45));
+        var topButtons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 3 };
+        topButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        topButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        topButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
+        topButtons.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));
+        topButtons.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+        topButtons.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
         topButtons.Controls.Add(_signInButton, 0, 0);
         topButtons.SetColumnSpan(_signInButton, 1);
         topButtons.Controls.Add(_signOutButton, 1, 0);
@@ -90,6 +104,8 @@ public sealed class Form1 : Form
         topButtons.Controls.Add(_pullSelectedButton, 0, 1);
         topButtons.Controls.Add(_commitSyncSelectedButton, 1, 1);
         topButtons.Controls.Add(_discardPullSelectedButton, 2, 1);
+        topButtons.Controls.Add(_pullDataSelectedButton, 0, 2);
+        topButtons.Controls.Add(_pushDataSelectedButton, 1, 2);
         main.Controls.Add(topButtons, 1, 0);
 
         _startupCheckBox = new CheckBox
@@ -105,11 +121,16 @@ public sealed class Form1 : Form
         };
         main.Controls.Add(_startupCheckBox, 0, 0);
 
+        var leftPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        leftPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        leftPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 196));
+        main.Controls.Add(leftPanel, 0, 1);
+
         var rootsPanel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3 };
         rootsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
         rootsPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         rootsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
-        main.Controls.Add(rootsPanel, 0, 1);
+        leftPanel.Controls.Add(rootsPanel, 0, 0);
 
         rootsPanel.Controls.Add(new Label
         {
@@ -137,6 +158,8 @@ public sealed class Form1 : Form
         rootButtons.Controls.Add(_removeRootButton, 1, 0);
         rootButtons.Controls.Add(_scanButton, 2, 0);
         rootsPanel.Controls.Add(rootButtons, 0, 2);
+
+        leftPanel.Controls.Add(BuildRcloneGroup(), 0, 1);
 
         _repoBinding.DataSource = _repos;
         _repoGrid = new DataGridView
@@ -173,6 +196,61 @@ public sealed class Form1 : Form
         _statusLabel = new ToolStripStatusLabel("Ready");
         status.Items.Add(_statusLabel);
         Controls.Add(status);
+    }
+
+    private GroupBox BuildRcloneGroup()
+    {
+        var group = new GroupBox { Text = "Rclone (dataset sync)", Dock = DockStyle.Fill, Padding = new Padding(8, 4, 8, 8) };
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4 };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
+        group.Controls.Add(layout);
+
+        layout.Controls.Add(new Label { Text = "Remote", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
+        _rcloneRemoteBox = new TextBox { Dock = DockStyle.Fill, Text = _settings.RcloneRemote ?? "", PlaceholderText = "e.g. onedrive" };
+        _rcloneRemoteBox.TextChanged += (_, _) =>
+        {
+            _settings.RcloneRemote = string.IsNullOrWhiteSpace(_rcloneRemoteBox.Text) ? null : _rcloneRemoteBox.Text.Trim();
+            SettingsStore.Save(_settings);
+        };
+        layout.Controls.Add(_rcloneRemoteBox, 1, 0);
+
+        layout.Controls.Add(new Label { Text = "Remote root", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 1);
+        _rcloneRootBox = new TextBox { Dock = DockStyle.Fill, Text = _settings.RcloneRemoteRoot };
+        _rcloneRootBox.TextChanged += (_, _) =>
+        {
+            _settings.RcloneRemoteRoot = string.IsNullOrWhiteSpace(_rcloneRootBox.Text) ? "InOutButtonData" : _rcloneRootBox.Text.Trim();
+            SettingsStore.Save(_settings);
+        };
+        layout.Controls.Add(_rcloneRootBox, 1, 1);
+
+        layout.Controls.Add(new Label { Text = "Timeout (s)", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft }, 0, 2);
+        _rcloneTimeoutBox = new NumericUpDown
+        {
+            Dock = DockStyle.Left,
+            Width = 90,
+            Minimum = 30,
+            Maximum = 86400,
+            Increment = 60,
+            Value = Math.Clamp(_settings.RcloneTimeoutSeconds, 30, 86400),
+        };
+        _rcloneTimeoutBox.ValueChanged += (_, _) =>
+        {
+            _settings.RcloneTimeoutSeconds = (int)_rcloneTimeoutBox.Value;
+            SettingsStore.Save(_settings);
+        };
+        layout.Controls.Add(_rcloneTimeoutBox, 1, 2);
+
+        _testRemoteButton = new Button { Text = "Test remote", Dock = DockStyle.Fill };
+        _testRemoteButton.Click += async (_, _) => await TestRemoteAsync();
+        layout.Controls.Add(_testRemoteButton, 1, 3);
+
+        return group;
     }
 
     private async Task AddRootAsync()
@@ -231,6 +309,7 @@ public sealed class Form1 : Form
             _repoBinding.ResetBindings(false);
             AppendLog($"Scan complete. Found {_repos.Count} repos.");
             _statusLabel.Text = $"Found {_repos.Count} repos";
+            WarnUnignoredDataFolders();
         }
         catch (Exception ex)
         {
@@ -267,9 +346,25 @@ public sealed class Form1 : Form
             repo.LastMessage = "";
             _repoBinding.ResetBindings(false);
 
-            var result = workflow == GitWorkflow.SignIn
-                ? await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds)
-                : await GitRunner.SignOutAsync(repo.Path, GitTimeoutSeconds);
+            GitWorkflowResult result;
+            if (workflow == GitWorkflow.SignIn)
+            {
+                // Sign in: git pull, then pull dataset folders (remote -> local).
+                result = await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds);
+                var dataPull = await TryRcloneForRepoAsync(repo, pull: true);
+                if (dataPull is not null)
+                {
+                    result = MergeResults(result, dataPull);
+                }
+            }
+            else
+            {
+                // Sign out: push dataset folders (local -> remote) first so the commit can
+                // reference them, then commit/push git. Both run independently of each other.
+                var dataPush = await TryRcloneForRepoAsync(repo, pull: false);
+                var git = await GitRunner.SignOutAsync(repo.Path, GitTimeoutSeconds);
+                result = dataPush is null ? git : MergeResults(dataPush, git);
+            }
 
             repo.Status = StatusFromResult(result);
             repo.LastMessage = result.Summary;
@@ -339,6 +434,140 @@ public sealed class Form1 : Form
         await RunForSelectedRepoAsync("discard + pull", GitRunner.DiscardAndPullAsync);
     }
 
+    private async Task InitRcloneAsync()
+    {
+        var version = await RcloneRunner.ProbeAsync(15);
+        _rcloneAvailable = version is not null;
+        AppendLog(_rcloneAvailable
+            ? $"rclone detected: {version}"
+            : "rclone not found on PATH — dataset sync disabled.");
+        ApplyRcloneAvailability();
+    }
+
+    private async Task TestRemoteAsync()
+    {
+        var remote = _rcloneRemoteBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(remote))
+        {
+            AppendLog("Enter a remote name before testing.");
+            return;
+        }
+
+        SetBusy(true, $"Testing remote {remote}...");
+        var result = await RcloneRunner.TestRemoteAsync(remote, _settings.RcloneTimeoutSeconds);
+        AppendLog($"Test remote {remote}: {(result.Success ? "OK" : "FAILED")} - {result.Summary}");
+        if (!string.IsNullOrWhiteSpace(result.FullOutput))
+        {
+            _logBox.AppendText(result.FullOutput.TrimEnd() + Environment.NewLine);
+        }
+
+        _statusLabel.Text = result.Success ? "Remote OK" : "Remote test failed";
+        SetBusy(false);
+    }
+
+    private async Task RunRcloneForSelectedRepoAsync(bool pull)
+    {
+        var repo = GetSelectedRepo();
+        if (repo is null)
+        {
+            AppendLog("Select a repository first.");
+            return;
+        }
+
+        if (!_rcloneAvailable)
+        {
+            AppendLog("rclone is not available; dataset sync disabled.");
+            return;
+        }
+
+        if (!RcloneSyncConfig.TryLoad(repo.Path, out var config, AppendLog) || config is null)
+        {
+            AppendLog($"{repo.Name}: no {RcloneSyncConfig.FileName} found.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(config.Remote ?? _settings.RcloneRemote))
+        {
+            AppendLog($"{repo.Name}: no rclone remote configured.");
+            return;
+        }
+
+        var label = pull ? "pull data" : "push data";
+        SetBusy(true, $"Running {label} for {repo.Name}...");
+        repo.Status = "Running";
+        repo.LastMessage = "";
+        _repoBinding.ResetBindings(false);
+
+        var result = pull
+            ? await RcloneRunner.RclonePullAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds)
+            : await RcloneRunner.RclonePushAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds);
+
+        repo.Status = StatusFromResult(result);
+        repo.LastMessage = result.Summary;
+        _repoBinding.ResetBindings(false);
+        AppendGitResult(repo, result);
+
+        _statusLabel.Text = result.Success ? $"{label} complete" : $"{label} failed";
+        SetBusy(false);
+    }
+
+    /// <summary>
+    /// Runs the rclone side of a sign in (pull) / sign out (push) for one repo, or returns
+    /// <c>null</c> when the repo has no usable rclone config so the caller skips it silently.
+    /// </summary>
+    private async Task<GitWorkflowResult?> TryRcloneForRepoAsync(RepoRow repo, bool pull)
+    {
+        if (!_rcloneAvailable)
+        {
+            return null;
+        }
+
+        if (!RcloneSyncConfig.TryLoad(repo.Path, out var config, AppendLog) || config is null)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(config.Remote ?? _settings.RcloneRemote))
+        {
+            AppendLog($"{repo.Name}: {RcloneSyncConfig.FileName} present but no remote configured; skipping data sync.");
+            return null;
+        }
+
+        return pull
+            ? await RcloneRunner.RclonePullAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds)
+            : await RcloneRunner.RclonePushAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds);
+    }
+
+    private static GitWorkflowResult MergeResults(GitWorkflowResult first, GitWorkflowResult second)
+    {
+        return new GitWorkflowResult(
+            first.Success && second.Success,
+            first.TimedOut || second.TimedOut,
+            !first.Success ? first.ExitCode : second.ExitCode,
+            ProcessRunner.JoinSummaries([first.Summary, second.Summary]),
+            ProcessRunner.JoinFullOutput([first.FullOutput, second.FullOutput]),
+            first.HasWarnings || second.HasWarnings);
+    }
+
+    private void WarnUnignoredDataFolders()
+    {
+        foreach (var repo in _repos)
+        {
+            if (!RcloneSyncConfig.TryLoad(repo.Path, out var config, AppendLog) || config is null)
+            {
+                continue;
+            }
+
+            foreach (var folder in config.Folders)
+            {
+                if (!RcloneRunner.IsGitignored(repo.Path, folder.Local))
+                {
+                    AppendLog($"Warning: {repo.Name}/{folder.Local} is set for rclone sync but is not in .gitignore.");
+                }
+            }
+        }
+    }
+
     private void SetBusy(bool busy, string? status = null)
     {
         _signInButton.Enabled = !busy;
@@ -350,11 +579,21 @@ public sealed class Form1 : Form
         _addRootButton.Enabled = !busy;
         _removeRootButton.Enabled = !busy;
         _startupCheckBox.Enabled = !busy;
+        ApplyRcloneAvailability();
 
         if (!string.IsNullOrWhiteSpace(status))
         {
             _statusLabel.Text = status;
         }
+    }
+
+    private void ApplyRcloneAvailability()
+    {
+        // _scanButton.Enabled is false while a workflow is busy; reuse it as the idle signal.
+        var idle = _scanButton.Enabled;
+        _testRemoteButton.Enabled = _rcloneAvailable && idle;
+        _pullDataSelectedButton.Enabled = _rcloneAvailable && idle;
+        _pushDataSelectedButton.Enabled = _rcloneAvailable && idle;
     }
 
     private void SaveSettings()
@@ -416,6 +655,10 @@ public enum GitWorkflow
 public sealed class AppSettings
 {
     public List<string> SearchRoots { get; set; } = [];
+
+    public string? RcloneRemote { get; set; }              // e.g. "onedrive"
+    public string RcloneRemoteRoot { get; set; } = "InOutButtonData";
+    public int RcloneTimeoutSeconds { get; set; } = 600;    // datasets can be slow
 }
 
 public static class SettingsStore
@@ -645,100 +888,14 @@ public static class GitRunner
         return pull with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
     }
 
-    private static async Task<GitWorkflowResult> RunGitAsync(string workingDirectory, int timeoutSeconds, params string[] arguments)
+    private static Task<GitWorkflowResult> RunGitAsync(string workingDirectory, int timeoutSeconds, params string[] arguments)
     {
-        var commandLabel = $"git {string.Join(' ', arguments)}";
-        using var process = new Process();
-        process.StartInfo = new ProcessStartInfo
-        {
-            FileName = "git",
-            WorkingDirectory = workingDirectory,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-
-        foreach (var argument in arguments)
-        {
-            process.StartInfo.ArgumentList.Add(argument);
-        }
-
-        var output = new StringBuilder();
-        process.OutputDataReceived += (_, args) =>
-        {
-            if (args.Data is not null)
-            {
-                output.AppendLine(args.Data);
-            }
-        };
-        process.ErrorDataReceived += (_, args) =>
-        {
-            if (args.Data is not null)
-            {
-                output.AppendLine(args.Data);
-            }
-        };
-
-        try
-        {
-            process.Start();
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            var waitTask = process.WaitForExitAsync();
-            var completed = await Task.WhenAny(waitTask, Task.Delay(TimeSpan.FromSeconds(timeoutSeconds)));
-            if (completed != waitTask)
-            {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-                catch
-                {
-                    // Process may already have exited.
-                }
-
-                return new GitWorkflowResult(false, true, -1, $"{commandLabel}: timed out after {timeoutSeconds}s", $"{commandLabel}: timed out after {timeoutSeconds}s", false);
-            }
-
-            var text = output.ToString().Trim();
-            var detail = string.IsNullOrWhiteSpace(text)
-                ? $"exited {process.ExitCode}"
-                : LastMeaningfulLine(text);
-            var summary = $"{commandLabel}: {detail}";
-            var fullOutput = string.IsNullOrWhiteSpace(text)
-                ? $"{commandLabel}: exited {process.ExitCode}"
-                : $"{commandLabel}:{Environment.NewLine}{text}";
-
-            return new GitWorkflowResult(process.ExitCode == 0, false, process.ExitCode, summary, fullOutput, ContainsWarning(text));
-        }
-        catch (Exception ex)
-        {
-            return new GitWorkflowResult(false, false, -1, $"{commandLabel}: {ex.Message}", $"{commandLabel}: {ex}", false);
-        }
+        return ProcessRunner.RunAsync("git", workingDirectory, timeoutSeconds, arguments);
     }
 
-    private static string JoinSummaries(IEnumerable<string> summaries)
-    {
-        return string.Join(" | ", summaries.Where(summary => !string.IsNullOrWhiteSpace(summary)));
-    }
+    private static string JoinSummaries(IEnumerable<string> summaries) => ProcessRunner.JoinSummaries(summaries);
 
-    private static string JoinFullOutput(IEnumerable<string> outputs)
-    {
-        return string.Join($"{Environment.NewLine}{Environment.NewLine}", outputs.Where(output => !string.IsNullOrWhiteSpace(output)));
-    }
-
-    private static string LastMeaningfulLine(string text)
-    {
-        return text.Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault() ?? text;
-    }
-
-    private static bool ContainsWarning(string text)
-    {
-        return text.Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries)
-            .Any(line => line.TrimStart().StartsWith("warning:", StringComparison.OrdinalIgnoreCase));
-    }
+    private static string JoinFullOutput(IEnumerable<string> outputs) => ProcessRunner.JoinFullOutput(outputs);
 }
 
 public sealed record GitWorkflowResult(bool Success, bool TimedOut, int ExitCode, string Summary, string FullOutput, bool HasWarnings);

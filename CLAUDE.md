@@ -30,7 +30,8 @@ Minimal viable shape, placed at the repo root and committed:
       "remote": "InOutButtonData/<repo-name>/data/raw"
     },
     {
-      "local": "datasets"
+      "local": "datasets",
+      "exclude": ["raw_dump.parquet", "*.tmp"]
     }
   ]
 }
@@ -39,6 +40,7 @@ Minimal viable shape, placed at the repo root and committed:
 - `remote` (optional): overrides the global remote name from settings. Usually omitted.
 - `folders[].local`: path relative to the repo root. Must match an entry in `.gitignore` (the app should warn but not block if it isn't ignored).
 - `folders[].remote` (optional): explicit remote subpath. If omitted, derived as `<settings.RemoteRoot>/<repo-name>/<local>`.
+- `folders[].exclude` (optional): list of rclone `--exclude` patterns (relative to the folder root), passed to `rclone copy` on both pull and push. Use it to keep a regenerable raw file local while still syncing the rest of the folder.
 
 ## New settings (additions to `AppSettings`)
 
@@ -59,7 +61,7 @@ Each step should compile and run on its own, in this order:
 2. **Add `RcloneSyncConfig` model + loader.** New types alongside `RepoRow`:
    ```csharp
    public sealed record RcloneSyncConfig(string? Remote, IReadOnlyList<RcloneFolder> Folders);
-   public sealed record RcloneFolder(string Local, string? Remote);
+   public sealed record RcloneFolder(string Local, string? Remote, IReadOnlyList<string> Exclude);
    ```
    Static `RcloneSyncConfig.TryLoad(string repoPath, out RcloneSyncConfig? config)` reads `.rclone-sync.json` and returns `false` if missing. Validation errors (malformed JSON, empty `folders`) should log a warning and return `false` — never throw out to the UI thread.
 
@@ -94,6 +96,6 @@ Each step should compile and run on its own, in this order:
 
 ## Out of scope, but worth noting
 
-- Future: per-folder `--exclude` rules in `.rclone-sync.json`.
+- ~~Future: per-folder `--exclude` rules in `.rclone-sync.json`.~~ **Done** — `folders[].exclude` (2026-06-01).
 - Future: a "dry run" button (`rclone copy --dry-run`) to preview before signing out.
 - Future: optional manifest file (`.rclone-sync.lock`) listing the SHAs of synced files, committed to git, so code reviewers can see what data state goes with which commit.

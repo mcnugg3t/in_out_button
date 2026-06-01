@@ -48,7 +48,10 @@ public sealed record RcloneSyncConfig(string? Remote, IReadOnlyList<RcloneFolder
                     return false;
                 }
 
-                folders.Add(new RcloneFolder(folder.Local.Trim(), string.IsNullOrWhiteSpace(folder.Remote) ? null : folder.Remote.Trim()));
+                var excludes = folder.Exclude is { Count: > 0 }
+                    ? folder.Exclude.Where(e => !string.IsNullOrWhiteSpace(e)).Select(e => e.Trim()).ToList()
+                    : (IReadOnlyList<string>)Array.Empty<string>();
+                folders.Add(new RcloneFolder(folder.Local.Trim(), string.IsNullOrWhiteSpace(folder.Remote) ? null : folder.Remote.Trim(), excludes));
             }
 
             config = new RcloneSyncConfig(string.IsNullOrWhiteSpace(dto.Remote) ? null : dto.Remote.Trim(), folders);
@@ -71,10 +74,13 @@ public sealed record RcloneSyncConfig(string? Remote, IReadOnlyList<RcloneFolder
     {
         public string? Local { get; set; }
         public string? Remote { get; set; }
+        public List<string>? Exclude { get; set; }
     }
 }
 
-public sealed record RcloneFolder(string Local, string? Remote);
+/// <param name="Exclude">rclone <c>--exclude</c> patterns (relative to the folder root), e.g. a
+/// raw dataset file that should stay local. Applied to both pull and push.</param>
+public sealed record RcloneFolder(string Local, string? Remote, IReadOnlyList<string> Exclude);
 
 public static class RcloneRunner
 {
@@ -132,14 +138,14 @@ public static class RcloneRunner
             var source = pull ? remoteSpec : localPath;
             var destination = pull ? localPath : remoteSpec;
 
-            var result = await ProcessRunner.RunAsync(
-                "rclone",
-                repoPath,
-                timeoutSeconds,
-                "copy",
-                source,
-                destination,
-                "--create-empty-src-dirs");
+            var args = new List<string> { "copy", source, destination, "--create-empty-src-dirs" };
+            foreach (var pattern in folder.Exclude)
+            {
+                args.Add("--exclude");
+                args.Add(pattern);
+            }
+
+            var result = await ProcessRunner.RunAsync("rclone", repoPath, timeoutSeconds, args.ToArray());
 
             outputs.Add(result.Summary);
             fullOutput.Add(result.FullOutput);

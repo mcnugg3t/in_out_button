@@ -84,6 +84,75 @@ public static class ProcessRunner
         }
     }
 
+    /// <summary>
+    /// raw exit code + combined output with no summary formatting — for cheap probes
+    /// (last-commit time, dirty check) where the caller parses the output itself.
+    /// timeout or launch failure returns (-1, "").
+    /// </summary>
+    public static async Task<(int ExitCode, string Output)> CaptureAsync(string fileName, string workingDirectory, int timeoutSeconds, params string[] arguments)
+    {
+        using var process = new Process();
+        process.StartInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
+
+        var output = new StringBuilder();
+        process.OutputDataReceived += (_, args) =>
+        {
+            if (args.Data is not null)
+            {
+                output.AppendLine(args.Data);
+            }
+        };
+        process.ErrorDataReceived += (_, args) =>
+        {
+            if (args.Data is not null)
+            {
+                output.AppendLine(args.Data);
+            }
+        };
+
+        try
+        {
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+
+            var waitTask = process.WaitForExitAsync();
+            var completed = await Task.WhenAny(waitTask, Task.Delay(TimeSpan.FromSeconds(timeoutSeconds)));
+            if (completed != waitTask)
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // process may already have exited
+                }
+
+                return (-1, "");
+            }
+
+            return (process.ExitCode, output.ToString());
+        }
+        catch
+        {
+            return (-1, "");
+        }
+    }
+
     public static string JoinSummaries(IEnumerable<string> summaries)
     {
         return string.Join(" | ", summaries.Where(summary => !string.IsNullOrWhiteSpace(summary)));

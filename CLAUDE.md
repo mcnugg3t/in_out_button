@@ -48,9 +48,17 @@ Minimal viable shape, placed at the repo root and committed:
 public string? RcloneRemote { get; set; }         // e.g. "onedrive"
 public string RcloneRemoteRoot { get; set; } = "InOutButtonData";
 public int RcloneTimeoutSeconds { get; set; } = 600;  // datasets can be slow
+public int RcloneActiveDays { get; set; } = 14;       // commit-recency window for "active"
+public bool RcloneActiveOnly { get; set; } = true;    // gate batch data sync to active repos
 ```
 
 Surface these in the UI as a small "Rclone" group: remote name textbox, remote-root textbox, and a "Test remote" button that runs `rclone lsd <remote>:` and reports success/failure to the log.
+
+## Active-repo gating (added 2026-08-24)
+
+Batch data sync (Sign in / Sign out / the all-repos data buttons) only runs rclone for *active* repos: last commit within `RcloneActiveDays` **or** a dirty working tree (`git status --porcelain` non-empty). The dirty check is load-bearing at sign-out — the day's work isn't committed yet when the data push runs, so commit age alone would skip exactly the repo being worked on. `RcloneActiveOnly = false` disables the gate; the per-repo Pull data / Push data buttons ignore it (explicit selection). Activity is probed during scan (`git log -1 --format=%ct` + `git status --porcelain`, bounded parallelism) and shown in the grid ("Last commit" column, `●` dirty marker, Data column `sync`/`idle`).
+
+Batch actions are also separable: "Git pull (all)" is git-only, "Pull/Push data (all)" are rclone-only; Sign in / Sign out remain the combined flows.
 
 ## Implementation steps
 

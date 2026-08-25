@@ -93,13 +93,15 @@ public static class RcloneRunner
     /// <summary>Checks once that rclone is on PATH; returns its version line, or null if missing.</summary>
     public static async Task<string?> ProbeAsync(int timeoutSeconds)
     {
-        var result = await ProcessRunner.RunAsync("rclone", Environment.CurrentDirectory, timeoutSeconds, "--version");
-        if (!result.Success)
+        // CaptureAsync gives raw output; RunAsync prepends a "rclone --version:" label line
+        // that itself starts with "rclone" and used to win the FirstOrDefault below.
+        var (exitCode, output) = await ProcessRunner.CaptureAsync("rclone", Environment.CurrentDirectory, timeoutSeconds, "--version");
+        if (exitCode != 0)
         {
             return null;
         }
 
-        return result.FullOutput
+        return output
             .Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .FirstOrDefault(line => line.StartsWith("rclone", StringComparison.OrdinalIgnoreCase)) ?? "rclone (version unknown)";
     }

@@ -4,15 +4,19 @@ Lightweight Windows C# applet for syncing git repositories at the start and end 
 
 ## What it does
 
-- Lets you select folders to scan for git repositories.
-- Recursively discovers repos under those folders.
-- `Sign in` runs `git pull` for every discovered repo.
-- `Sign out` rescans first, then runs `git add -A`, commits staged changes with `MM-DD-YY updates`, and runs `git push`.
+- Lets you select folders to scan for git repositories (shown in the "Folders to scan" list; a scan runs automatically at startup).
+- Recursively discovers repos under those folders and shows each repo's last commit age, uncommitted-changes marker (`●`), and data-sync state (`sync`/`idle`).
+- `Sign in` runs `git pull` for every discovered repo, then pulls dataset folders for *active* repos (see below).
+- `Sign out` rescans first, pushes dataset folders for active repos, then runs `git add -A`, commits staged changes with `MM-DD-YY updates`, and runs `git push`.
+- Git-only / data-only batch buttons keep the two processes separable:
+  - `Git pull (all)` — `git pull` everywhere, no rclone.
+  - `Pull data (all)` / `Push data (all)` — rclone only, honoring the active-repo gate.
 - Logs full git output, flags failed commands and commands that time out, and marks successful commands that emitted Git warnings as `OK with warnings`.
 - Provides selected-repo actions for quick fixes:
-  - `Pull selected`
-  - `Commit + sync selected`, which commits local changes, runs `git pull --rebase`, then pushes
-  - `Discard + pull selected`, which runs `git reset --hard HEAD` and then pulls
+  - `Pull`
+  - `Commit + sync`, which commits local changes, runs `git pull --rebase`, then pushes
+  - `Discard + pull`, which runs `git reset --hard HEAD` and then pulls
+  - `Pull data` / `Push data`, which sync the selected repo's dataset folders regardless of activity
 - Can register itself to launch on Windows startup.
 - Optionally syncs gitignored dataset folders to a cloud remote via [rclone](https://rclone.org), so large data follows you across machines alongside the code (see below).
 
@@ -26,13 +30,17 @@ Repos can opt in to syncing large, gitignored folders (datasets, model weights, 
 - **Sign out** pushes dataset folders up to the remote (`rclone copy` local → remote) *first*, then runs the git commit/push.
 - Per-repo `Pull data` / `Push data` buttons run the same operations on the selected repo without touching git.
 
+### Active-repo gate
+
+Datasets only need to move while a project is being worked on, so batch data sync (Sign in / Sign out / the `(all)` data buttons) skips repos that aren't *active*. A repo is active when its last commit is within the `Active (days)` window (default 14) **or** its working tree has uncommitted changes — the second condition is what catches a repo being worked on right now at sign-out, before its commit exists. Skipped repos show `idle` in the grid's Data column and get a log line explaining why; uncheck "Only sync data for active repos" to sync every opted-in repo regardless. The per-repo `Pull data` / `Push data` buttons always run, since selecting a repo is already an explicit choice.
+
 It always uses `rclone copy`, never `sync`/`bisync` — so it adds and overwrites but never deletes at the destination. This is safe across machines (a missing local folder just gets pulled, never propagated as a deletion), at the cost of no automatic conflict resolution if the same file is edited on two machines before syncing.
 
 ### Setup
 
 1. Install [rclone](https://rclone.org/downloads/) and put it on `PATH`. The app probes `rclone --version` at startup; if it isn't found, the rclone controls are disabled. (After installing, a fresh login/reboot is needed so launched processes inherit the updated `PATH`.)
 2. Configure a remote once per machine with `rclone config` (e.g. a Google Drive remote named `gdrive`). The OAuth token rclone stores is local to each machine and does not travel with your repos.
-3. In the app's **Rclone** group, set the remote name, the remote root path (where everything is stored under the remote), and a timeout. Use **Test remote** (`rclone lsd <remote>:`) to confirm auth is healthy.
+3. In the app's **Data sync (rclone)** group, set the remote name, the remote root path (where everything is stored under the remote), a timeout, and the active-repo window. Use **Test remote** (`rclone lsd <remote>:`) to confirm auth is healthy.
 
 ### Per-repo opt-in: `.rclone-sync.json`
 

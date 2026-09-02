@@ -517,10 +517,11 @@ public sealed class Form1 : Form
         _repoGrid.AlternatingRowsDefaultCellStyle = new DataGridViewCellStyle { BackColor = Theme.AltRow };
         _repoGrid.RowTemplate.Height = 28;
 
+        // git and data get their own status cells so one side failing doesn't hide the other
         _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Repository", DataPropertyName = nameof(RepoRow.Name), Width = 175 });
         _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Last commit", DataPropertyName = nameof(RepoRow.LastCommitDisplay), Width = 95 });
-        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Data", DataPropertyName = nameof(RepoRow.DataDisplay), Width = 55 });
-        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Status", DataPropertyName = nameof(RepoRow.Status), Width = 120 });
+        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Git", DataPropertyName = nameof(RepoRow.GitStatus), Width = 110 });
+        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Data", DataPropertyName = nameof(RepoRow.DataDisplay), Width = 110 });
         _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Last message", DataPropertyName = nameof(RepoRow.LastMessage), AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill });
 
         _repoGrid.CellFormatting += (_, e) =>
@@ -537,17 +538,13 @@ public sealed class Form1 : Form
                     e.CellStyle.ForeColor = repo.IsActive ? Theme.Text : Theme.SubtleText;
                     break;
                 case 2:
-                    e.CellStyle.ForeColor = repo.WillSync ? Theme.Ok : Theme.SubtleText;
+                    e.CellStyle.ForeColor = StatusColor(repo.GitStatus);
                     break;
                 case 3:
-                    e.CellStyle.ForeColor = repo.Status switch
-                    {
-                        "OK" => Theme.Ok,
-                        "OK with warnings" => Theme.Warn,
-                        "Failed" or "Timed out" => Theme.Fail,
-                        "Running" => Theme.Accent,
-                        _ => Theme.SubtleText,
-                    };
+                    // pending "sync" is green like before; blue is reserved for "Running"
+                    e.CellStyle.ForeColor = repo.DataStatus is { } dataStatus
+                        ? StatusColor(dataStatus)
+                        : repo.WillSync ? Theme.Ok : Theme.SubtleText;
                     break;
             }
         };
@@ -564,9 +561,12 @@ public sealed class Form1 : Form
             {
                 0 => repo.Path,
                 1 => repo.HasChanges ? "● = uncommitted changes" : "",
-                2 => repo.HasDataSync
-                    ? (repo.WillSync ? "dataset folders will sync" : "data sync configured, repo inactive — skipped")
-                    : "",
+                2 => repo.GitMessage,
+                3 => repo.DataMessage.Length > 0
+                    ? repo.DataMessage
+                    : repo.HasDataSync
+                        ? (repo.WillSync ? "dataset folders will sync" : "data sync configured, repo inactive — skipped")
+                        : "",
                 4 => repo.LastMessage,
                 _ => "",
             };
@@ -647,7 +647,6 @@ public sealed class Form1 : Form
             {
                 AppendLog(warning);
             }
-            WarnUnignoredDataFolders();
 
             var dataCount = _repos.Count(repo => repo.HasDataSync);
             var activeCount = _repos.Count(repo => repo.IsActive);
@@ -680,6 +679,18 @@ public sealed class Form1 : Form
                 repo.HasChanges = await GitRunner.HasUncommittedChangesAsync(repo.Path, 30);
                 repo.HasDataSync = RcloneSyncConfig.TryLoad(repo.Path, out var config, warnings.Enqueue) && config is not null;
                 repo.SyncConfig = config;
+
+                if (config is not null)
+                {
+                    foreach (var folder in config.Folders)
+                    {
+                        // git check-ignore honours globs (*.db) that a hand-rolled .gitignore scan misses
+                        if (await GitRunner.IsIgnoredAsync(repo.Path, folder.Local, 30) == false)
+                        {
+                            warnings.Enqueue($"Warning: {repo.Name}/{folder.Local} is set for rclone sync but is not gitignored.");
+                        }
+                    }
+                }
             }
             finally
             {
@@ -708,29 +719,12 @@ public sealed class Form1 : Form
         _repoBinding.ResetBindings(false);
     }
 
-    private void WarnUnignoredDataFolders()
-    {
-        foreach (var repo in _repos)
-        {
-            if (repo.SyncConfig is null)
-            {
-                continue;
-            }
-
-            foreach (var folder in repo.SyncConfig.Folders)
-            {
-                if (!RcloneRunner.IsGitignored(repo.Path, folder.Local))
-                {
-                    AppendLog($"Warning: {repo.Name}/{folder.Local} is set for rclone sync but is not in .gitignore.");
-                }
-            }
-        }
-    }
-
     // ---- batch actions ----------------------------------------------------
 
-    // runs an action across all repos; a null result means "skipped" and leaves the row untouched.
-    private async Task RunBatchAsync(string label, bool rescanFirst, Func<RepoRow, Task<GitWorkflowResult?>> action)
+    // runs an action across all repos. each side of the result (git, data) is null when that
+    // side didn't run; a skipped side keeps its previous status so a data-only batch doesn't
+    // blank the git column and vice versa.
+    private async Task RunBatchAsync(string label, bool rescanFirst, bool runsGit, bool runsData, Func<RepoRow, Task<RepoActionResult>> action)
     {
         if (rescanFirst)
         {
@@ -750,32 +744,52 @@ public sealed class Form1 : Form
         var ran = 0;
         foreach (var repo in _repos)
         {
-            var previousStatus = repo.Status;
-            var previousMessage = repo.LastMessage;
-            repo.Status = "Running";
-            repo.LastMessage = "";
-            _repoBinding.ResetBindings(false);
-
-            var result = await action(repo);
-            if (result is null)
+            var previousGit = (repo.GitStatus, repo.GitMessage);
+            var previousData = (repo.DataStatus, repo.DataMessage);
+            if (runsGit)
             {
-                repo.Status = previousStatus;
-                repo.LastMessage = previousMessage;
-                _repoBinding.ResetBindings(false);
-                continue;
+                (repo.GitStatus, repo.GitMessage) = ("Running", "");
             }
 
-            ran++;
-            repo.Status = StatusFromResult(result);
-            repo.LastMessage = result.Summary;
+            if (runsData && repo.WillSync)
+            {
+                (repo.DataStatus, repo.DataMessage) = ("Running", "");
+            }
+
             _repoBinding.ResetBindings(false);
 
-            if (!result.Success)
+            RepoActionResult result;
+            try
+            {
+                result = await action(repo);
+            }
+            catch (Exception ex)
+            {
+                // one repo must not wedge the batch with every button disabled
+                var failure = new WorkflowResult(false, false, -1, $"unexpected error: {ex.Message}", ex.ToString(), false);
+                result = new RepoActionResult(runsGit ? failure : null, runsData && repo.WillSync ? failure : null);
+            }
+
+            if (result.Git is null)
+            {
+                (repo.GitStatus, repo.GitMessage) = previousGit;
+            }
+
+            if (result.Data is null)
+            {
+                (repo.DataStatus, repo.DataMessage) = previousData;
+            }
+
+            ApplyResult(repo, result);
+            if (result.Ran)
+            {
+                ran++;
+            }
+
+            if (result.Failed)
             {
                 failures++;
             }
-
-            AppendGitResult(repo, result);
         }
 
         _statusLabel.Text = failures == 0
@@ -788,11 +802,11 @@ public sealed class Form1 : Form
     private Task SignInAllAsync()
     {
         // sign in: git pull, then pull dataset folders (remote -> local) for active repos
-        return RunBatchAsync("sign in", rescanFirst: false, async repo =>
+        return RunBatchAsync("sign in", rescanFirst: false, runsGit: true, runsData: true, async repo =>
         {
-            var result = await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds);
-            var dataPull = await TryRcloneForRepoAsync(repo, pull: true);
-            return dataPull is null ? result : MergeResults(result, dataPull);
+            var git = await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds);
+            var data = await TryRcloneForRepoAsync(repo, pull: true);
+            return new RepoActionResult(git, data);
         });
     }
 
@@ -800,19 +814,19 @@ public sealed class Form1 : Form
     {
         // sign out: push dataset folders first so a future commit can reference them,
         // then commit/push git. the two run independently.
-        return RunBatchAsync("sign out", rescanFirst: true, async repo =>
+        return RunBatchAsync("sign out", rescanFirst: true, runsGit: true, runsData: true, async repo =>
         {
-            var dataPush = await TryRcloneForRepoAsync(repo, pull: false);
+            var data = await TryRcloneForRepoAsync(repo, pull: false);
             var git = await GitRunner.SignOutAsync(repo.Path, GitTimeoutSeconds);
-            return dataPush is null ? git : MergeResults(dataPush, git);
+            return new RepoActionResult(git, data);
         });
     }
 
     private Task GitPullAllAsync()
     {
         // git only — no rclone, regardless of config
-        return RunBatchAsync("git pull (all)", rescanFirst: false,
-            async repo => await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds));
+        return RunBatchAsync("git pull (all)", rescanFirst: false, runsGit: true, runsData: false,
+            async repo => new RepoActionResult(await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds), null));
     }
 
     private async Task RunDataForAllAsync(bool pull)
@@ -823,13 +837,13 @@ public sealed class Form1 : Form
             return;
         }
 
-        await RunBatchAsync(pull ? "pull data (all)" : "push data (all)", rescanFirst: false,
-            repo => TryRcloneForRepoAsync(repo, pull));
+        await RunBatchAsync(pull ? "pull data (all)" : "push data (all)", rescanFirst: false, runsGit: false, runsData: true,
+            async repo => new RepoActionResult(null, await TryRcloneForRepoAsync(repo, pull)));
     }
 
     // ---- selected-repo actions --------------------------------------------
 
-    private async Task RunForSelectedRepoAsync(string label, Func<string, int, Task<GitWorkflowResult>> action)
+    private async Task RunForSelectedRepoAsync(string label, Func<string, int, Task<WorkflowResult>> action)
     {
         var repo = GetSelectedRepo();
         if (repo is null)
@@ -839,15 +853,11 @@ public sealed class Form1 : Form
         }
 
         SetBusy(true, $"Running {label} for {repo.Name}...");
-        repo.Status = "Running";
-        repo.LastMessage = "";
+        (repo.GitStatus, repo.GitMessage) = ("Running", "");
         _repoBinding.ResetBindings(false);
 
         var result = await action(repo.Path, GitTimeoutSeconds);
-        repo.Status = StatusFromResult(result);
-        repo.LastMessage = result.Summary;
-        _repoBinding.ResetBindings(false);
-        AppendGitResult(repo, result);
+        ApplyResult(repo, new RepoActionResult(result, null));
 
         _statusLabel.Text = result.Success ? $"{label} complete" : $"{label} failed";
         SetBusy(false);
@@ -907,18 +917,13 @@ public sealed class Form1 : Form
 
         var label = pull ? "pull data" : "push data";
         SetBusy(true, $"Running {label} for {repo.Name}...");
-        repo.Status = "Running";
-        repo.LastMessage = "";
+        (repo.DataStatus, repo.DataMessage) = ("Running", "");
         _repoBinding.ResetBindings(false);
 
         var result = pull
             ? await RcloneRunner.RclonePullAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds)
             : await RcloneRunner.RclonePushAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds);
-
-        repo.Status = StatusFromResult(result);
-        repo.LastMessage = result.Summary;
-        _repoBinding.ResetBindings(false);
-        AppendGitResult(repo, result);
+        ApplyResult(repo, new RepoActionResult(null, result));
 
         _statusLabel.Text = result.Success ? $"{label} complete" : $"{label} failed";
         SetBusy(false);
@@ -962,7 +967,7 @@ public sealed class Form1 : Form
     /// rclone missing, repo inactive (when the active-only gate is on), no config, or no remote.
     /// config is reloaded from disk (not the scan cache) because a git pull may have just changed it.
     /// </summary>
-    private async Task<GitWorkflowResult?> TryRcloneForRepoAsync(RepoRow repo, bool pull)
+    private async Task<WorkflowResult?> TryRcloneForRepoAsync(RepoRow repo, bool pull)
     {
         if (!_rcloneAvailable)
         {
@@ -993,17 +998,6 @@ public sealed class Form1 : Form
         return pull
             ? await RcloneRunner.RclonePullAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds)
             : await RcloneRunner.RclonePushAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds);
-    }
-
-    private static GitWorkflowResult MergeResults(GitWorkflowResult first, GitWorkflowResult second)
-    {
-        return new GitWorkflowResult(
-            first.Success && second.Success,
-            first.TimedOut || second.TimedOut,
-            !first.Success ? first.ExitCode : second.ExitCode,
-            ProcessRunner.JoinSummaries([first.Summary, second.Summary]),
-            ProcessRunner.JoinFullOutput([first.FullOutput, second.FullOutput]),
-            first.HasWarnings || second.HasWarnings);
     }
 
     // ---- shared ui plumbing -----------------------------------------------
@@ -1050,16 +1044,36 @@ public sealed class Form1 : Form
         _logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
     }
 
-    private void AppendGitResult(RepoRow repo, GitWorkflowResult result)
+    // writes each side that ran onto the row and into the log
+    private void ApplyResult(RepoRow repo, RepoActionResult result)
     {
-        AppendLog($"{repo.Name}: {repo.Status} - {result.Summary}");
+        if (result.Git is { } git)
+        {
+            repo.GitStatus = StatusFromResult(git);
+            repo.GitMessage = git.Summary;
+            AppendResult(repo, "git", repo.GitStatus, git);
+        }
+
+        if (result.Data is { } data)
+        {
+            repo.DataStatus = StatusFromResult(data);
+            repo.DataMessage = data.Summary;
+            AppendResult(repo, "data", repo.DataStatus, data);
+        }
+
+        _repoBinding.ResetBindings(false);
+    }
+
+    private void AppendResult(RepoRow repo, string side, string status, WorkflowResult result)
+    {
+        AppendLog($"{repo.Name} [{side}]: {status} - {result.Summary}");
         if (!string.IsNullOrWhiteSpace(result.FullOutput))
         {
             _logBox.AppendText(result.FullOutput.TrimEnd() + Environment.NewLine);
         }
     }
 
-    private static string StatusFromResult(GitWorkflowResult result)
+    private static string StatusFromResult(WorkflowResult result)
     {
         if (result.Success)
         {
@@ -1067,6 +1081,18 @@ public sealed class Form1 : Form
         }
 
         return result.TimedOut ? "Timed out" : "Failed";
+    }
+
+    private static Color StatusColor(string status)
+    {
+        return status switch
+        {
+            "OK" => Theme.Ok,
+            "OK with warnings" => Theme.Warn,
+            "Failed" or "Timed out" => Theme.Fail,
+            "Running" => Theme.Accent,
+            _ => Theme.SubtleText,
+        };
     }
 
     private RepoRow? GetSelectedRepo()
@@ -1085,8 +1111,13 @@ public sealed class RepoRow
 
     public string Name { get; }
     public string Path { get; }
-    public string Status { get; set; } = "Ready";
-    public string LastMessage { get; set; } = "";
+
+    public string GitStatus { get; set; } = "Ready";
+    public string GitMessage { get; set; } = "";
+
+    // null until a data action has run for this row; the grid then falls back to the scan-time sync/idle state
+    public string? DataStatus { get; set; }
+    public string DataMessage { get; set; } = "";
 
     // populated during scan
     public DateTime? LastCommit { get; set; }
@@ -1121,13 +1152,39 @@ public sealed class RepoRow
         }
     }
 
-    public string DataDisplay => HasDataSync ? (WillSync ? "sync" : "idle") : "";
+    public string DataDisplay => DataStatus ?? (HasDataSync ? (WillSync ? "sync" : "idle") : "");
+
+    // failing side first, each prefixed, so the cause is readable without opening the log
+    public string LastMessage
+    {
+        get
+        {
+            var parts = new List<(bool Failed, string Text)>();
+            if (GitMessage.Length > 0)
+            {
+                parts.Add((IsFailure(GitStatus), $"git: {GitMessage}"));
+            }
+
+            if (DataMessage.Length > 0)
+            {
+                parts.Add((IsFailure(DataStatus), $"data: {DataMessage}"));
+            }
+
+            return string.Join("   ·   ", parts.OrderByDescending(part => part.Failed).Select(part => part.Text));
+        }
+    }
+
+    private static bool IsFailure(string? status) => status is "Failed" or "Timed out";
 }
 
-public enum GitWorkflow
+/// <summary>
+/// outcome of one action on one repo. a null side didn't run (skipped by the active-repo gate,
+/// no config, git-only or data-only action); both sides are reported independently.
+/// </summary>
+public sealed record RepoActionResult(WorkflowResult? Git, WorkflowResult? Data)
 {
-    SignIn,
-    SignOut,
+    public bool Ran => Git is not null || Data is not null;
+    public bool Failed => Git is { Success: false } || Data is { Success: false };
 }
 
 public sealed class AppSettings
@@ -1242,131 +1299,159 @@ public static class RepoDiscovery
 
 public static class GitRunner
 {
-    public static async Task<GitWorkflowResult> SignInAsync(string repoPath, int timeoutSeconds)
+    public static Task<WorkflowResult> SignInAsync(string repoPath, int timeoutSeconds)
     {
-        return await RunGitAsync(repoPath, timeoutSeconds, "pull");
+        return RunGitAsync(repoPath, timeoutSeconds, "pull");
     }
 
-    public static async Task<GitWorkflowResult> SignOutAsync(string repoPath, int timeoutSeconds)
+    /// <summary>stage, commit, push — with one rebase-and-retry if another machine pushed first.</summary>
+    public static async Task<WorkflowResult> SignOutAsync(string repoPath, int timeoutSeconds)
     {
-        var outputs = new List<string>();
-        var fullOutput = new List<string>();
-
-        var add = await RunGitAsync(repoPath, timeoutSeconds, "add", "-A");
-        outputs.Add(add.Summary);
-        fullOutput.Add(add.FullOutput);
-        var hasWarnings = add.HasWarnings;
-        if (!add.Success)
+        var steps = new StepLog();
+        var failed = await StageAndCommitAsync(repoPath, timeoutSeconds, steps);
+        if (failed is not null)
         {
-            return add with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
+            return steps.Finish(failed);
         }
 
-        var hasStagedChanges = await RunGitAsync(repoPath, timeoutSeconds, "diff", "--cached", "--quiet");
-        if (hasStagedChanges.ExitCode == 1)
-        {
-            var message = $"{DateTime.Now:MM-dd-yy} updates";
-            var commit = await RunGitAsync(repoPath, timeoutSeconds, "commit", "-m", message);
-            outputs.Add(commit.Summary);
-            fullOutput.Add(commit.FullOutput);
-            hasWarnings |= commit.HasWarnings;
-            if (!commit.Success)
-            {
-                return commit with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
-            }
-        }
-        else if (!hasStagedChanges.Success)
-        {
-            outputs.Add(hasStagedChanges.Summary);
-            fullOutput.Add(hasStagedChanges.FullOutput);
-            hasWarnings |= hasStagedChanges.HasWarnings;
-            return hasStagedChanges with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
-        }
-        else
-        {
-            outputs.Add("No staged changes to commit.");
-        }
-
-        var push = await RunGitAsync(repoPath, timeoutSeconds, "push");
-        outputs.Add(push.Summary);
-        fullOutput.Add(push.FullOutput);
-        hasWarnings |= push.HasWarnings;
-        return push with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
+        return steps.Finish(await PushAsync(repoPath, timeoutSeconds, steps, rebaseOnReject: true));
     }
 
-    public static async Task<GitWorkflowResult> CommitSyncAsync(string repoPath, int timeoutSeconds)
+    /// <summary>stage, commit, pull --rebase, push.</summary>
+    public static async Task<WorkflowResult> CommitSyncAsync(string repoPath, int timeoutSeconds)
     {
-        var outputs = new List<string>();
-        var fullOutput = new List<string>();
-
-        var add = await RunGitAsync(repoPath, timeoutSeconds, "add", "-A");
-        outputs.Add(add.Summary);
-        fullOutput.Add(add.FullOutput);
-        var hasWarnings = add.HasWarnings;
-        if (!add.Success)
+        var steps = new StepLog();
+        var failed = await StageAndCommitAsync(repoPath, timeoutSeconds, steps);
+        if (failed is not null)
         {
-            return add with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
-        }
-
-        var hasStagedChanges = await RunGitAsync(repoPath, timeoutSeconds, "diff", "--cached", "--quiet");
-        if (hasStagedChanges.ExitCode == 1)
-        {
-            var message = $"{DateTime.Now:MM-dd-yy} updates";
-            var commit = await RunGitAsync(repoPath, timeoutSeconds, "commit", "-m", message);
-            outputs.Add(commit.Summary);
-            fullOutput.Add(commit.FullOutput);
-            hasWarnings |= commit.HasWarnings;
-            if (!commit.Success)
-            {
-                return commit with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
-            }
-        }
-        else if (!hasStagedChanges.Success)
-        {
-            outputs.Add(hasStagedChanges.Summary);
-            fullOutput.Add(hasStagedChanges.FullOutput);
-            hasWarnings |= hasStagedChanges.HasWarnings;
-            return hasStagedChanges with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
-        }
-        else
-        {
-            outputs.Add("No staged changes to commit.");
+            return steps.Finish(failed);
         }
 
         var pull = await RunGitAsync(repoPath, timeoutSeconds, "pull", "--rebase");
-        outputs.Add(pull.Summary);
-        fullOutput.Add(pull.FullOutput);
-        hasWarnings |= pull.HasWarnings;
+        steps.Add(pull);
         if (!pull.Success)
         {
-            return pull with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
+            await AbortRebaseAsync(repoPath, timeoutSeconds, steps, pull);
+            return steps.Finish(pull);
         }
 
-        var push = await RunGitAsync(repoPath, timeoutSeconds, "push");
-        outputs.Add(push.Summary);
-        fullOutput.Add(push.FullOutput);
-        hasWarnings |= push.HasWarnings;
-        return push with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
+        return steps.Finish(await PushAsync(repoPath, timeoutSeconds, steps, rebaseOnReject: false));
     }
 
-    public static async Task<GitWorkflowResult> DiscardAndPullAsync(string repoPath, int timeoutSeconds)
+    public static async Task<WorkflowResult> DiscardAndPullAsync(string repoPath, int timeoutSeconds)
     {
-        var outputs = new List<string>();
-        var fullOutput = new List<string>();
-
+        var steps = new StepLog();
         var reset = await RunGitAsync(repoPath, timeoutSeconds, "reset", "--hard", "HEAD");
-        outputs.Add(reset.Summary);
-        fullOutput.Add(reset.FullOutput);
-        var hasWarnings = reset.HasWarnings;
+        steps.Add(reset);
         if (!reset.Success)
         {
-            return reset with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
+            return steps.Finish(reset);
         }
 
         var pull = await SignInAsync(repoPath, timeoutSeconds);
-        outputs.Add(pull.Summary);
-        fullOutput.Add(pull.FullOutput);
-        hasWarnings |= pull.HasWarnings;
-        return pull with { Summary = JoinSummaries(outputs), FullOutput = JoinFullOutput(fullOutput), HasWarnings = hasWarnings };
+        steps.Add(pull);
+        return steps.Finish(pull);
+    }
+
+    /// <summary>git add -A, then commit when anything is staged. returns the failing step, or null when ready to push.</summary>
+    private static async Task<WorkflowResult?> StageAndCommitAsync(string repoPath, int timeoutSeconds, StepLog steps)
+    {
+        var add = await RunGitAsync(repoPath, timeoutSeconds, "add", "-A");
+        steps.Add(add);
+        if (!add.Success)
+        {
+            return add;
+        }
+
+        // yes/no probe, so skip diff drivers: git for windows routes *.docx through astextplain,
+        // which dies on word's "~$" lock files and turned this into exit 128 — sign-out then
+        // reported Failed without ever committing (scratch_pad, 2026-09-02)
+        var staged = await RunGitAsync(repoPath, timeoutSeconds, "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv");
+        if (staged.ExitCode == 0)
+        {
+            steps.Note("No staged changes to commit.");
+            return null;
+        }
+
+        if (staged.ExitCode != 1)
+        {
+            steps.Add(staged);
+            return staged;
+        }
+
+        var commit = await RunGitAsync(repoPath, timeoutSeconds, "commit", "-m", $"{DateTime.Now:MM-dd-yy} updates");
+        steps.Add(commit);
+        return commit.Success ? null : commit;
+    }
+
+    /// <summary>
+    /// git push. with <paramref name="rebaseOnReject"/>, a non-fast-forward rejection (another
+    /// machine pushed since our last pull — routine with several machines) gets one
+    /// <c>pull --rebase</c> and a second push. a rebase that fails is aborted, leaving the local
+    /// commit intact and nothing pushed.
+    /// </summary>
+    private static async Task<WorkflowResult> PushAsync(string repoPath, int timeoutSeconds, StepLog steps, bool rebaseOnReject)
+    {
+        var push = await RunGitAsync(repoPath, timeoutSeconds, "push");
+        steps.Add(push);
+        if (push.Success || !rebaseOnReject || !IsRejectedPush(push.FullOutput))
+        {
+            return push;
+        }
+
+        var rebase = await RunGitAsync(repoPath, timeoutSeconds, "pull", "--rebase");
+        steps.Add(rebase);
+        if (!rebase.Success)
+        {
+            await AbortRebaseAsync(repoPath, timeoutSeconds, steps, rebase);
+            return rebase;
+        }
+
+        push = await RunGitAsync(repoPath, timeoutSeconds, "push");
+        steps.Add(push);
+        return push;
+    }
+
+    // after a failed pull --rebase: never leave the repo mid-rebase, and say honestly whether we managed that.
+    // abort is a no-op (fails harmlessly) when the failure happened before the rebase started (fetch, network).
+    private static async Task AbortRebaseAsync(string repoPath, int timeoutSeconds, StepLog steps, WorkflowResult failedPull)
+    {
+        var abort = await RunGitAsync(repoPath, timeoutSeconds, "rebase", "--abort");
+        if (!failedPull.FullOutput.Contains("CONFLICT", StringComparison.Ordinal) && !failedPull.TimedOut)
+        {
+            steps.Note("pull --rebase failed before rebasing (see log); local commits intact, nothing pushed");
+        }
+        else if (abort.Success)
+        {
+            steps.Note("rebase aborted: remote has commits that conflict with local work; resolve by hand (local commits intact, nothing pushed)");
+        }
+        else
+        {
+            steps.Add(abort);
+            steps.Note("rebase could NOT be aborted — repo may be mid-rebase; run `git rebase --abort` by hand before the next sign-out");
+        }
+    }
+
+    private static bool IsRejectedPush(string output)
+    {
+        return output.Contains("[rejected]", StringComparison.Ordinal)
+            || output.Contains("non-fast-forward", StringComparison.Ordinal)
+            || output.Contains("fetch first", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>git check-ignore</c> for one path: true = ignored, false = not ignored, null = git
+    /// couldn't answer (not a repo, timeout) so callers don't warn on unknowns. honours globs.
+    /// </summary>
+    public static async Task<bool?> IsIgnoredAsync(string repoPath, string relativePath, int timeoutSeconds)
+    {
+        var (exitCode, _) = await ProcessRunner.CaptureAsync("git", repoPath, timeoutSeconds, "check-ignore", "-q", "--", relativePath);
+        return exitCode switch
+        {
+            0 => true,
+            1 => false,
+            _ => null,
+        };
     }
 
     /// <summary>committer time of HEAD, or null (no commits, timeout, not a repo).</summary>
@@ -1391,17 +1476,35 @@ public static class GitRunner
         return exitCode == 0 && output.Trim().Length > 0;
     }
 
-    private static Task<GitWorkflowResult> RunGitAsync(string workingDirectory, int timeoutSeconds, params string[] arguments)
+    private static Task<WorkflowResult> RunGitAsync(string workingDirectory, int timeoutSeconds, params string[] arguments)
     {
         return ProcessRunner.RunAsync("git", workingDirectory, timeoutSeconds, arguments);
     }
 
-    private static string JoinSummaries(IEnumerable<string> summaries) => ProcessRunner.JoinSummaries(summaries);
+    // collects per-step summaries/output so a multi-step flow reports as one result
+    private sealed class StepLog
+    {
+        private readonly List<string> _summaries = [];
+        private readonly List<string> _fullOutput = [];
+        private bool _hasWarnings;
 
-    private static string JoinFullOutput(IEnumerable<string> outputs) => ProcessRunner.JoinFullOutput(outputs);
+        public void Add(WorkflowResult step)
+        {
+            _summaries.Add(step.Summary);
+            _fullOutput.Add(step.FullOutput);
+            _hasWarnings |= step.HasWarnings;
+        }
+
+        public void Note(string text) => _summaries.Add(text);
+
+        public WorkflowResult Finish(WorkflowResult last) => last with
+        {
+            Summary = ProcessRunner.JoinSummaries(_summaries),
+            FullOutput = ProcessRunner.JoinFullOutput(_fullOutput),
+            HasWarnings = _hasWarnings,
+        };
+    }
 }
-
-public sealed record GitWorkflowResult(bool Success, bool TimedOut, int ExitCode, string Summary, string FullOutput, bool HasWarnings);
 
 public static class StartupManager
 {

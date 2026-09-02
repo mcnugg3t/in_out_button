@@ -5,13 +5,13 @@ Lightweight Windows C# applet for syncing git repositories at the start and end 
 ## What it does
 
 - Lets you select folders to scan for git repositories (shown in the "Folders to scan" list; a scan runs automatically at startup).
-- Recursively discovers repos under those folders and shows each repo's last commit age, uncommitted-changes marker (`●`), and data-sync state (`sync`/`idle`).
+- Recursively discovers repos under those folders and shows each repo's last commit age, uncommitted-changes marker (`●`), and separate **Git** and **Data** status columns, so a failed rclone push and a failed git push are told apart at a glance. `Last message` shows the failing side's root-cause line first; hover a status cell for that side's full summary.
 - `Sign in` runs `git pull` for every discovered repo, then pulls dataset folders for *active* repos (see below).
-- `Sign out` rescans first, pushes dataset folders for active repos, then runs `git add -A`, commits staged changes with `MM-DD-YY updates`, and runs `git push`.
+- `Sign out` rescans first, pushes dataset folders for active repos, then runs `git add -A`, commits staged changes with `MM-DD-YY updates`, and runs `git push`. If the push is rejected because another machine pushed first, it runs `git pull --rebase` once and pushes again; a rebase that conflicts is aborted and reported, leaving the local commit intact.
 - Git-only / data-only batch buttons keep the two processes separable:
   - `Git pull (all)` — `git pull` everywhere, no rclone.
   - `Pull data (all)` / `Push data (all)` — rclone only, honoring the active-repo gate.
-- Logs full git output, flags failed commands and commands that time out, and marks successful commands that emitted Git warnings as `OK with warnings`.
+- Logs full git and rclone output, flags failed commands and commands that time out, and marks successful commands that emitted Git warnings as `OK with warnings`.
 - Provides selected-repo actions for quick fixes:
   - `Pull`
   - `Commit + sync`, which commits local changes, runs `git pull --rebase`, then pushes
@@ -54,11 +54,14 @@ A repo opts in by committing a `.rclone-sync.json` at its root listing the local
 }
 ```
 
-- `folders[].local` (required): path relative to the repo root. Should be in the repo's `.gitignore` (the app warns at scan time if it isn't).
+- `folders[].local` (required): path relative to the repo root — a folder, or a single file (e.g. `proficiency.db`; files go through `rclone copyto`). Should be gitignored (the app checks with `git check-ignore` at scan time and warns if it isn't).
 - `folders[].remote` (optional): explicit remote subpath. If omitted, derived as `<RcloneRemoteRoot>/<repo-name>/<local>`.
+- `folders[].exclude` (optional): rclone `--exclude` patterns relative to the folder, applied on both pull and push. Use it to keep a regenerable raw file local while syncing the rest.
 - `remote` (optional, top-level): overrides the app's global remote for this repo. Usually omitted.
 
 Because the file is committed, the sync instructions travel with the repo to every machine — no per-repo setup on a fresh clone. A repo without this file is git-only and untouched by the rclone machinery.
+
+A missing side is normal, not a failure: an entry that doesn't exist locally yet (fresh clone) is skipped on push, and an entry that has never been pushed is skipped on pull. Both are reported as `nothing to push` / `nothing on remote yet` in the Data column's message.
 
 ### Remote path layout
 

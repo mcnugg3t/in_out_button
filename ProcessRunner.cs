@@ -1,86 +1,59 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace InOutButton;
 
 /// <summary>
-/// Shared, shell-free process runner used by both <see cref="GitRunner"/> and
-/// <see cref="RcloneRunner"/>. Arguments are passed via <see cref="ProcessStartInfo.ArgumentList"/>
+/// outcome of one git or rclone step (or several joined). <c>Summary</c> is the one-line
+/// grid text; <c>FullOutput</c> is everything the process printed, for the log.
+/// </summary>
+public sealed record WorkflowResult(bool Success, bool TimedOut, int ExitCode, string Summary, string FullOutput, bool HasWarnings);
+
+/// <summary>
+/// shared, shell-free process runner used by both <see cref="GitRunner"/> and
+/// <see cref="RcloneRunner"/>. arguments go through <see cref="ProcessStartInfo.ArgumentList"/>
 /// so spaces and unicode in paths need no quoting.
 /// </summary>
-public static class ProcessRunner
+public static partial class ProcessRunner
 {
-    public static async Task<GitWorkflowResult> RunAsync(string fileName, string workingDirectory, int timeoutSeconds, params string[] arguments)
+    // lines that name the root cause; git and rclone both end with hint/stats noise instead
+    private static readonly string[] ErrorMarkers = ["fatal:", "error:", "CRITICAL", "ERROR", "[rejected]", "Failed to"];
+
+    public static Task<WorkflowResult> RunAsync(string fileName, string workingDirectory, int timeoutSeconds, params string[] arguments)
+        => RunLabeledAsync(fileName, workingDirectory, timeoutSeconds, null, arguments);
+
+    /// <summary>
+    /// <paramref name="label"/> replaces the full command line in <c>Summary</c> (rclone
+    /// command lines carry two long paths); the full command still heads <c>FullOutput</c>.
+    /// </summary>
+    public static async Task<WorkflowResult> RunLabeledAsync(string fileName, string workingDirectory, int timeoutSeconds, string? label, params string[] arguments)
     {
         var commandLabel = $"{fileName} {string.Join(' ', arguments)}";
-        using var process = new Process();
-        process.StartInfo = new ProcessStartInfo
-        {
-            FileName = fileName,
-            WorkingDirectory = workingDirectory,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-
-        foreach (var argument in arguments)
-        {
-            process.StartInfo.ArgumentList.Add(argument);
-        }
-
-        var output = new StringBuilder();
-        process.OutputDataReceived += (_, args) =>
-        {
-            if (args.Data is not null)
-            {
-                output.AppendLine(args.Data);
-            }
-        };
-        process.ErrorDataReceived += (_, args) =>
-        {
-            if (args.Data is not null)
-            {
-                output.AppendLine(args.Data);
-            }
-        };
+        label ??= commandLabel;
 
         try
         {
-            process.Start();
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            var waitTask = process.WaitForExitAsync();
-            var completed = await Task.WhenAny(waitTask, Task.Delay(TimeSpan.FromSeconds(timeoutSeconds)));
-            if (completed != waitTask)
+            var (exitCode, text, timedOut) = await ExecuteAsync(fileName, workingDirectory, timeoutSeconds, arguments);
+            if (timedOut)
             {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-                catch
-                {
-                    // Process may already have exited.
-                }
-
-                return new GitWorkflowResult(false, true, -1, $"{commandLabel}: timed out after {timeoutSeconds}s", $"{commandLabel}: timed out after {timeoutSeconds}s", false);
+                var msg = $"{label}: timed out after {timeoutSeconds}s";
+                return new WorkflowResult(false, true, -1, msg, $"{commandLabel}: timed out after {timeoutSeconds}s", false);
             }
 
-            var text = output.ToString().Trim();
+            text = text.Trim();
             var detail = string.IsNullOrWhiteSpace(text)
-                ? $"exited {process.ExitCode}"
-                : LastMeaningfulLine(text);
-            var summary = $"{commandLabel}: {detail}";
+                ? $"exited {exitCode}"
+                : exitCode == 0 ? LastMeaningfulLine(text) : DescribeFailure(text, exitCode);
             var fullOutput = string.IsNullOrWhiteSpace(text)
-                ? $"{commandLabel}: exited {process.ExitCode}"
+                ? $"{commandLabel}: exited {exitCode}"
                 : $"{commandLabel}:{Environment.NewLine}{text}";
 
-            return new GitWorkflowResult(process.ExitCode == 0, false, process.ExitCode, summary, fullOutput, ContainsWarning(text));
+            return new WorkflowResult(exitCode == 0, false, exitCode, $"{label}: {detail}", fullOutput, ContainsWarning(text));
         }
         catch (Exception ex)
         {
-            return new GitWorkflowResult(false, false, -1, $"{commandLabel}: {ex.Message}", $"{commandLabel}: {ex}", false);
+            return new WorkflowResult(false, false, -1, $"{label}: {ex.Message}", $"{commandLabel}: {ex}", false);
         }
     }
 
@@ -91,6 +64,19 @@ public static class ProcessRunner
     /// </summary>
     public static async Task<(int ExitCode, string Output)> CaptureAsync(string fileName, string workingDirectory, int timeoutSeconds, params string[] arguments)
     {
+        try
+        {
+            var (exitCode, text, timedOut) = await ExecuteAsync(fileName, workingDirectory, timeoutSeconds, arguments);
+            return timedOut ? (-1, "") : (exitCode, text);
+        }
+        catch
+        {
+            return (-1, "");
+        }
+    }
+
+    private static async Task<(int ExitCode, string Output, bool TimedOut)> ExecuteAsync(string fileName, string workingDirectory, int timeoutSeconds, string[] arguments)
+    {
         using var process = new Process();
         process.StartInfo = new ProcessStartInfo
         {
@@ -108,48 +94,40 @@ public static class ProcessRunner
         }
 
         var output = new StringBuilder();
-        process.OutputDataReceived += (_, args) =>
+        process.OutputDataReceived += (_, args) => Append(output, args.Data);
+        process.ErrorDataReceived += (_, args) => Append(output, args.Data);
+
+        process.Start();
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+
+        var waitTask = process.WaitForExitAsync();
+        var completed = await Task.WhenAny(waitTask, Task.Delay(TimeSpan.FromSeconds(timeoutSeconds)));
+        if (completed != waitTask)
         {
-            if (args.Data is not null)
+            try
             {
-                output.AppendLine(args.Data);
+                process.Kill(entireProcessTree: true);
             }
-        };
-        process.ErrorDataReceived += (_, args) =>
-        {
-            if (args.Data is not null)
+            catch
             {
-                output.AppendLine(args.Data);
-            }
-        };
-
-        try
-        {
-            process.Start();
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            var waitTask = process.WaitForExitAsync();
-            var completed = await Task.WhenAny(waitTask, Task.Delay(TimeSpan.FromSeconds(timeoutSeconds)));
-            if (completed != waitTask)
-            {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-                catch
-                {
-                    // process may already have exited
-                }
-
-                return (-1, "");
+                // process may already have exited
             }
 
-            return (process.ExitCode, output.ToString());
+            return (-1, "", true);
         }
-        catch
+
+        return (process.ExitCode, output.ToString(), false);
+    }
+
+    private static void Append(StringBuilder output, string? line)
+    {
+        if (line is not null)
         {
-            return (-1, "");
+            lock (output)
+            {
+                output.AppendLine(line);
+            }
         }
     }
 
@@ -163,14 +141,42 @@ public static class ProcessRunner
         return string.Join($"{Environment.NewLine}{Environment.NewLine}", outputs.Where(output => !string.IsNullOrWhiteSpace(output)));
     }
 
+    public static string[] SplitLines(string text)
+    {
+        return text.Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
     private static string LastMeaningfulLine(string text)
     {
-        return text.Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).LastOrDefault() ?? text;
+        return SplitLines(text).LastOrDefault() ?? text;
+    }
+
+    // first error-marked line is normally the root cause; rclone's retries repeat it,
+    // git follows it with "hint:" lines, and both end with stats/hints that say nothing
+    public static string DescribeFailure(string text, int exitCode)
+    {
+        var lines = SplitLines(text);
+        var line = lines.FirstOrDefault(l => ErrorMarkers.Any(m => l.Contains(m, StringComparison.Ordinal)))
+            ?? lines.LastOrDefault()
+            ?? text;
+        return $"{CleanLine(line)} (exit {exitCode})";
+    }
+
+    // drop rclone's "2026/09/02 17:47:50 " prefix and collapse its column padding
+    private static string CleanLine(string line)
+    {
+        line = RcloneTimestamp().Replace(line, "");
+        return Whitespace().Replace(line, " ").Trim();
     }
 
     private static bool ContainsWarning(string text)
     {
-        return text.Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries)
-            .Any(line => line.TrimStart().StartsWith("warning:", StringComparison.OrdinalIgnoreCase));
+        return SplitLines(text).Any(line => line.StartsWith("warning:", StringComparison.OrdinalIgnoreCase));
     }
+
+    [GeneratedRegex(@"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\s+")]
+    private static partial Regex RcloneTimestamp();
+
+    [GeneratedRegex(@"\s{2,}")]
+    private static partial Regex Whitespace();
 }

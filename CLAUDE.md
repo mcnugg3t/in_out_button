@@ -60,6 +60,17 @@ Batch data sync (Sign in / Sign out / the all-repos data buttons) only runs rclo
 
 Batch actions are also separable: "Git pull (all)" is git-only, "Pull/Push data (all)" are rclone-only; Sign in / Sign out remain the combined flows.
 
+## Changes 2026-09-02 (sign-out failures on three repos)
+
+Three unrelated causes, all reproduced and fixed:
+
+- **File entries.** `.rclone-sync.json` may list a single file (`scratch_pad/proficiency.db`). `rclone copy` treats a file source as "copy into this folder" and dies when the destination is a file. `RcloneRunner` now detects file vs folder (local type; on a first pull, `rclone lsjson --stat` on the remote) and uses `copyto` for files, `copy --create-empty-src-dirs` for folders.
+- **Missing sides.** A push of an entry that doesn't exist locally (fresh clone: `qc_modeling/data`) and a pull of an entry never pushed (rclone exit 3) are skips with a message, not failures.
+- **Staged-changes probe.** `git diff --cached --quiet` ran git for windows' `astextplain` docx driver, which fails on word `~$` lock files (exit 128); sign-out then never committed. Probe now passes `--no-ext-diff --no-textconv`.
+- **Push rejected.** Sign out on `persistent-memory` was rejected because another machine had pushed. `GitRunner.PushAsync` retries once with `pull --rebase`; a failing rebase is aborted.
+
+Plumbing that came with it: `GitWorkflowResult` → `WorkflowResult` (lives in `ProcessRunner.cs`); actions return `RepoActionResult(Git, Data)` and the grid has separate **Git** and **Data** status columns with per-side tooltips; `ProcessRunner` summarises failures by the first `fatal:`/`error:`/`CRITICAL`/`ERROR`/`[rejected]` line (rclone timestamps stripped, exit code appended) instead of the last line; rclone runs with `--stats-log-level NOTICE` so the success summary can report files transferred; the gitignore warning uses `git check-ignore` (honours globs).
+
 ## Implementation steps
 
 Each step should compile and run on its own, in this order:

@@ -6,7 +6,7 @@ Lightweight Windows C# applet for syncing git repositories at the start and end 
 
 - Lets you select folders to scan for git repositories (shown in the "Folders to scan" list; a scan runs automatically at startup).
 - Recursively discovers repos under those folders and shows each repo's last commit age, uncommitted-changes marker (`●`), and separate **Git** and **Data** status columns, so a failed rclone push and a failed git push are told apart at a glance. `Last message` shows the failing side's root-cause line first; hover a status cell for that side's full summary.
-- `Sign in` runs `git pull` for every discovered repo, then pulls dataset folders for *active* repos (see below).
+- `Sign in` runs `git pull` for every discovered repo, then pulls dataset folders for *active* repos (see below), then runs persistent-memory's `agent-cooperation/agent-setup/sync-machine.ps1` (machine settings, logged as `machine sync:`; a failure is logged and ignored).
 - `Sign out` rescans first, pushes dataset folders for active repos, then runs `git add -A`, commits staged changes with `MM-DD-YY updates`, and runs `git push`. If the push is rejected because another machine pushed first, it runs `git pull --rebase` once and pushes again; a rebase that conflicts is aborted and reported, leaving the local commit intact.
 - Git-only / data-only batch buttons keep the two processes separable:
   - `Git pull (all)` — `git pull` everywhere, no rclone.

@@ -799,15 +799,54 @@ public sealed class Form1 : Form
         SetBusy(false);
     }
 
-    private Task SignInAllAsync()
+    private async Task SignInAllAsync()
     {
         // sign in: git pull, then pull dataset folders (remote -> local) for active repos
-        return RunBatchAsync("sign in", rescanFirst: false, runsGit: true, runsData: true, async repo =>
+        await RunBatchAsync("sign in", rescanFirst: false, runsGit: true, runsData: true, async repo =>
         {
             var git = await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds);
             var data = await TryRcloneForRepoAsync(repo, pull: true);
             return new RepoActionResult(git, data);
         });
+
+        // after every pull, so it sees the fresh persistent-memory clone
+        await RunMachineSyncAsync();
+    }
+
+    // runs persistent-memory's sync-machine.ps1 from the clone root. it reports to the log
+    // but gets no vote on sign-in: a missing script, failure or timeout is logged and ignored.
+    private async Task RunMachineSyncAsync()
+    {
+        const int timeoutSeconds = 120;
+        SetBusy(true);
+        try
+        {
+            var clone = _repos.FirstOrDefault(repo => string.Equals(repo.Name, "persistent-memory", StringComparison.OrdinalIgnoreCase))?.Path
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Tools", "persistent-memory");
+            var script = Path.Combine(clone, "agent-cooperation", "agent-setup", "sync-machine.ps1");
+            if (!File.Exists(script))
+            {
+                AppendLog($"machine sync: skipped, no script at {script}");
+                return;
+            }
+
+            AppendLog($"machine sync: running {script}");
+            var result = await ProcessRunner.RunLabeledAsync("powershell.exe", clone, timeoutSeconds, "machine sync",
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script);
+            AppendLog(result.Success ? result.Summary : $"{result.Summary} (ignored)");
+
+            // prefix every line so script output can't pass for git's
+            var prefixed = result.FullOutput.TrimEnd().ReplaceLineEndings($"{Environment.NewLine}machine sync: ");
+            _logBox.AppendText($"machine sync: {prefixed}{Environment.NewLine}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"machine sync: {ex.Message} (ignored)");
+        }
+        finally
+        {
+            SetBusy(false);
+        }
     }
 
     private Task SignOutAllAsync()

@@ -12,7 +12,7 @@ Some of the user's git repos contain large datasets that are gitignored (too big
 - Source of truth for *where data goes* is a **single OneDrive rclone remote** configured by the user (e.g. `onedrive:`). The remote name is stored in `%APPDATA%\InOutButton\settings.json` (one new field on `AppSettings`).
 - Each dataset folder maps deterministically to a remote subpath: `<remote>:<remote-root>/<repo-name>/<relative-folder-path>`. The repo's `.rclone-sync.json` can override this if needed.
 - Sync direction is tied to the existing buttons:
-  - **Sign in** runs `git pull`, then `rclone copy <remote-path> <local-path>` per dataset folder (remote → local; missing locally is normal).
+  - **Sign in** runs `git pull`, then `rclone copy <remote-path> <local-path>` per dataset folder (remote → local; missing locally is normal). After the whole batch, `RunMachineSyncAsync` runs persistent-memory's `sync-machine.ps1` with a 120 s timeout; it only reports to the log and never fails sign-in (2026-10-07).
   - **Sign out** runs `rclone copy <local-path> <remote-path>` per dataset folder (local → remote), *then* `git add -A` / commit / push.
 - Repos without `.rclone-sync.json` are unaffected — rclone steps are skipped silently.
 - Rclone failures should behave like git failures today: surface in the repo row's `Status` / `LastMessage`, append the full output to the log, and count toward the failure tally. They should **not** abort the rest of the sign-in/out for other repos.

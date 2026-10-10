@@ -6,7 +6,7 @@ Lightweight Windows C# applet for syncing git repositories at the start and end 
 
 - Lets you select folders to scan for git repositories (shown in the "Folders to scan" list; a scan runs automatically at startup).
 - Recursively discovers repos under those folders and shows each repo's last commit age, uncommitted-changes marker (`●`), and separate **Git** and **Data** status columns, so a failed rclone push and a failed git push are told apart at a glance. `Last message` shows the failing side's root-cause line first; hover a status cell for that side's full summary.
-- `Sign in` runs `git pull` for every discovered repo, then pulls dataset folders for *active* repos (see below), then runs persistent-memory's `agent-cooperation/agent-setup/sync-machine.ps1` (machine settings, logged as `machine sync:`; a failure is logged and ignored).
+- `Sign in` runs `git pull` for every discovered repo, then pulls dataset folders for *active* repos (see below), then runs persistent-memory's `agent-cooperation/agent-setup/sync-machine.ps1` (Claude settings and global instructions, Codex global instructions, and both clients' selected skills; logged as `machine sync:`; a failure is logged and ignored).
 - `Sign out` rescans first, pushes dataset folders for active repos, then runs `git add -A`, commits staged changes with `MM-DD-YY updates`, and runs `git push`. If the push is rejected because another machine pushed first, it runs `git pull --rebase` once and pushes again; a rebase that conflicts is aborted and reported, leaving the local commit intact.
 - Git-only / data-only batch buttons keep the two processes separable:
   - `Git pull (all)` — `git pull` everywhere, no rclone.
@@ -21,6 +21,33 @@ Lightweight Windows C# applet for syncing git repositories at the start and end 
 - Optionally syncs gitignored dataset folders to a cloud remote via [rclone](https://rclone.org), so large data follows you across machines alongside the code (see below).
 
 Settings are stored in `%APPDATA%\InOutButton\settings.json`.
+
+## Assistant setup at sign-in
+
+After the pull batch, the app runs `agent-cooperation/agent-setup/sync-machine.ps1`
+from the discovered `persistent-memory` checkout, falling back to
+`<user-profile>/Tools/persistent-memory`. The script renders root
+`AGENTS.global.md` into Codex's `AGENTS.md`: under inherited `CODEX_HOME` when
+set, otherwise `<user-profile>/.codex`. It also maintains Claude's global
+pointer and settings and installs selected skills for both clients. Python
+3.10+ must be on the app's `PATH`. Start the app with the same `CODEX_HOME`
+used by Codex; start a fresh assistant session after an instruction update.
+
+The installer backs up managed updates and refuses conflicting local edits.
+A missing interpreter, installer error, or refusal appears in the `machine
+sync:` log; it does not fail the rest of sign-in. Check that log before assuming
+the instructions are current. Credentials and client sign-in remain separate.
+
+The executable launched at Windows startup must include `RunMachineSyncAsync`.
+Pulling this repository updates source, not an already-built executable. With
+the app closed, rebuild the configuration used by its startup entry (for the
+default development path, `dotnet build -c Debug --no-restore`). Then launch
+that executable, or update the startup registration from the intended build.
+
+The wrapper and real installer have been tested with disposable Windows
+profiles and default/custom Codex homes. The full Sign in action and remote
+machines have not been exercised for this setup change; those would perform
+repository and dataset synchronization beyond the installer checks.
 
 ## Dataset sync (rclone)
 

@@ -1,0 +1,12 @@
+<Project>
+
+  <!-- the webview2 package also references its wpf assembly, which drags in a WindowsBase
+       conflict (MSB3277) for every project that sees the package, the test project included.
+       this app is winforms only, so drop that one reference before assemblies resolve -->
+  <Target Name="DropWebView2WpfReference" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <Reference Remove="@(Reference)" Condition="'%(Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+    </ItemGroup>
+  </Target>
+
+</Project>

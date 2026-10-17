@@ -1,0 +1,2130 @@
+FRAMING QUESTION: Refute this plan. Where would it lose or overwrite the user's tasks.json across five machines, leak a credential into a log or message, hang the UI thread, or fail silently? Check the reload-before-write rule, the Codex process handling, the refresh and cooldown policy, and the Form1 integration against the attached code. Rank findings by severity and say which are blocking.
+
+Review this plan before anything is built.
+
+Return, in this order:
+
+(1) The five most confident objections. For each one: why it matters, and what
+    would happen if it goes unaddressed.
+(2) Assumptions the plan makes that should be verified before building, and how
+    to verify each one.
+(3) Acceptance criteria that are missing or untestable.
+(4) The first thing you would probe if you had to break this.
+(5) Checked and cleared: what you looked for and did not find.
+
+Plain text, under 800 words. Do not restate the plan. Do not flatter. Say when
+you lack information.
+
+=== PLAN ===
+
+# Spec: AI usage tab and Tasks tab
+
+Date: 2026-10-17. Author: Fable, from Caleb's request and his answers to the
+forks (WebView2, tasks file in persistent-memory, Gemini empty state, usage
+candidate A, tasks candidate B). Design candidates and the brief are in
+`docs/design/2026-10-17-candidates/`.
+
+## 1. What changes for the user
+
+The window gains a tab strip in its middle row. The title, the Sign in / Sign
+out button row, and the log stay visible on every tab.
+
+- **Repos**: the existing folders card, rclone card, toolbar, and repo grid,
+  unchanged.
+- **AI usage**: one column per subscription. Anthropic shows three rings
+  (session, weekly all models, weekly Fable only), OpenAI shows one ring per
+  rate-limit window the account reports, Google shows an empty state with two
+  buttons. Each ring shows the percent left; a thin bar under it shows how far
+  through the window we are, labelled "resets in 2 h 17 m · 7:00 PM". A
+  "Refresh" button and an "Updated 4:43 PM" line sit in the tab header.
+- **Tasks**: three lanes, Projects, Admin, Misc. Cards show a progress glyph,
+  title, due chip, priority flag, checklist count, and a repo label on Projects
+  cards. In-progress cards first, then not started by due date, then a
+  collapsed "Completed (n)" footer. A filter row (All, Due this week, Overdue)
+  and a search box. "+ Add task" at the foot of each lane. Clicking a card opens
+  an in-page edit dialog. Dragging a card to another lane changes its bucket.
+
+## 2. Architecture
+
+```
+Form1.cs            TabControl in main row 1; usage timer; wiring
+WebHost.cs          WebView2 wrapper: lazy init, virtual host, JSON bridge
+Usage.cs            UsageSnapshot/ProviderUsage/UsageMeter, three readers, UsageService
+Tasks.cs            TaskItem, TaskDocument, TaskStore
+web/shared.css      theme tokens copied from Theme in Form1.cs
+web/bridge.js       send()/onMessage() over window.chrome.webview, browser fallback
+web/usage.html      candidate A, driven by messages
+web/tasks.html      candidate B, driven by messages
+tests/InOutButton.Tests/   xunit: parsers, window labels, TaskStore
+```
+
+The pages are plain HTML, CSS, and JavaScript with no libraries and no build
+step. The `web/` folder is copied to the output directory on build
+(`CopyToOutputDirectory=PreserveNewest`). C# is the single source of truth:
+every page renders only what C# sends, and every user action is a message to
+C# that answers with the full new state.
+
+### 2.1 WebHost
+
+- NuGet `Microsoft.Web.WebView2`, latest stable at build time.
+- `WebHost : UserControl` holding one `WebView2` docked fill. `InitializeAsync`
+  runs on first show: `CoreWebView2Environment.CreateAsync(null,
+  %LOCALAPPDATA%\InOutButton\WebView2)`, `EnsureCoreWebView2Async(env)`,
+  `SetVirtualHostNameToFolderMapping("inout.local", <exe dir>\web, Allow)`,
+  then `Navigate("https://inout.local/<page>.html")`.
+- Settings: `PreferredColorScheme = Light` (the WinForms chrome is light
+  regardless of the OS theme), default context menus off, status bar off,
+  dev tools on, built-in error page on.
+- Bridge: C# to page with `PostWebMessageAsJson` (camelCase JSON); page to C#
+  through `WebMessageReceived`, parsed as `JsonElement` and raised on the UI
+  thread as `MessageReceived`. Messages posted before the page says
+  `{type:"ready"}` are queued and flushed on ready.
+- If `EnsureCoreWebView2Async` throws (runtime missing), the control shows a
+  label: "WebView2 runtime not found. Install the Evergreen WebView2 runtime
+  from Microsoft, then restart." and the log gets one line. The rest of the app
+  is unaffected.
+
+### 2.2 Usage data layer
+
+Types (records, serialized camelCase):
+
+```
+UsageSnapshot(DateTimeOffset UpdatedAt, IReadOnlyList<ProviderUsage> Providers)
+ProviderUsage(string Provider, string? Plan, string State /* ok | unavailable */,
+              string? Message, IReadOnlyList<UsageMeter> Meters, string? Footnote,
+              IReadOnlyList<ProviderAction> Actions, DateTimeOffset? UpdatedAt)
+UsageMeter(string Key, string Name, int WindowMinutes, double UsedPercent,
+           DateTimeOffset ResetsAt, string Severity /* normal | warning | critical */,
+           string? Note)
+ProviderAction(string Id, string Label)
+```
+
+**UsageService** owns one reader per provider and the policy:
+
+- Per-provider cache of 60 s. `RefreshAsync(fresh: false)` serves the cache;
+  `fresh: true` (the page's Refresh button) skips the cache.
+- Per-provider cooldown. A cooldown is never skipped, fresh or not.
+- Single flight per provider: concurrent callers share one pending read.
+- Providers are read in parallel; one failing provider never hides another.
+- A reader failure produces `State = unavailable` with a one-line `Message`
+  that never contains a token, a URL query string, or a response body.
+
+**Anthropic reader** (specification: `persistent-memory/agent-cooperation/
+claude-usage-mcp/src/usage.mjs`, lines 100-230 for parsing and 453-542 for the
+request; fixture `tests/fixtures/usage-2026-10-13.json` beside it):
+
+- Credentials: `%CLAUDE_CONFIG_DIR%\.credentials.json` if the variable is set,
+  else `~\.claude\.credentials.json`. Read as UTF-8, strip a BOM, take
+  `claudeAiOauth.accessToken`, `subscriptionType`, `rateLimitTier`,
+  `expiresAt` (epoch ms). The file is re-read on every live call and is never
+  written. If `expiresAt` is in the past, don't call; report "Claude Code token
+  expired; run any claude command to refresh it".
+- Request: `GET https://api.anthropic.com/api/oauth/usage`, headers
+  `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`,
+  `Accept: application/json`, `User-Agent: InOutButton/<assembly version>`.
+  10 s timeout, auto-redirect off (a redirect is a failure), no cookies.
+- Response handling: 200 parse; 401 or 403 re-read the file once and retry only
+  if the token changed, else "token rejected; run any claude command so Claude
+  Code refreshes it"; 429 never retried, cooldown from `Retry-After` (seconds
+  or HTTP date, default 60 s, floor 1 s); 5xx one retry after 1 s, then a 10 s
+  cooldown; network error one retry after 1 s.
+- Parsing: meters come from `limits[]`. `kind` `session` maps to Key `session`,
+  Name "Session", 300 min; `weekly_all` to `weekly`, "Weekly, all models",
+  10080 min; `weekly_scoped` to `weekly_<display_name lowercased>`, "Weekly,
+  {scope.model.display_name} only", 10080 min, with Note "headroom {h}% of
+  weekly" where h = (100 - percent) * allowance / 100 and allowance comes from
+  `weekly_scoped_shares[]` joined on `limit_index`. Percent prefers the float
+  `five_hour.utilization` / `seven_day.utilization` over the integer
+  `limits[].percent` where the kind matches. `resets_at` is ISO 8601 with
+  offset; parse with `DateTimeOffset`. Severity is the API's `severity`
+  string, lower-cased; anything unrecognised becomes `normal`. Unknown kinds
+  are ignored. If `limits[]` is absent, fall back to the `five_hour` and
+  `seven_day` objects. Footnote from `extra_usage` when `is_enabled`: "Extra
+  usage on · $U of $L used" with amounts scaled by `decimal_places`. Plan from
+  `subscriptionType` and `rateLimitTier` ("Claude Max 20x" style when the tier
+  is recognisable, else the raw strings).
+
+**OpenAI reader** (Codex app-server; verified live 2026-10-17):
+
+- Executable discovery, first hit wins: `settings.CodexExecutable`; the native
+  exe beside the npm shim found with `where.exe codex`, at
+  `<shim dir>\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\
+  vendor\x86_64-pc-windows-msvc\bin\codex.exe`; else `node` with
+  `<shim dir>\node_modules\@openai\codex\bin\codex.js`. Nothing found means
+  "Codex CLI not found on PATH".
+- Protocol: start `<exe> app-server` with stdin and stdout redirected, no
+  shell, UTF-8. Write three lines:
+  `{"id":1,"method":"initialize","params":{"clientInfo":{"name":"InOutButton","version":"<v>"}}}`,
+  `{"method":"initialized"}`,
+  `{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}`.
+  Read stdout lines until a JSON object with `id` 2 arrives (notifications
+  arrive in between and are ignored), then close stdin, wait up to 5 s, and
+  kill the process tree if it is still alive. Whole call capped at 20 s.
+- Parsing: `result.rateLimits.primary` and `.secondary`, each
+  `{usedPercent, windowDurationMins, resetsAt (Unix seconds)}`; a null window is
+  simply absent. Window label by duration, matching Codex's own rule: within
+  5% of 300 min "5-hour", of 1440 "Daily", of 10080 "Weekly", else "{n}-hour".
+  Key `codex_<label lowercased>`. Plan from `planType`. Severity: `critical` if
+  `rateLimitReachedType` is non-null or usedPercent >= 100, `warning` if >= 80,
+  else `normal` (the 80 mirrors the threshold Anthropic's API applied today;
+  overridable). An error reply, or no reply within the cap, is unavailable with
+  the error's `message` field when present.
+- The app never reads `auth.json` and never refreshes a token. Codex does.
+
+**Google reader**: always unavailable. Message "No local source on this
+machine." Second line "The Gemini CLI stopped serving AI Pro on 2026-06-18. The
+Antigravity CLI (agy) is not installed." Actions `gemini-usage` ("Open usage
+page") and `antigravity-setup` ("Set up Antigravity"). When `agy` is found on
+PATH the second line becomes "Antigravity CLI found; reading its usage report
+is not implemented yet." Follow-up, not in this cut: parse `agy -p /usage`.
+
+**Actions** from the page (`{type:"action", id}`) map to fixed URLs in C#:
+`gemini-usage` to `https://gemini.google.com/`, `antigravity-setup` to
+`https://antigravity.google/docs/install/`. The page never supplies a URL.
+
+**Refresh policy** in Form1: a 60 s `System.Windows.Forms.Timer`. On each
+tick, if the usage tab is selected and the last read is older than
+`UsageRefreshMinutes`, refresh (not fresh). After `SignInAllAsync` finishes,
+refresh once if the usage page has ever been shown. The page's Refresh button
+posts `{type:"refresh"}` and gets a fresh read. None of this touches `SetBusy`.
+
+**Logging**, quiet by default: one line per provider on its first successful
+read of the session ("usage: Anthropic ok, 3 meters"), one line on every state
+change (ok to unavailable or back, with the message), and one line when a
+cooldown starts. Nothing on routine refreshes.
+
+### 2.3 Page contract: usage
+
+C# to page: `{type:"snapshot", snapshot:<UsageSnapshot>, busy:false}` after
+every read, and `{type:"snapshot", busy:true}` while one is in flight so the
+Refresh button can disable. Page to C#: `{type:"ready"}`, `{type:"refresh"}`,
+`{type:"action", id}`.
+
+The page renders from the snapshot and re-derives "resets in" and the fuse
+position every 30 s from `resetsAt` and the clock, so the countdown stays
+right between reads. Same-day resets show the time ("7:00 PM"); other days add
+the weekday ("Fri 4:08 PM"). When a window has passed its reset without a new
+read, the label reads "reset at 7:00 PM · refreshing" and the page posts
+`{type:"refresh"}` once.
+
+### 2.4 Tasks data layer
+
+File: `settings.TasksFile`, default `<persistent-memory>\tasks\tasks.json`,
+where persistent-memory is located exactly as `RunMachineSyncAsync` does (the
+scanned repo named `persistent-memory`, else `~\Tools\persistent-memory`). If
+that folder does not exist, fall back to `%APPDATA%\InOutButton\tasks.json`
+and log once. The `tasks\` folder is created on first save.
+
+```json
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "8f3c2a1e9b7d4c6f",
+      "title": "Refit buffer pH GAM with September data",
+      "bucket": "projects",
+      "progress": "notStarted",
+      "due": "2026-10-24",
+      "priority": "normal",
+      "repo": "rrl_sikora",
+      "checklist": [{ "text": "Pull September rows", "done": false }],
+      "notes": "",
+      "created": "2026-10-17T22:10:00Z",
+      "updated": "2026-10-17T22:10:00Z",
+      "completed": null
+    }
+  ]
+}
+```
+
+- `bucket`: projects | admin | misc. `progress`: notStarted | inProgress |
+  complete. `priority`: normal | important | urgent. `due` is a date with no
+  time, local. `repo` is a repo name from the scan or free text. Nulls are
+  omitted on write; `id` is 16 hex characters from a GUID.
+- Serialization: `System.Text.Json`, camelCase, enums as strings, indented,
+  tasks ordered by `created` then `id`, so git diffs stay small.
+- `TaskStore.Load()` reads and validates; a malformed file is reported in the
+  log and the tab shows the error instead of an empty board (an empty board
+  would invite a save that overwrites the file).
+- `Upsert(task)` and `Delete(id)` each: if the file's last-write time differs
+  from the time of the last load, reload first and apply the change onto the
+  fresh document (one user action is one change, so this is exact), then write
+  atomically (temp file in the same folder, then `File.Move` with overwrite).
+  `completed` is set when progress becomes complete and cleared when it leaves.
+- Sign-out commits the file with everything else in persistent-memory. Two
+  machines editing without a sign-out in between can conflict on push; the
+  existing `pull --rebase` retry handles the easy cases and a real conflict
+  surfaces as a failed push for that repo, as today.
+
+### 2.5 Page contract: tasks
+
+C# to page: `{type:"state", today:"2026-10-17", file:"persistent-memory\\tasks\\tasks.json",
+repos:["in_out_button", ...], tasks:[...], error:null}`. Sent on ready, after
+every mutation, when the tab is shown and the file changed on disk, and after
+sign-in. Page to C#: `{type:"ready"}`, `{type:"upsert", task:{...}}`,
+`{type:"delete", id}`.
+
+Page behaviour: lanes sort as in section 1; the progress glyph click cycles
+notStarted, inProgress, complete; "Due this week" means not complete and due
+within the next seven days or earlier; "Overdue" means not complete and due
+before today; search matches title, repo, and notes. The edit dialog has
+title, bucket, progress, due, priority, repo (with a datalist of `repos`),
+checklist (add, toggle, remove), notes, Save, Cancel, and Delete with an
+in-page confirmation. Enter in the lane's "+ Add task" box adds a notStarted
+task with that title and the lane's bucket. Drag a card onto a lane to change
+its bucket. The header's right side shows the file path in subtle text.
+
+### 2.6 Settings
+
+```csharp
+public int UsageRefreshMinutes { get; set; } = 5;
+public string? CodexExecutable { get; set; }   // override; discovered when null
+public string? TasksFile { get; set; }         // override; derived when null
+```
+
+No new controls. These are edited in `settings.json` by hand.
+
+### 2.7 Form1 changes
+
+- `main` row 1 becomes a `TabControl` spanning both columns. The Repos page
+  holds a 2-column `TableLayoutPanel` with the existing 300 px / fill styles
+  and the existing `leftPanel` and `rightPanel`. The AI usage and Tasks pages
+  each hold one `WebHost`, initialised on first selection.
+- Tab selection drives the usage timer gate and the tasks reload check.
+- `_repos` names feed the tasks page's `repos` list after every scan.
+- `SignInAllAsync` ends by refreshing usage (if ever shown) and re-sending the
+  tasks state (the pull may have changed the file).
+
+### 2.8 Project file
+
+- `PackageReference` to `Microsoft.Web.WebView2`.
+- `<None Include="web\**" CopyToOutputDirectory="PreserveNewest" />`.
+- `<Compile Remove="tests\**" />` and `<None Remove="tests\**" />` so the test
+  project's sources never fold into the app.
+
+## 3. Tests (xunit, `tests/InOutButton.Tests`)
+
+Expected values come from captured data, not from the code under test.
+
+1. Anthropic parser on the 2026-10-13 fixture: three meters with the fixture's
+   percents and reset instants, the scoped meter's note, the plan string, the
+   extra-usage footnote.
+2. Anthropic parser with `limits[]` removed: falls back to the two window
+   objects.
+3. Codex parser on the 2026-10-17 captured reply (account id redacted): one
+   meter "Weekly", 6 used, resets 2026-10-24T21:08:18Z; no 5-hour meter.
+4. Codex parser on a synthetic reply with a 300-minute secondary window: two
+   meters, the second labelled "5-hour".
+5. Window label: 300, 285, 315, 1440, 10080, 10500, 720.
+6. Codex severity: 79, 80, 100, and `rateLimitReachedType` set.
+7. TaskStore: upsert then load round-trips every field; nulls are omitted.
+8. TaskStore: an external edit between load and upsert survives the upsert.
+9. TaskStore: delete removes only that id; no temp file remains after a write.
+10. TaskStore: a malformed file loads as an error, not as an empty document.
+
+## 4. Verification before the pre-review commit
+
+- `dotnet build -c Debug -o <scratch>` succeeds with no warnings new to this
+  change. Never build in place while `InOutButton.exe` is running.
+- `dotnet test tests/InOutButton.Tests` passes.
+- Run the scratch exe, open each tab, screenshot, close that process only.
+  The usage tab shows live Anthropic and Codex numbers; the tasks tab shows
+  the board; adding, editing, dragging, and deleting a task round-trips to
+  `tasks.json`.
+- No token, bearer header, or credentials path content appears in the log or
+  in any exception message. Grep the sources for `accessToken` to confirm it is
+  only ever read into a local.
+
+## 5. Out of scope for this cut
+
+- Parsing `agy -p /usage` for Gemini.
+- A dark theme for the WinForms chrome.
+- Task ordering by hand, assignees, attachments, recurring tasks.
+- Styling the TabControl beyond defaults.
+- Reading the Claude status-line JSON as an alternative source.
+
+## 6. Risks named
+
+- The Anthropic endpoint is undocumented. A shape change degrades to
+  unavailable with the reason in the log, never to a crash.
+- Codex reported only a weekly window and `planType` "prolite" today. The
+  reader labels by duration and does not assume two windows.
+- The Debug exe is locked while the app runs. Shipping means closing the app,
+  `dotnet build -c Debug`, relaunch. Verification uses a scratch output.
+- WebView2 runtime absence on another machine: handled by the label and log
+  line; the Repos tab still works.
+- The Theme's amber and red fail colorblind separation when adjacent. The pages
+  use amber `#c48604`, which passes beside the Theme's green and red.
+
+=== FILE: Form1.cs ===
+using System.Collections.Concurrent;
+using System.Text.Json;
+using Microsoft.Win32;
+
+namespace InOutButton;
+
+public sealed class Form1 : Form
+{
+    private const int GitTimeoutSeconds = 120;
+
+    private readonly AppSettings _settings;
+    private readonly BindingSource _repoBinding = new();
+    private readonly BindingSource _rootBinding = new();
+    private readonly List<RepoRow> _repos = [];
+    private readonly List<string> _roots = [];
+
+    private Button _signInButton = null!;
+    private Button _signOutButton = null!;
+    private Button _gitPullAllButton = null!;
+    private Button _pullDataAllButton = null!;
+    private Button _pushDataAllButton = null!;
+    private Button _pullSelectedButton = null!;
+    private Button _commitSyncSelectedButton = null!;
+    private Button _discardPullSelectedButton = null!;
+    private Button _pullDataSelectedButton = null!;
+    private Button _pushDataSelectedButton = null!;
+    private Button _scanButton = null!;
+    private Button _addRootButton = null!;
+    private Button _removeRootButton = null!;
+    private Button _testRemoteButton = null!;
+    private CheckBox _startupCheckBox = null!;
+    private CheckBox _activeOnlyCheckBox = null!;
+    private DataGridView _repoGrid = null!;
+    private ListBox _rootList = null!;
+    private Label _rootsHeader = null!;
+    private TextBox _logBox = null!;
+    private TextBox _rcloneRemoteBox = null!;
+    private TextBox _rcloneRootBox = null!;
+    private NumericUpDown _rcloneTimeoutBox = null!;
+    private NumericUpDown _activeDaysBox = null!;
+    private ToolStripStatusLabel _statusLabel = null!;
+
+    private bool _rcloneAvailable;
+
+    public Form1()
+    {
+        _settings = SettingsStore.Load();
+        _roots.AddRange(_settings.SearchRoots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase));
+
+        BuildUi();
+        Load += (_, _) =>
+        {
+            _startupCheckBox.Checked = StartupManager.IsEnabled();
+            _rootBinding.ResetBindings(false);
+            UpdateRootsHeader();
+            _ = InitRcloneAsync();
+            _ = ScanReposAsync();
+        };
+    }
+
+    // ---- theme ------------------------------------------------------------
+
+    private static class Theme
+    {
+        public static readonly Color WindowBg = Color.FromArgb(241, 243, 246);
+        public static readonly Color CardBg = Color.White;
+        public static readonly Color Text = Color.FromArgb(24, 33, 47);
+        public static readonly Color SubtleText = Color.FromArgb(120, 128, 140);
+        public static readonly Color Border = Color.FromArgb(216, 220, 227);
+        public static readonly Color Accent = Color.FromArgb(37, 99, 235);
+        public static readonly Color AccentHover = Color.FromArgb(29, 78, 216);
+        public static readonly Color Slate = Color.FromArgb(51, 65, 85);
+        public static readonly Color SlateHover = Color.FromArgb(30, 41, 59);
+        public static readonly Color Hover = Color.FromArgb(237, 241, 247);
+        public static readonly Color DisabledBg = Color.FromArgb(203, 208, 216);
+        public static readonly Color Ok = Color.FromArgb(21, 128, 61);
+        public static readonly Color Warn = Color.FromArgb(180, 83, 9);
+        public static readonly Color Fail = Color.FromArgb(220, 38, 38);
+        public static readonly Color Selection = Color.FromArgb(219, 234, 254);
+        public static readonly Color AltRow = Color.FromArgb(248, 249, 251);
+        public static readonly Color LogBg = Color.FromArgb(15, 23, 42);
+        public static readonly Color LogFg = Color.FromArgb(203, 213, 225);
+    }
+
+    // panel with a 1px border; the "card" building block of the layout
+    private sealed class CardPanel : Panel
+    {
+        public CardPanel()
+        {
+            ResizeRedraw = true;
+            DoubleBuffered = true;
+            BackColor = Theme.CardBg;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            using var pen = new Pen(Theme.Border);
+            e.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+        }
+    }
+
+    private static Button CreatePrimaryButton(string text, Color back, Color hover)
+    {
+        var button = new Button
+        {
+            Text = text,
+            Dock = DockStyle.Fill,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = back,
+            ForeColor = Color.White,
+            Font = new Font("Segoe UI Semibold", 10.5F),
+            Cursor = Cursors.Hand,
+            UseVisualStyleBackColor = false,
+        };
+        button.FlatAppearance.BorderSize = 0;
+        button.FlatAppearance.MouseOverBackColor = hover;
+        button.FlatAppearance.MouseDownBackColor = hover;
+        button.EnabledChanged += (_, _) => button.BackColor = button.Enabled ? back : Theme.DisabledBg;
+        return button;
+    }
+
+    private static Button CreateSecondaryButton(string text)
+    {
+        var button = new Button
+        {
+            Text = text,
+            Dock = DockStyle.Fill,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Theme.CardBg,
+            ForeColor = Theme.Text,
+            Cursor = Cursors.Hand,
+            UseVisualStyleBackColor = false,
+        };
+        button.FlatAppearance.BorderSize = 1;
+        button.FlatAppearance.BorderColor = Theme.Border;
+        button.FlatAppearance.MouseOverBackColor = Theme.Hover;
+        button.FlatAppearance.MouseDownBackColor = Theme.Hover;
+        return button;
+    }
+
+    private static Label CreateSectionLabel(string text)
+    {
+        return new Label
+        {
+            Text = text,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Theme.Text,
+            Font = new Font("Segoe UI Semibold", 9.75F),
+        };
+    }
+
+    private static Label CreateFieldLabel(string text)
+    {
+        return new Label
+        {
+            Text = text,
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Theme.SubtleText,
+        };
+    }
+
+    // ---- ui construction --------------------------------------------------
+
+    private void BuildUi()
+    {
+        Text = "In / Out Button";
+        MinimumSize = new Size(1060, 700);
+        StartPosition = FormStartPosition.CenterScreen;
+        Font = new Font("Segoe UI", 9.75F);
+        BackColor = Theme.WindowBg;
+        ForeColor = Theme.Text;
+
+        var main = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 2,
+            RowCount = 3,
+            Padding = new Padding(14, 14, 14, 6),
+        };
+        main.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
+        main.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        main.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));
+        main.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        main.RowStyles.Add(new RowStyle(SizeType.Absolute, 160));
+        Controls.Add(main);
+
+        // top-left: title + startup toggle
+        var titlePanel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, Margin = new Padding(3, 3, 8, 3) };
+        titlePanel.RowStyles.Add(new RowStyle(SizeType.Percent, 55));
+        titlePanel.RowStyles.Add(new RowStyle(SizeType.Percent, 45));
+        titlePanel.Controls.Add(new Label
+        {
+            Text = "In / Out Button",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.BottomLeft,
+            Font = new Font("Segoe UI Semibold", 14F),
+            ForeColor = Theme.Text,
+        }, 0, 0);
+        _startupCheckBox = new CheckBox
+        {
+            Text = "Launch on startup",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            ForeColor = Theme.SubtleText,
+        };
+        _startupCheckBox.CheckedChanged += (_, _) =>
+        {
+            StartupManager.SetEnabled(_startupCheckBox.Checked);
+            AppendLog(_startupCheckBox.Checked ? "Startup launch enabled." : "Startup launch disabled.");
+        };
+        titlePanel.Controls.Add(_startupCheckBox, 0, 1);
+        main.Controls.Add(titlePanel, 0, 0);
+
+        // top-right: batch actions. row 1 = combined sign in/out, row 2 = git-only / data-only
+        _signInButton = CreatePrimaryButton("Sign in", Theme.Accent, Theme.AccentHover);
+        _signOutButton = CreatePrimaryButton("Sign out", Theme.Slate, Theme.SlateHover);
+        _gitPullAllButton = CreateSecondaryButton("Git pull (all)");
+        _pullDataAllButton = CreateSecondaryButton("Pull data (all)");
+        _pushDataAllButton = CreateSecondaryButton("Push data (all)");
+        _signInButton.Click += async (_, _) => await SignInAllAsync();
+        _signOutButton.Click += async (_, _) => await SignOutAllAsync();
+        _gitPullAllButton.Click += async (_, _) => await GitPullAllAsync();
+        _pullDataAllButton.Click += async (_, _) => await RunDataForAllAsync(pull: true);
+        _pushDataAllButton.Click += async (_, _) => await RunDataForAllAsync(pull: false);
+
+        var topButtons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 6, RowCount = 2 };
+        for (var i = 0; i < 6; i++)
+        {
+            topButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F / 6));
+        }
+        topButtons.RowStyles.Add(new RowStyle(SizeType.Absolute, 52));
+        topButtons.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        topButtons.Controls.Add(_signInButton, 0, 0);
+        topButtons.SetColumnSpan(_signInButton, 3);
+        topButtons.Controls.Add(_signOutButton, 3, 0);
+        topButtons.SetColumnSpan(_signOutButton, 3);
+        topButtons.Controls.Add(_gitPullAllButton, 0, 1);
+        topButtons.SetColumnSpan(_gitPullAllButton, 2);
+        topButtons.Controls.Add(_pullDataAllButton, 2, 1);
+        topButtons.SetColumnSpan(_pullDataAllButton, 2);
+        topButtons.Controls.Add(_pushDataAllButton, 4, 1);
+        topButtons.SetColumnSpan(_pushDataAllButton, 2);
+        main.Controls.Add(topButtons, 1, 0);
+
+        // left column: folders card over rclone card
+        var leftPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(3, 3, 8, 3) };
+        leftPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        leftPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 268));
+        main.Controls.Add(leftPanel, 0, 1);
+
+        leftPanel.Controls.Add(BuildRootsCard(), 0, 0);
+        leftPanel.Controls.Add(BuildRcloneCard(), 0, 1);
+
+        // right: selected-repo toolbar over repo grid
+        var rightPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
+        rightPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        rightPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        main.Controls.Add(rightPanel, 1, 1);
+
+        rightPanel.Controls.Add(BuildSelectedToolbar(), 0, 0);
+        rightPanel.Controls.Add(BuildRepoGridCard(), 0, 1);
+
+        // bottom: log
+        var logCard = new Panel { Dock = DockStyle.Fill, BackColor = Theme.LogBg, Padding = new Padding(10, 8, 10, 8), Margin = new Padding(3, 8, 3, 3) };
+        _logBox = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            Multiline = true,
+            ReadOnly = true,
+            BorderStyle = BorderStyle.None,
+            BackColor = Theme.LogBg,
+            ForeColor = Theme.LogFg,
+            ScrollBars = ScrollBars.Vertical,
+            Font = new Font("Consolas", 9F),
+        };
+        logCard.Controls.Add(_logBox);
+        main.Controls.Add(logCard, 0, 2);
+        main.SetColumnSpan(logCard, 2);
+
+        var status = new StatusStrip { BackColor = Theme.WindowBg, SizingGrip = false };
+        _statusLabel = new ToolStripStatusLabel("Ready") { ForeColor = Theme.SubtleText };
+        status.Items.Add(_statusLabel);
+        Controls.Add(status);
+    }
+
+    private Control BuildRootsCard()
+    {
+        var card = new CardPanel { Dock = DockStyle.Fill, Padding = new Padding(12, 10, 12, 12), Margin = new Padding(0, 0, 0, 8) };
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+        card.Controls.Add(layout);
+
+        _rootsHeader = CreateSectionLabel("Folders to scan");
+        layout.Controls.Add(_rootsHeader, 0, 0);
+
+        _rootBinding.DataSource = _roots;
+        _rootList = new ListBox
+        {
+            Dock = DockStyle.Fill,
+            DataSource = _rootBinding,
+            BorderStyle = BorderStyle.None,
+            IntegralHeight = false,
+            BackColor = Theme.CardBg,
+            ForeColor = Theme.Text,
+        };
+        layout.Controls.Add(_rootList, 0, 1);
+
+        var rootButtons = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3 };
+        rootButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        rootButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
+        rootButtons.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
+        _addRootButton = CreateSecondaryButton("Add");
+        _removeRootButton = CreateSecondaryButton("Remove");
+        _scanButton = CreateSecondaryButton("Rescan");
+        _addRootButton.Click += async (_, _) => await AddRootAsync();
+        _removeRootButton.Click += async (_, _) => await RemoveSelectedRootAsync();
+        _scanButton.Click += async (_, _) => await ScanReposAsync();
+        rootButtons.Controls.Add(_addRootButton, 0, 0);
+        rootButtons.Controls.Add(_removeRootButton, 1, 0);
+        rootButtons.Controls.Add(_scanButton, 2, 0);
+        layout.Controls.Add(rootButtons, 0, 2);
+
+        return card;
+    }
+
+    private Control BuildRcloneCard()
+    {
+        var card = new CardPanel { Dock = DockStyle.Fill, Padding = new Padding(12, 10, 12, 12) };
+
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 7 };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 104));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+        card.Controls.Add(layout);
+
+        var header = CreateSectionLabel("Data sync (rclone)");
+        layout.Controls.Add(header, 0, 0);
+        layout.SetColumnSpan(header, 2);
+
+        layout.Controls.Add(CreateFieldLabel("Remote"), 0, 1);
+        _rcloneRemoteBox = new TextBox { Dock = DockStyle.Fill, Text = _settings.RcloneRemote ?? "", PlaceholderText = "e.g. gdrive" };
+        _rcloneRemoteBox.TextChanged += (_, _) =>
+        {
+            _settings.RcloneRemote = string.IsNullOrWhiteSpace(_rcloneRemoteBox.Text) ? null : _rcloneRemoteBox.Text.Trim();
+            SettingsStore.Save(_settings);
+        };
+        layout.Controls.Add(_rcloneRemoteBox, 1, 1);
+
+        layout.Controls.Add(CreateFieldLabel("Remote root"), 0, 2);
+        _rcloneRootBox = new TextBox { Dock = DockStyle.Fill, Text = _settings.RcloneRemoteRoot };
+        _rcloneRootBox.TextChanged += (_, _) =>
+        {
+            _settings.RcloneRemoteRoot = string.IsNullOrWhiteSpace(_rcloneRootBox.Text) ? "InOutButtonData" : _rcloneRootBox.Text.Trim();
+            SettingsStore.Save(_settings);
+        };
+        layout.Controls.Add(_rcloneRootBox, 1, 2);
+
+        layout.Controls.Add(CreateFieldLabel("Timeout (s)"), 0, 3);
+        _rcloneTimeoutBox = new NumericUpDown
+        {
+            Dock = DockStyle.Left,
+            Width = 90,
+            Minimum = 30,
+            Maximum = 86400,
+            Increment = 60,
+            Value = Math.Clamp(_settings.RcloneTimeoutSeconds, 30, 86400),
+        };
+        _rcloneTimeoutBox.ValueChanged += (_, _) =>
+        {
+            _settings.RcloneTimeoutSeconds = (int)_rcloneTimeoutBox.Value;
+            SettingsStore.Save(_settings);
+        };
+        layout.Controls.Add(_rcloneTimeoutBox, 1, 3);
+
+        layout.Controls.Add(CreateFieldLabel("Active (days)"), 0, 4);
+        _activeDaysBox = new NumericUpDown
+        {
+            Dock = DockStyle.Left,
+            Width = 90,
+            Minimum = 1,
+            Maximum = 365,
+            Value = Math.Clamp(_settings.RcloneActiveDays, 1, 365),
+        };
+        _activeDaysBox.ValueChanged += (_, _) =>
+        {
+            _settings.RcloneActiveDays = (int)_activeDaysBox.Value;
+            SettingsStore.Save(_settings);
+            RefreshActivity();
+        };
+        layout.Controls.Add(_activeDaysBox, 1, 4);
+
+        _activeOnlyCheckBox = new CheckBox
+        {
+            Text = "Only sync data for active repos",
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Checked = _settings.RcloneActiveOnly,
+            ForeColor = Theme.SubtleText,
+        };
+        _activeOnlyCheckBox.CheckedChanged += (_, _) =>
+        {
+            _settings.RcloneActiveOnly = _activeOnlyCheckBox.Checked;
+            SettingsStore.Save(_settings);
+            RefreshActivity();
+        };
+        layout.Controls.Add(_activeOnlyCheckBox, 0, 5);
+        layout.SetColumnSpan(_activeOnlyCheckBox, 2);
+
+        _testRemoteButton = CreateSecondaryButton("Test remote");
+        _testRemoteButton.Click += async (_, _) => await TestRemoteAsync();
+        layout.Controls.Add(_testRemoteButton, 1, 6);
+
+        return card;
+    }
+
+    private Control BuildSelectedToolbar()
+    {
+        var toolbar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = new Padding(0, 2, 0, 0),
+        };
+
+        toolbar.Controls.Add(new Label
+        {
+            Text = "Selected repo:",
+            ForeColor = Theme.SubtleText,
+            AutoSize = true,
+            Margin = new Padding(3, 8, 6, 0),
+        });
+
+        Button MakeToolButton(string text)
+        {
+            var button = CreateSecondaryButton(text);
+            button.Dock = DockStyle.None;
+            button.AutoSize = true;
+            button.Padding = new Padding(6, 1, 6, 1);
+            button.Margin = new Padding(0, 2, 6, 2);
+            return button;
+        }
+
+        _pullSelectedButton = MakeToolButton("Pull");
+        _commitSyncSelectedButton = MakeToolButton("Commit + sync");
+        _discardPullSelectedButton = MakeToolButton("Discard + pull");
+        _pullDataSelectedButton = MakeToolButton("Pull data");
+        _pushDataSelectedButton = MakeToolButton("Push data");
+        _pullSelectedButton.Click += async (_, _) => await RunForSelectedRepoAsync("pull", GitRunner.SignInAsync);
+        _commitSyncSelectedButton.Click += async (_, _) => await RunForSelectedRepoAsync("commit + sync", GitRunner.CommitSyncAsync);
+        _discardPullSelectedButton.Click += async (_, _) => await DiscardAndPullSelectedRepoAsync();
+        _pullDataSelectedButton.Click += async (_, _) => await RunRcloneForSelectedRepoAsync(pull: true);
+        _pushDataSelectedButton.Click += async (_, _) => await RunRcloneForSelectedRepoAsync(pull: false);
+
+        toolbar.Controls.Add(_pullSelectedButton);
+        toolbar.Controls.Add(_commitSyncSelectedButton);
+        toolbar.Controls.Add(_discardPullSelectedButton);
+        toolbar.Controls.Add(_pullDataSelectedButton);
+        toolbar.Controls.Add(_pushDataSelectedButton);
+        return toolbar;
+    }
+
+    private Control BuildRepoGridCard()
+    {
+        var card = new CardPanel { Dock = DockStyle.Fill, Padding = new Padding(1) };
+
+        _repoBinding.DataSource = _repos;
+        _repoGrid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            AutoGenerateColumns = false,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AllowUserToResizeRows = false,
+            ReadOnly = true,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            MultiSelect = false,
+            RowHeadersVisible = false,
+            BorderStyle = BorderStyle.None,
+            BackgroundColor = Theme.CardBg,
+            GridColor = Color.FromArgb(233, 235, 239),
+            CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+            ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single,
+            EnableHeadersVisualStyles = false,
+            ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+            ColumnHeadersHeight = 32,
+            DataSource = _repoBinding,
+        };
+        _repoGrid.ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
+        {
+            BackColor = Theme.CardBg,
+            ForeColor = Theme.SubtleText,
+            SelectionBackColor = Theme.CardBg,
+            Font = new Font("Segoe UI Semibold", 9F),
+            Padding = new Padding(4, 0, 0, 0),
+        };
+        _repoGrid.DefaultCellStyle = new DataGridViewCellStyle
+        {
+            BackColor = Theme.CardBg,
+            ForeColor = Theme.Text,
+            SelectionBackColor = Theme.Selection,
+            SelectionForeColor = Theme.Text,
+            Padding = new Padding(4, 0, 0, 0),
+        };
+        _repoGrid.AlternatingRowsDefaultCellStyle = new DataGridViewCellStyle { BackColor = Theme.AltRow };
+        _repoGrid.RowTemplate.Height = 28;
+
+        // git and data get their own status cells so one side failing doesn't hide the other
+        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Repository", DataPropertyName = nameof(RepoRow.Name), Width = 175 });
+        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Last commit", DataPropertyName = nameof(RepoRow.LastCommitDisplay), Width = 95 });
+        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Git", DataPropertyName = nameof(RepoRow.GitStatus), Width = 110 });
+        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Data", DataPropertyName = nameof(RepoRow.DataDisplay), Width = 110 });
+        _repoGrid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Last message", DataPropertyName = nameof(RepoRow.LastMessage), AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill });
+
+        _repoGrid.CellFormatting += (_, e) =>
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= _repos.Count || e.CellStyle is null)
+            {
+                return;
+            }
+
+            var repo = _repos[e.RowIndex];
+            switch (e.ColumnIndex)
+            {
+                case 1:
+                    e.CellStyle.ForeColor = repo.IsActive ? Theme.Text : Theme.SubtleText;
+                    break;
+                case 2:
+                    e.CellStyle.ForeColor = StatusColor(repo.GitStatus);
+                    break;
+                case 3:
+                    // pending "sync" is green like before; blue is reserved for "Running"
+                    e.CellStyle.ForeColor = repo.DataStatus is { } dataStatus
+                        ? StatusColor(dataStatus)
+                        : repo.WillSync ? Theme.Ok : Theme.SubtleText;
+                    break;
+            }
+        };
+
+        _repoGrid.CellToolTipTextNeeded += (_, e) =>
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= _repos.Count)
+            {
+                return;
+            }
+
+            var repo = _repos[e.RowIndex];
+            e.ToolTipText = e.ColumnIndex switch
+            {
+                0 => repo.Path,
+                1 => repo.HasChanges ? "● = uncommitted changes" : "",
+                2 => repo.GitMessage,
+                3 => repo.DataMessage.Length > 0
+                    ? repo.DataMessage
+                    : repo.HasDataSync
+                        ? (repo.WillSync ? "dataset folders will sync" : "data sync configured, repo inactive — skipped")
+                        : "",
+                4 => repo.LastMessage,
+                _ => "",
+            };
+        };
+
+        card.Controls.Add(_repoGrid);
+        return card;
+    }
+
+    // ---- scan roots -------------------------------------------------------
+
+    private async Task AddRootAsync()
+    {
+        using var dialog = new FolderBrowserDialog
+        {
+            Description = "Select a folder to scan for git repositories.",
+            UseDescriptionForTitle = true,
+            ShowNewFolderButton = false,
+        };
+
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+        {
+            return;
+        }
+
+        if (!_roots.Contains(dialog.SelectedPath, StringComparer.OrdinalIgnoreCase))
+        {
+            _roots.Add(dialog.SelectedPath);
+            SaveSettings();
+            _rootBinding.ResetBindings(false);
+            UpdateRootsHeader();
+            AppendLog($"Added scan root: {dialog.SelectedPath}");
+        }
+
+        await ScanReposAsync();
+    }
+
+    private async Task RemoveSelectedRootAsync()
+    {
+        if (_rootList.SelectedItem is not string selected)
+        {
+            return;
+        }
+
+        _roots.Remove(selected);
+        SaveSettings();
+        _rootBinding.ResetBindings(false);
+        UpdateRootsHeader();
+        AppendLog($"Removed scan root: {selected}");
+        await ScanReposAsync();
+    }
+
+    private void UpdateRootsHeader()
+    {
+        _rootsHeader.Text = _roots.Count == 1 ? "Folders to scan (1)" : $"Folders to scan ({_roots.Count})";
+    }
+
+    // ---- scanning ---------------------------------------------------------
+
+    private async Task ScanReposAsync()
+    {
+        SetBusy(true, "Scanning repositories...");
+        _repos.Clear();
+        _repoBinding.ResetBindings(false);
+
+        try
+        {
+            var discovered = await Task.Run(() => RepoDiscovery.FindRepositories(_roots));
+            foreach (var path in discovered.OrderBy(Path.GetFileName).ThenBy(path => path, StringComparer.OrdinalIgnoreCase))
+            {
+                _repos.Add(new RepoRow(path));
+            }
+
+            var warnings = await ProbeReposAsync(_repos);
+            RefreshActivity();
+
+            foreach (var warning in warnings)
+            {
+                AppendLog(warning);
+            }
+
+            var dataCount = _repos.Count(repo => repo.HasDataSync);
+            var activeCount = _repos.Count(repo => repo.IsActive);
+            AppendLog($"Scan complete. Found {_repos.Count} repos ({dataCount} with data sync, {activeCount} active).");
+            _statusLabel.Text = $"{_repos.Count} repos  ·  {dataCount} with data sync  ·  {activeCount} active";
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Scan failed: {ex.Message}");
+            _statusLabel.Text = "Scan failed";
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    // probes last-commit time, working-tree changes, and data-sync config; bounded parallelism.
+    // warnings are collected (not logged) because this runs off the ui thread.
+    private static async Task<IReadOnlyList<string>> ProbeReposAsync(IReadOnlyList<RepoRow> repos)
+    {
+        var warnings = new ConcurrentQueue<string>();
+        using var gate = new SemaphoreSlim(8);
+        await Task.WhenAll(repos.Select(async repo =>
+        {
+            await gate.WaitAsync();
+            try
+            {
+                repo.LastCommit = await GitRunner.GetLastCommitTimeAsync(repo.Path, 30);
+                repo.HasChanges = await GitRunner.HasUncommittedChangesAsync(repo.Path, 30);
+                repo.HasDataSync = RcloneSyncConfig.TryLoad(repo.Path, out var config, warnings.Enqueue) && config is not null;
+                repo.SyncConfig = config;
+
+                if (config is not null)
+                {
+                    foreach (var folder in config.Folders)
+                    {
+                        // git check-ignore honours globs (*.db) that a hand-rolled .gitignore scan misses
+                        if (await GitRunner.IsIgnoredAsync(repo.Path, folder.Local, 30) == false)
+                        {
+                            warnings.Enqueue($"Warning: {repo.Name}/{folder.Local} is set for rclone sync but is not gitignored.");
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }));
+        return [.. warnings];
+    }
+
+    // active = recent commit or uncommitted changes. the dirty check matters at sign-out:
+    // today's work isn't committed yet, so commit age alone would skip the repo being worked on.
+    private bool ComputeActive(RepoRow repo)
+    {
+        return repo.HasChanges
+            || (repo.LastCommit is { } last && (DateTime.Now - last).TotalDays <= _settings.RcloneActiveDays);
+    }
+
+    private void RefreshActivity()
+    {
+        foreach (var repo in _repos)
+        {
+            repo.IsActive = ComputeActive(repo);
+            repo.WillSync = repo.HasDataSync && (repo.IsActive || !_settings.RcloneActiveOnly);
+        }
+
+        _repoBinding.ResetBindings(false);
+    }
+
+    // ---- batch actions ----------------------------------------------------
+
+    // runs an action across all repos. each side of the result (git, data) is null when that
+    // side didn't run; a skipped side keeps its previous status so a data-only batch doesn't
+    // blank the git column and vice versa.
+    private async Task RunBatchAsync(string label, bool rescanFirst, bool runsGit, bool runsData, Func<RepoRow, Task<RepoActionResult>> action)
+    {
+        if (rescanFirst)
+        {
+            await ScanReposAsync();
+        }
+
+        if (_repos.Count == 0)
+        {
+            AppendLog("No repositories found. Add folders to scan, then scan again.");
+            return;
+        }
+
+        SetBusy(true, $"Running {label}...");
+        AppendLog($"Starting {label} ({_repos.Count} repos).");
+
+        var failures = 0;
+        var ran = 0;
+        foreach (var repo in _repos)
+        {
+            var previousGit = (repo.GitStatus, repo.GitMessage);
+            var previousData = (repo.DataStatus, repo.DataMessage);
+            if (runsGit)
+            {
+                (repo.GitStatus, repo.GitMessage) = ("Running", "");
+            }
+
+            if (runsData && repo.WillSync)
+            {
+                (repo.DataStatus, repo.DataMessage) = ("Running", "");
+            }
+
+            _repoBinding.ResetBindings(false);
+
+            RepoActionResult result;
+            try
+            {
+                result = await action(repo);
+            }
+            catch (Exception ex)
+            {
+                // one repo must not wedge the batch with every button disabled
+                var failure = new WorkflowResult(false, false, -1, $"unexpected error: {ex.Message}", ex.ToString(), false);
+                result = new RepoActionResult(runsGit ? failure : null, runsData && repo.WillSync ? failure : null);
+            }
+
+            if (result.Git is null)
+            {
+                (repo.GitStatus, repo.GitMessage) = previousGit;
+            }
+
+            if (result.Data is null)
+            {
+                (repo.DataStatus, repo.DataMessage) = previousData;
+            }
+
+            ApplyResult(repo, result);
+            if (result.Ran)
+            {
+                ran++;
+            }
+
+            if (result.Failed)
+            {
+                failures++;
+            }
+        }
+
+        _statusLabel.Text = failures == 0
+            ? $"{label} complete ({ran} repos)"
+            : $"{label} complete with {failures} failure(s)";
+        AppendLog($"{label} complete. Ran {ran}/{_repos.Count} repos; failures/timeouts: {failures}.");
+        SetBusy(false);
+    }
+
+    private async Task SignInAllAsync()
+    {
+        // sign in: git pull, then pull dataset folders (remote -> local) for active repos
+        await RunBatchAsync("sign in", rescanFirst: false, runsGit: true, runsData: true, async repo =>
+        {
+            var git = await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds);
+            var data = await TryRcloneForRepoAsync(repo, pull: true);
+            return new RepoActionResult(git, data);
+        });
+
+        // after every pull, so it sees the fresh persistent-memory clone
+        await RunMachineSyncAsync();
+    }
+
+    // runs persistent-memory's sync-machine.ps1 from the clone root. it reports to the log
+    // but gets no vote on sign-in: a missing script, failure or timeout is logged and ignored.
+    private async Task RunMachineSyncAsync()
+    {
+        const int timeoutSeconds = 120;
+        SetBusy(true);
+        try
+        {
+            var clone = _repos.FirstOrDefault(repo => string.Equals(repo.Name, "persistent-memory", StringComparison.OrdinalIgnoreCase))?.Path
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Tools", "persistent-memory");
+            var script = Path.Combine(clone, "agent-cooperation", "agent-setup", "sync-machine.ps1");
+            if (!File.Exists(script))
+            {
+                AppendLog($"machine sync: skipped, no script at {script}");
+                return;
+            }
+
+            AppendLog($"machine sync: running {script}");
+            var result = await ProcessRunner.RunLabeledAsync("powershell.exe", clone, timeoutSeconds, "machine sync",
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script);
+            AppendLog(result.Success ? result.Summary : $"{result.Summary} (ignored)");
+
+            // prefix every line so script output can't pass for git's
+            var prefixed = result.FullOutput.TrimEnd().ReplaceLineEndings($"{Environment.NewLine}machine sync: ");
+            _logBox.AppendText($"machine sync: {prefixed}{Environment.NewLine}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"machine sync: {ex.Message} (ignored)");
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    private Task SignOutAllAsync()
+    {
+        // sign out: push dataset folders first so a future commit can reference them,
+        // then commit/push git. the two run independently.
+        return RunBatchAsync("sign out", rescanFirst: true, runsGit: true, runsData: true, async repo =>
+        {
+            var data = await TryRcloneForRepoAsync(repo, pull: false);
+            var git = await GitRunner.SignOutAsync(repo.Path, GitTimeoutSeconds);
+            return new RepoActionResult(git, data);
+        });
+    }
+
+    private Task GitPullAllAsync()
+    {
+        // git only — no rclone, regardless of config
+        return RunBatchAsync("git pull (all)", rescanFirst: false, runsGit: true, runsData: false,
+            async repo => new RepoActionResult(await GitRunner.SignInAsync(repo.Path, GitTimeoutSeconds), null));
+    }
+
+    private async Task RunDataForAllAsync(bool pull)
+    {
+        if (!_rcloneAvailable)
+        {
+            AppendLog("rclone is not available; dataset sync disabled.");
+            return;
+        }
+
+        await RunBatchAsync(pull ? "pull data (all)" : "push data (all)", rescanFirst: false, runsGit: false, runsData: true,
+            async repo => new RepoActionResult(null, await TryRcloneForRepoAsync(repo, pull)));
+    }
+
+    // ---- selected-repo actions --------------------------------------------
+
+    private async Task RunForSelectedRepoAsync(string label, Func<string, int, Task<WorkflowResult>> action)
+    {
+        var repo = GetSelectedRepo();
+        if (repo is null)
+        {
+            AppendLog("Select a repository first.");
+            return;
+        }
+
+        SetBusy(true, $"Running {label} for {repo.Name}...");
+        (repo.GitStatus, repo.GitMessage) = ("Running", "");
+        _repoBinding.ResetBindings(false);
+
+        var result = await action(repo.Path, GitTimeoutSeconds);
+        ApplyResult(repo, new RepoActionResult(result, null));
+
+        _statusLabel.Text = result.Success ? $"{label} complete" : $"{label} failed";
+        SetBusy(false);
+    }
+
+    private async Task DiscardAndPullSelectedRepoAsync()
+    {
+        var repo = GetSelectedRepo();
+        if (repo is null)
+        {
+            AppendLog("Select a repository first.");
+            return;
+        }
+
+        var answer = MessageBox.Show(
+            this,
+            $"Discard all tracked local changes in {repo.Name}, then run git pull?\n\nThis uses git reset --hard HEAD. Untracked files are left alone.",
+            "Discard local changes?",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2);
+
+        if (answer != DialogResult.Yes)
+        {
+            return;
+        }
+
+        await RunForSelectedRepoAsync("discard + pull", GitRunner.DiscardAndPullAsync);
+    }
+
+    private async Task RunRcloneForSelectedRepoAsync(bool pull)
+    {
+        var repo = GetSelectedRepo();
+        if (repo is null)
+        {
+            AppendLog("Select a repository first.");
+            return;
+        }
+
+        if (!_rcloneAvailable)
+        {
+            AppendLog("rclone is not available; dataset sync disabled.");
+            return;
+        }
+
+        if (!RcloneSyncConfig.TryLoad(repo.Path, out var config, AppendLog) || config is null)
+        {
+            AppendLog($"{repo.Name}: no {RcloneSyncConfig.FileName} found.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(config.Remote ?? _settings.RcloneRemote))
+        {
+            AppendLog($"{repo.Name}: no rclone remote configured.");
+            return;
+        }
+
+        var label = pull ? "pull data" : "push data";
+        SetBusy(true, $"Running {label} for {repo.Name}...");
+        (repo.DataStatus, repo.DataMessage) = ("Running", "");
+        _repoBinding.ResetBindings(false);
+
+        var result = pull
+            ? await RcloneRunner.RclonePullAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds)
+            : await RcloneRunner.RclonePushAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds);
+        ApplyResult(repo, new RepoActionResult(null, result));
+
+        _statusLabel.Text = result.Success ? $"{label} complete" : $"{label} failed";
+        SetBusy(false);
+    }
+
+    // ---- rclone plumbing --------------------------------------------------
+
+    private async Task InitRcloneAsync()
+    {
+        var version = await RcloneRunner.ProbeAsync(15);
+        _rcloneAvailable = version is not null;
+        AppendLog(_rcloneAvailable
+            ? $"rclone detected: {version}"
+            : "rclone not found on PATH — dataset sync disabled.");
+        ApplyRcloneAvailability();
+    }
+
+    private async Task TestRemoteAsync()
+    {
+        var remote = _rcloneRemoteBox.Text.Trim();
+        if (string.IsNullOrWhiteSpace(remote))
+        {
+            AppendLog("Enter a remote name before testing.");
+            return;
+        }
+
+        SetBusy(true, $"Testing remote {remote}...");
+        var result = await RcloneRunner.TestRemoteAsync(remote, _settings.RcloneTimeoutSeconds);
+        AppendLog($"Test remote {remote}: {(result.Success ? "OK" : "FAILED")} - {result.Summary}");
+        if (!string.IsNullOrWhiteSpace(result.FullOutput))
+        {
+            _logBox.AppendText(result.FullOutput.TrimEnd() + Environment.NewLine);
+        }
+
+        _statusLabel.Text = result.Success ? "Remote OK" : "Remote test failed";
+        SetBusy(false);
+    }
+
+    /// <summary>
+    /// runs the rclone side of a batch action for one repo, or returns <c>null</c> to skip:
+    /// rclone missing, repo inactive (when the active-only gate is on), no config, or no remote.
+    /// config is reloaded from disk (not the scan cache) because a git pull may have just changed it.
+    /// </summary>
+    private async Task<WorkflowResult?> TryRcloneForRepoAsync(RepoRow repo, bool pull)
+    {
+        if (!_rcloneAvailable)
+        {
+            return null;
+        }
+
+        if (_settings.RcloneActiveOnly && !repo.IsActive)
+        {
+            if (repo.HasDataSync)
+            {
+                AppendLog($"{repo.Name}: data sync skipped — not active (last commit {repo.LastCommitDisplay}, window {_settings.RcloneActiveDays}d).");
+            }
+
+            return null;
+        }
+
+        if (!RcloneSyncConfig.TryLoad(repo.Path, out var config, AppendLog) || config is null)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(config.Remote ?? _settings.RcloneRemote))
+        {
+            AppendLog($"{repo.Name}: {RcloneSyncConfig.FileName} present but no remote configured; skipping data sync.");
+            return null;
+        }
+
+        return pull
+            ? await RcloneRunner.RclonePullAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds)
+            : await RcloneRunner.RclonePushAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds);
+    }
+
+    // ---- shared ui plumbing -----------------------------------------------
+
+    private void SetBusy(bool busy, string? status = null)
+    {
+        _signInButton.Enabled = !busy;
+        _signOutButton.Enabled = !busy;
+        _gitPullAllButton.Enabled = !busy;
+        _pullSelectedButton.Enabled = !busy;
+        _commitSyncSelectedButton.Enabled = !busy;
+        _discardPullSelectedButton.Enabled = !busy;
+        _scanButton.Enabled = !busy;
+        _addRootButton.Enabled = !busy;
+        _removeRootButton.Enabled = !busy;
+        _startupCheckBox.Enabled = !busy;
+        ApplyRcloneAvailability();
+
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            _statusLabel.Text = status;
+        }
+    }
+
+    private void ApplyRcloneAvailability()
+    {
+        // _scanButton.Enabled is false while a workflow is busy; reuse it as the idle signal.
+        var idle = _scanButton.Enabled;
+        _testRemoteButton.Enabled = _rcloneAvailable && idle;
+        _pullDataAllButton.Enabled = _rcloneAvailable && idle;
+        _pushDataAllButton.Enabled = _rcloneAvailable && idle;
+        _pullDataSelectedButton.Enabled = _rcloneAvailable && idle;
+        _pushDataSelectedButton.Enabled = _rcloneAvailable && idle;
+    }
+
+    private void SaveSettings()
+    {
+        _settings.SearchRoots = [.. _roots];
+        SettingsStore.Save(_settings);
+    }
+
+    private void AppendLog(string message)
+    {
+        _logBox.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}{Environment.NewLine}");
+    }
+
+    // writes each side that ran onto the row and into the log
+    private void ApplyResult(RepoRow repo, RepoActionResult result)
+    {
+        if (result.Git is { } git)
+        {
+            repo.GitStatus = StatusFromResult(git);
+            repo.GitMessage = git.Summary;
+            AppendResult(repo, "git", repo.GitStatus, git);
+        }
+
+        if (result.Data is { } data)
+        {
+            repo.DataStatus = StatusFromResult(data);
+            repo.DataMessage = data.Summary;
+            AppendResult(repo, "data", repo.DataStatus, data);
+        }
+
+        _repoBinding.ResetBindings(false);
+    }
+
+    private void AppendResult(RepoRow repo, string side, string status, WorkflowResult result)
+    {
+        AppendLog($"{repo.Name} [{side}]: {status} - {result.Summary}");
+        if (!string.IsNullOrWhiteSpace(result.FullOutput))
+        {
+            _logBox.AppendText(result.FullOutput.TrimEnd() + Environment.NewLine);
+        }
+    }
+
+    private static string StatusFromResult(WorkflowResult result)
+    {
+        if (result.Success)
+        {
+            return result.HasWarnings ? "OK with warnings" : "OK";
+        }
+
+        return result.TimedOut ? "Timed out" : "Failed";
+    }
+
+    private static Color StatusColor(string status)
+    {
+        return status switch
+        {
+            "OK" => Theme.Ok,
+            "OK with warnings" => Theme.Warn,
+            "Failed" or "Timed out" => Theme.Fail,
+            "Running" => Theme.Accent,
+            _ => Theme.SubtleText,
+        };
+    }
+
+    private RepoRow? GetSelectedRepo()
+    {
+        return _repoGrid.CurrentRow?.DataBoundItem as RepoRow;
+    }
+}
+
+public sealed class RepoRow
+{
+    public RepoRow(string path)
+    {
+        Path = path;
+        Name = System.IO.Path.GetFileName(path.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar));
+    }
+
+    public string Name { get; }
+    public string Path { get; }
+
+    public string GitStatus { get; set; } = "Ready";
+    public string GitMessage { get; set; } = "";
+
+    // null until a data action has run for this row; the grid then falls back to the scan-time sync/idle state
+    public string? DataStatus { get; set; }
+    public string DataMessage { get; set; } = "";
+
+    // populated during scan
+    public DateTime? LastCommit { get; set; }
+    public bool HasChanges { get; set; }
+    public bool HasDataSync { get; set; }
+    public bool IsActive { get; set; }
+    public bool WillSync { get; set; }
+    public RcloneSyncConfig? SyncConfig { get; set; }
+
+    // "● " prefix marks uncommitted working-tree changes
+    public string LastCommitDisplay
+    {
+        get
+        {
+            var marker = HasChanges ? "● " : "";
+            if (LastCommit is null)
+            {
+                return HasChanges ? marker + "new" : "—";
+            }
+
+            var age = DateTime.Now - LastCommit.Value;
+            var text = age.TotalDays switch
+            {
+                < 1 => "today",
+                < 2 => "1d ago",
+                < 14 => $"{(int)age.TotalDays}d ago",
+                < 70 => $"{(int)(age.TotalDays / 7)}w ago",
+                < 365 => $"{(int)(age.TotalDays / 30)}mo ago",
+                _ => $"{(int)(age.TotalDays / 365)}y ago",
+            };
+            return marker + text;
+        }
+    }
+
+    public string DataDisplay => DataStatus ?? (HasDataSync ? (WillSync ? "sync" : "idle") : "");
+
+    // failing side first, each prefixed, so the cause is readable without opening the log
+    public string LastMessage
+    {
+        get
+        {
+            var parts = new List<(bool Failed, string Text)>();
+            if (GitMessage.Length > 0)
+            {
+                parts.Add((IsFailure(GitStatus), $"git: {GitMessage}"));
+            }
+
+            if (DataMessage.Length > 0)
+            {
+                parts.Add((IsFailure(DataStatus), $"data: {DataMessage}"));
+            }
+
+            return string.Join("   ·   ", parts.OrderByDescending(part => part.Failed).Select(part => part.Text));
+        }
+    }
+
+    private static bool IsFailure(string? status) => status is "Failed" or "Timed out";
+}
+
+/// <summary>
+/// outcome of one action on one repo. a null side didn't run (skipped by the active-repo gate,
+/// no config, git-only or data-only action); both sides are reported independently.
+/// </summary>
+public sealed record RepoActionResult(WorkflowResult? Git, WorkflowResult? Data)
+{
+    public bool Ran => Git is not null || Data is not null;
+    public bool Failed => Git is { Success: false } || Data is { Success: false };
+}
+
+public sealed class AppSettings
+{
+    public List<string> SearchRoots { get; set; } = [];
+
+    public string? RcloneRemote { get; set; }              // e.g. "gdrive"
+    public string RcloneRemoteRoot { get; set; } = "InOutButtonData";
+    public int RcloneTimeoutSeconds { get; set; } = 600;    // datasets can be slow
+
+    public int RcloneActiveDays { get; set; } = 14;         // commit-recency window for "active"
+    public bool RcloneActiveOnly { get; set; } = true;      // gate batch data sync to active repos
+}
+
+public static class SettingsStore
+{
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    public static string SettingsDirectory { get; } =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "InOutButton");
+
+    public static string SettingsPath { get; } = Path.Combine(SettingsDirectory, "settings.json");
+
+    public static AppSettings Load()
+    {
+        try
+        {
+            if (!File.Exists(SettingsPath))
+            {
+                return new AppSettings();
+            }
+
+            return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsPath), JsonOptions) ?? new AppSettings();
+        }
+        catch
+        {
+            return new AppSettings();
+        }
+    }
+
+    public static void Save(AppSettings settings)
+    {
+        Directory.CreateDirectory(SettingsDirectory);
+        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(settings, JsonOptions));
+    }
+}
+
+public static class RepoDiscovery
+{
+    private static readonly HashSet<string> IgnoredDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".git",
+        "bin",
+        "obj",
+        ".vs",
+        ".idea",
+    };
+
+    public static IReadOnlyList<string> FindRepositories(IEnumerable<string> roots)
+    {
+        var repos = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var root in roots.Where(Directory.Exists))
+        {
+            Walk(root, repos);
+        }
+
+        return [.. repos];
+    }
+
+    private static void Walk(string directory, HashSet<string> repos)
+    {
+        if (Directory.Exists(Path.Combine(directory, ".git")))
+        {
+            repos.Add(directory);
+        }
+
+        IEnumerable<string> children;
+        try
+        {
+            children = Directory.EnumerateDirectories(directory);
+        }
+        catch
+        {
+            return;
+        }
+
+        foreach (var child in children)
+        {
+            var name = Path.GetFileName(child);
+            if (IgnoredDirectoryNames.Contains(name))
+            {
+                continue;
+            }
+
+            try
+            {
+                if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) != 0)
+                {
+                    continue;
+                }
+            }
+            catch
+            {
+                continue;
+            }
+
+            Walk(child, repos);
+        }
+    }
+}
+
+public static class GitRunner
+{
+    public static Task<WorkflowResult> SignInAsync(string repoPath, int timeoutSeconds)
+    {
+        return RunGitAsync(repoPath, timeoutSeconds, "pull");
+    }
+
+    /// <summary>stage, commit, push — with one rebase-and-retry if another machine pushed first.</summary>
+    public static async Task<WorkflowResult> SignOutAsync(string repoPath, int timeoutSeconds)
+    {
+        var steps = new StepLog();
+        var failed = await StageAndCommitAsync(repoPath, timeoutSeconds, steps);
+        if (failed is not null)
+        {
+            return steps.Finish(failed);
+        }
+
+        return steps.Finish(await PushAsync(repoPath, timeoutSeconds, steps, rebaseOnReject: true));
+    }
+
+    /// <summary>stage, commit, pull --rebase, push.</summary>
+    public static async Task<WorkflowResult> CommitSyncAsync(string repoPath, int timeoutSeconds)
+    {
+        var steps = new StepLog();
+        var failed = await StageAndCommitAsync(repoPath, timeoutSeconds, steps);
+        if (failed is not null)
+        {
+            return steps.Finish(failed);
+        }
+
+        var pull = await RunGitAsync(repoPath, timeoutSeconds, "pull", "--rebase");
+        steps.Add(pull);
+        if (!pull.Success)
+        {
+            await AbortRebaseAsync(repoPath, timeoutSeconds, steps, pull);
+            return steps.Finish(pull);
+        }
+
+        return steps.Finish(await PushAsync(repoPath, timeoutSeconds, steps, rebaseOnReject: false));
+    }
+
+    public static async Task<WorkflowResult> DiscardAndPullAsync(string repoPath, int timeoutSeconds)
+    {
+        var steps = new StepLog();
+        var reset = await RunGitAsync(repoPath, timeoutSeconds, "reset", "--hard", "HEAD");
+        steps.Add(reset);
+        if (!reset.Success)
+        {
+            return steps.Finish(reset);
+        }
+
+        var pull = await SignInAsync(repoPath, timeoutSeconds);
+        steps.Add(pull);
+        return steps.Finish(pull);
+    }
+
+    /// <summary>git add -A, then commit when anything is staged. returns the failing step, or null when ready to push.</summary>
+    private static async Task<WorkflowResult?> StageAndCommitAsync(string repoPath, int timeoutSeconds, StepLog steps)
+    {
+        var add = await RunGitAsync(repoPath, timeoutSeconds, "add", "-A");
+        steps.Add(add);
+        if (!add.Success)
+        {
+            return add;
+        }
+
+        // yes/no probe, so skip diff drivers: git for windows routes *.docx through astextplain,
+        // which dies on word's "~$" lock files and turned this into exit 128 — sign-out then
+        // reported Failed without ever committing (scratch_pad, 2026-09-02)
+        var staged = await RunGitAsync(repoPath, timeoutSeconds, "diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv");
+        if (staged.ExitCode == 0)
+        {
+            steps.Note("No staged changes to commit.");
+            return null;
+        }
+
+        if (staged.ExitCode != 1)
+        {
+            steps.Add(staged);
+            return staged;
+        }
+
+        var commit = await RunGitAsync(repoPath, timeoutSeconds, "commit", "-m", $"{DateTime.Now:MM-dd-yy} updates");
+        steps.Add(commit);
+        return commit.Success ? null : commit;
+    }
+
+    /// <summary>
+    /// git push. with <paramref name="rebaseOnReject"/>, a non-fast-forward rejection (another
+    /// machine pushed since our last pull — routine with several machines) gets one
+    /// <c>pull --rebase</c> and a second push. a rebase that fails is aborted, leaving the local
+    /// commit intact and nothing pushed.
+    /// </summary>
+    private static async Task<WorkflowResult> PushAsync(string repoPath, int timeoutSeconds, StepLog steps, bool rebaseOnReject)
+    {
+        var push = await RunGitAsync(repoPath, timeoutSeconds, "push");
+        steps.Add(push);
+        if (push.Success || !rebaseOnReject || !IsRejectedPush(push.FullOutput))
+        {
+            return push;
+        }
+
+        var rebase = await RunGitAsync(repoPath, timeoutSeconds, "pull", "--rebase");
+        steps.Add(rebase);
+        if (!rebase.Success)
+        {
+            await AbortRebaseAsync(repoPath, timeoutSeconds, steps, rebase);
+            return rebase;
+        }
+
+        push = await RunGitAsync(repoPath, timeoutSeconds, "push");
+        steps.Add(push);
+        return push;
+    }
+
+    // after a failed pull --rebase: never leave the repo mid-rebase, and say honestly whether we managed that.
+    // abort is a no-op (fails harmlessly) when the failure happened before the rebase started (fetch, network).
+    private static async Task AbortRebaseAsync(string repoPath, int timeoutSeconds, StepLog steps, WorkflowResult failedPull)
+    {
+        var abort = await RunGitAsync(repoPath, timeoutSeconds, "rebase", "--abort");
+        if (!failedPull.FullOutput.Contains("CONFLICT", StringComparison.Ordinal) && !failedPull.TimedOut)
+        {
+            steps.Note("pull --rebase failed before rebasing (see log); local commits intact, nothing pushed");
+        }
+        else if (abort.Success)
+        {
+            steps.Note("rebase aborted: remote has commits that conflict with local work; resolve by hand (local commits intact, nothing pushed)");
+        }
+        else
+        {
+            steps.Add(abort);
+            steps.Note("rebase could NOT be aborted — repo may be mid-rebase; run `git rebase --abort` by hand before the next sign-out");
+        }
+    }
+
+    private static bool IsRejectedPush(string output)
+    {
+        return output.Contains("[rejected]", StringComparison.Ordinal)
+            || output.Contains("non-fast-forward", StringComparison.Ordinal)
+            || output.Contains("fetch first", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>git check-ignore</c> for one path: true = ignored, false = not ignored, null = git
+    /// couldn't answer (not a repo, timeout) so callers don't warn on unknowns. honours globs.
+    /// </summary>
+    public static async Task<bool?> IsIgnoredAsync(string repoPath, string relativePath, int timeoutSeconds)
+    {
+        var (exitCode, _) = await ProcessRunner.CaptureAsync("git", repoPath, timeoutSeconds, "check-ignore", "-q", "--", relativePath);
+        return exitCode switch
+        {
+            0 => true,
+            1 => false,
+            _ => null,
+        };
+    }
+
+    /// <summary>committer time of HEAD, or null (no commits, timeout, not a repo).</summary>
+    public static async Task<DateTime?> GetLastCommitTimeAsync(string repoPath, int timeoutSeconds)
+    {
+        var (exitCode, output) = await ProcessRunner.CaptureAsync("git", repoPath, timeoutSeconds, "log", "-1", "--format=%ct");
+        if (exitCode != 0)
+        {
+            return null;
+        }
+
+        var line = output.Trim().Split('\n').FirstOrDefault()?.Trim();
+        return long.TryParse(line, out var epoch)
+            ? DateTimeOffset.FromUnixTimeSeconds(epoch).LocalDateTime
+            : null;
+    }
+
+    /// <summary>true when the working tree has staged, unstaged, or untracked changes.</summary>
+    public static async Task<bool> HasUncommittedChangesAsync(string repoPath, int timeoutSeconds)
+    {
+        var (exitCode, output) = await ProcessRunner.CaptureAsync("git", repoPath, timeoutSeconds, "status", "--porcelain");
+        return exitCode == 0 && output.Trim().Length > 0;
+    }
+
+    private static Task<WorkflowResult> RunGitAsync(string workingDirectory, int timeoutSeconds, params string[] arguments)
+    {
+        return ProcessRunner.RunAsync("git", workingDirectory, timeoutSeconds, arguments);
+    }
+
+    // collects per-step summaries/output so a multi-step flow reports as one result
+    private sealed class StepLog
+    {
+        private readonly List<string> _summaries = [];
+        private readonly List<string> _fullOutput = [];
+        private bool _hasWarnings;
+
+        public void Add(WorkflowResult step)
+        {
+            _summaries.Add(step.Summary);
+            _fullOutput.Add(step.FullOutput);
+            _hasWarnings |= step.HasWarnings;
+        }
+
+        public void Note(string text) => _summaries.Add(text);
+
+        public WorkflowResult Finish(WorkflowResult last) => last with
+        {
+            Summary = ProcessRunner.JoinSummaries(_summaries),
+            FullOutput = ProcessRunner.JoinFullOutput(_fullOutput),
+            HasWarnings = _hasWarnings,
+        };
+    }
+}
+
+public static class StartupManager
+{
+    private const string AppName = "InOutButton";
+    private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+
+    public static bool IsEnabled()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: false);
+        return string.Equals(key?.GetValue(AppName) as string, Application.ExecutablePath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static void SetEnabled(bool enabled)
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath, writable: true)
+            ?? Registry.CurrentUser.CreateSubKey(RunKeyPath, writable: true);
+
+        if (enabled)
+        {
+            key.SetValue(AppName, Application.ExecutablePath);
+        }
+        else
+        {
+            key.DeleteValue(AppName, throwOnMissingValue: false);
+        }
+    }
+}
+
+=== FILE: ProcessRunner.cs ===
+using System.Diagnostics;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace InOutButton;
+
+/// <summary>
+/// outcome of one git or rclone step (or several joined). <c>Summary</c> is the one-line
+/// grid text; <c>FullOutput</c> is everything the process printed, for the log.
+/// </summary>
+public sealed record WorkflowResult(bool Success, bool TimedOut, int ExitCode, string Summary, string FullOutput, bool HasWarnings);
+
+/// <summary>
+/// shared, shell-free process runner used by both <see cref="GitRunner"/> and
+/// <see cref="RcloneRunner"/>. arguments go through <see cref="ProcessStartInfo.ArgumentList"/>
+/// so spaces and unicode in paths need no quoting.
+/// </summary>
+public static partial class ProcessRunner
+{
+    // lines that name the root cause; git and rclone both end with hint/stats noise instead
+    private static readonly string[] ErrorMarkers = ["fatal:", "error:", "CRITICAL", "ERROR", "[rejected]", "Failed to"];
+
+    public static Task<WorkflowResult> RunAsync(string fileName, string workingDirectory, int timeoutSeconds, params string[] arguments)
+        => RunLabeledAsync(fileName, workingDirectory, timeoutSeconds, null, arguments);
+
+    /// <summary>
+    /// <paramref name="label"/> replaces the full command line in <c>Summary</c> (rclone
+    /// command lines carry two long paths); the full command still heads <c>FullOutput</c>.
+    /// </summary>
+    public static async Task<WorkflowResult> RunLabeledAsync(string fileName, string workingDirectory, int timeoutSeconds, string? label, params string[] arguments)
+    {
+        var commandLabel = $"{fileName} {string.Join(' ', arguments)}";
+        label ??= commandLabel;
+
+        try
+        {
+            var (exitCode, text, timedOut) = await ExecuteAsync(fileName, workingDirectory, timeoutSeconds, arguments);
+            if (timedOut)
+            {
+                var msg = $"{label}: timed out after {timeoutSeconds}s";
+                return new WorkflowResult(false, true, -1, msg, $"{commandLabel}: timed out after {timeoutSeconds}s", false);
+            }
+
+            text = text.Trim();
+            var detail = string.IsNullOrWhiteSpace(text)
+                ? $"exited {exitCode}"
+                : exitCode == 0 ? LastMeaningfulLine(text) : DescribeFailure(text, exitCode);
+            var fullOutput = string.IsNullOrWhiteSpace(text)
+                ? $"{commandLabel}: exited {exitCode}"
+                : $"{commandLabel}:{Environment.NewLine}{text}";
+
+            return new WorkflowResult(exitCode == 0, false, exitCode, $"{label}: {detail}", fullOutput, ContainsWarning(text));
+        }
+        catch (Exception ex)
+        {
+            return new WorkflowResult(false, false, -1, $"{label}: {ex.Message}", $"{commandLabel}: {ex}", false);
+        }
+    }
+
+    /// <summary>
+    /// raw exit code + combined output with no summary formatting — for cheap probes
+    /// (last-commit time, dirty check) where the caller parses the output itself.
+    /// timeout or launch failure returns (-1, "").
+    /// </summary>
+    public static async Task<(int ExitCode, string Output)> CaptureAsync(string fileName, string workingDirectory, int timeoutSeconds, params string[] arguments)
+    {
+        try
+        {
+            var (exitCode, text, timedOut) = await ExecuteAsync(fileName, workingDirectory, timeoutSeconds, arguments);
+            return timedOut ? (-1, "") : (exitCode, text);
+        }
+        catch
+        {
+            return (-1, "");
+        }
+    }
+
+    private static async Task<(int ExitCode, string Output, bool TimedOut)> ExecuteAsync(string fileName, string workingDirectory, int timeoutSeconds, string[] arguments)
+    {
+        using var process = new Process();
+        process.StartInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        foreach (var argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
+
+        var output = new StringBuilder();
+        process.OutputDataReceived += (_, args) => Append(output, args.Data);
+        process.ErrorDataReceived += (_, args) => Append(output, args.Data);
+
+        process.Start();
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+
+        var waitTask = process.WaitForExitAsync();
+        var completed = await Task.WhenAny(waitTask, Task.Delay(TimeSpan.FromSeconds(timeoutSeconds)));
+        if (completed != waitTask)
+        {
+            try
+            {
+                process.Kill(entireProcessTree: true);
+            }
+            catch
+            {
+                // process may already have exited
+            }
+
+            return (-1, "", true);
+        }
+
+        return (process.ExitCode, output.ToString(), false);
+    }
+
+    private static void Append(StringBuilder output, string? line)
+    {
+        if (line is not null)
+        {
+            lock (output)
+            {
+                output.AppendLine(line);
+            }
+        }
+    }
+
+    public static string JoinSummaries(IEnumerable<string> summaries)
+    {
+        return string.Join(" | ", summaries.Where(summary => !string.IsNullOrWhiteSpace(summary)));
+    }
+
+    public static string JoinFullOutput(IEnumerable<string> outputs)
+    {
+        return string.Join($"{Environment.NewLine}{Environment.NewLine}", outputs.Where(output => !string.IsNullOrWhiteSpace(output)));
+    }
+
+    public static string[] SplitLines(string text)
+    {
+        return text.Split([Environment.NewLine, "\n"], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private static string LastMeaningfulLine(string text)
+    {
+        return SplitLines(text).LastOrDefault() ?? text;
+    }
+
+    // first error-marked line is normally the root cause; rclone's retries repeat it,
+    // git follows it with "hint:" lines, and both end with stats/hints that say nothing
+    public static string DescribeFailure(string text, int exitCode)
+    {
+        var lines = SplitLines(text);
+        var line = lines.FirstOrDefault(l => ErrorMarkers.Any(m => l.Contains(m, StringComparison.Ordinal)))
+            ?? lines.LastOrDefault()
+            ?? text;
+        return $"{CleanLine(line)} (exit {exitCode})";
+    }
+
+    // drop rclone's "2026/09/02 17:47:50 " prefix and collapse its column padding
+    private static string CleanLine(string line)
+    {
+        line = RcloneTimestamp().Replace(line, "");
+        return Whitespace().Replace(line, " ").Trim();
+    }
+
+    private static bool ContainsWarning(string text)
+    {
+        return SplitLines(text).Any(line => line.StartsWith("warning:", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [GeneratedRegex(@"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\s+")]
+    private static partial Regex RcloneTimestamp();
+
+    [GeneratedRegex(@"\s{2,}")]
+    private static partial Regex Whitespace();
+}
+
+=== FILE: InOutButton.csproj ===
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon></ApplicationIcon>
+  </PropertyGroup>
+
+</Project>

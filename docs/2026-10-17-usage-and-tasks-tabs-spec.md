@@ -60,6 +60,13 @@ C# that answers with the full new state.
   through `WebMessageReceived`, parsed as `JsonElement` and raised on the UI
   thread as `MessageReceived`. Messages posted before the page says
   `{type:"ready"}` are queued and flushed on ready.
+- Containment: `NavigationStarting` cancels any navigation whose URI is not
+  under `https://inout.local/`; `NewWindowRequested` is marked handled and
+  dropped (external links go through the action map only). Incoming messages
+  must be a JSON object with a string `type` from the page's known set; anything
+  else is ignored and counted in a debug log line at most once per session. The
+  pages render all data through `textContent` or attribute assignment, never
+  through `innerHTML` with data in it.
 - If `EnsureCoreWebView2Async` throws (runtime missing), the control shows a
   label: "WebView2 runtime not found. Install the Evergreen WebView2 runtime
   from Microsoft, then restart." and the log gets one line. The rest of the app
@@ -133,14 +140,22 @@ request; fixture `tests/fixtures/usage-2026-10-13.json` beside it):
   vendor\x86_64-pc-windows-msvc\bin\codex.exe`; else `node` with
   `<shim dir>\node_modules\@openai\codex\bin\codex.js`. Nothing found means
   "Codex CLI not found on PATH".
-- Protocol: start `<exe> app-server` with stdin and stdout redirected, no
-  shell, UTF-8. Write three lines:
-  `{"id":1,"method":"initialize","params":{"clientInfo":{"name":"InOutButton","version":"<v>"}}}`,
-  `{"method":"initialized"}`,
-  `{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}`.
-  Read stdout lines until a JSON object with `id` 2 arrives (notifications
-  arrive in between and are ignored), then close stdin, wait up to 5 s, and
-  kill the process tree if it is still alive. Whole call capped at 20 s.
+- Protocol: start `<exe> app-server` with stdin, stdout, and stderr all
+  redirected, no shell, UTF-8, through a dedicated `JsonLineProcess` driver
+  (not `ProcessRunner`, which has no stdin and merges stderr into stdout).
+  Write `{"id":1,"method":"initialize","params":{"clientInfo":{"name":"InOutButton","version":"<v>"}}}`
+  and wait for the reply with `id` 1. Then write `{"method":"initialized"}` and
+  `{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}`
+  and read stdout lines until the object with `id` 2 arrives; notifications in
+  between are ignored. Then close stdin and wait up to 5 s for exit.
+- Driver contract: one `CancellationTokenSource` with the whole-call cap
+  (default 20 s, injectable for tests) covers every read and write; stderr is
+  drained concurrently into a buffer capped at 8 KB; stdout is capped at 256
+  lines or 1 MB, after which the call fails as "unexpected output"; a
+  non-JSON line is skipped; early exit, malformed output, a failed
+  initialize, cancellation, and form close all end in the same `finally`,
+  which kills the process tree if it has not exited. Nothing from stderr or
+  from an unparsed stdout line is ever surfaced; only its length is logged.
 - Parsing: `result.rateLimits.primary` and `.secondary`, each
   `{usedPercent, windowDurationMins, resetsAt (Unix seconds)}`; a null window is
   simply absent. Window label by duration, matching Codex's own rule: within
@@ -148,8 +163,13 @@ request; fixture `tests/fixtures/usage-2026-10-13.json` beside it):
   Key `codex_<label lowercased>`. Plan from `planType`. Severity: `critical` if
   `rateLimitReachedType` is non-null or usedPercent >= 100, `warning` if >= 80,
   else `normal` (the 80 mirrors the threshold Anthropic's API applied today;
-  overridable). An error reply, or no reply within the cap, is unavailable with
-  the error's `message` field when present.
+  overridable). An error reply, or no reply within the cap, is unavailable.
+- Messages shown for Codex are fixed strings for the known cases: executable
+  not found, not signed in (an error reply whose message contains "login" or
+  "auth"), timed out, exited early, unexpected output. Any other error text
+  passes through `Scrub.Message` first (section 2.9) and is capped at 200
+  characters. The same scrubber wraps every exception message that reaches
+  `ProviderUsage.Message` or the log, for every provider.
 - The app never reads `auth.json` and never refreshes a token. Codex does.
 
 **Google reader**: always unavailable. Message "No local source on this
@@ -163,11 +183,22 @@ is not implemented yet." Follow-up, not in this cut: parse `agy -p /usage`.
 `gemini-usage` to `https://gemini.google.com/`, `antigravity-setup` to
 `https://antigravity.google/docs/install/`. The page never supplies a URL.
 
-**Refresh policy** in Form1: a 60 s `System.Windows.Forms.Timer`. On each
-tick, if the usage tab is selected and the last read is older than
-`UsageRefreshMinutes`, refresh (not fresh). After `SignInAllAsync` finishes,
-refresh once if the usage page has ever been shown. The page's Refresh button
-posts `{type:"refresh"}` and gets a fresh read. None of this touches `SetBusy`.
+**Refresh policy**, owned entirely by Form1; the page never schedules a read:
+
+- First selection of the usage tab reads immediately (not fresh).
+- A 60 s `System.Windows.Forms.Timer` ticks; if the usage tab is selected and
+  the last completed read is older than `UsageRefreshMinutes`, read (not
+  fresh). A hidden tab never triggers a read.
+- After any batch workflow ends (`SetBusy(false)`), read once if the usage
+  page has ever been shown, since sign-in may have refreshed the Claude token.
+- The page's Refresh button posts `{type:"refresh"}`: a fresh read (cache
+  skipped, cooldowns kept). When a meter's `resetsAt` passes, the page shows
+  "reset at 7:00 PM · waiting for refresh" and posts `{type:"stale"}` once
+  per meter per snapshot; Form1 treats `stale` as a normal read subject to the
+  visibility gate and the cache.
+- "Last read" is the completion time of the last `RefreshAsync`, success or
+  failure, so a failing provider cannot cause a tight loop.
+- None of this touches `SetBusy`.
 
 **Logging**, quiet by default: one line per provider on its first successful
 read of the session ("usage: Anthropic ok, 3 meters"), one line on every state
@@ -202,6 +233,7 @@ and log once. The `tasks\` folder is created on first save.
   "tasks": [
     {
       "id": "8f3c2a1e9b7d4c6f",
+      "rev": 3,
       "title": "Refit buffer pH GAM with September data",
       "bucket": "projects",
       "progress": "notStarted",
@@ -227,23 +259,52 @@ and log once. The `tasks\` folder is created on first save.
 - `TaskStore.Load()` reads and validates; a malformed file is reported in the
   log and the tab shows the error instead of an empty board (an empty board
   would invite a save that overwrites the file).
-- `Upsert(task)` and `Delete(id)` each: if the file's last-write time differs
-  from the time of the last load, reload first and apply the change onto the
-  fresh document (one user action is one change, so this is exact), then write
-  atomically (temp file in the same folder, then `File.Move` with overwrite).
-  `completed` is set when progress becomes complete and cleared when it leaves.
+- `rev` is a per-task revision counter, 1 on creation, incremented by every
+  accepted write. The page sends back the `rev` it was given.
+- `Upsert(task)` and `Delete(id, rev)` always reload the file first (it is
+  small; last-write time is not trusted to detect every change). A write is
+  accepted only when the task is new (`rev` 0 or absent, id unknown) or the
+  incoming `rev` equals the on-disk `rev`. Otherwise the result is a rejection
+  with a fixed message ("This task changed on disk. Your edit was not saved;
+  reopen it to see the current version."), the document on disk is untouched,
+  and the page keeps the dialog open with the user's draft. An upsert for an id
+  the page knew (`rev` > 0) that is no longer on disk is rejected the same way,
+  so a deleted task is never resurrected. `completed` is set when progress
+  becomes complete and cleared when it leaves.
+- Writes are atomic: temp file in the same folder, then `File.Move` with
+  overwrite. A failed write (access denied, disk full) leaves the previous
+  file intact, is reported to the page with the scrubbed exception message,
+  and keeps the draft.
+- All store I/O runs on a worker thread (`Task.Run`); results are marshalled
+  back by the usual `await` on the UI thread.
+- Git coordination: while any workflow is busy (`SetBusy(true)`), the page is
+  told `{type:"busy", busy:true}`, disables editing, and shows "Syncing
+  repositories…"; a mutation that arrives anyway is rejected with a state
+  re-send. When the workflow ends (`SetBusy(false)`), Form1 reloads the file
+  and re-sends state, because sign-in, "Git pull (all)", a selected-repo pull,
+  or a discard may all have changed it. This closes the window in which a save
+  could land after `git add -A` and miss the sign-out commit.
 - Sign-out commits the file with everything else in persistent-memory. Two
   machines editing without a sign-out in between can conflict on push; the
   existing `pull --rebase` retry handles the easy cases and a real conflict
-  surfaces as a failed push for that repo, as today.
+  surfaces as a failed push for that repo, as today. Five-clone merge drills
+  are out of scope for this cut (section 7).
+- Path resolution waits for the first repo scan to finish, so the tasks page
+  shows "Waiting for the repository scan" until then, and the fallback to
+  `%APPDATA%` is shown as a persistent banner in the page ("Saving to a local
+  file because persistent-memory was not found; these tasks will not follow
+  you to other machines"), not only as a log line.
 
 ### 2.5 Page contract: tasks
 
 C# to page: `{type:"state", today:"2026-10-17", file:"persistent-memory\\tasks\\tasks.json",
-repos:["in_out_button", ...], tasks:[...], error:null}`. Sent on ready, after
-every mutation, when the tab is shown and the file changed on disk, and after
-sign-in. Page to C#: `{type:"ready"}`, `{type:"upsert", task:{...}}`,
-`{type:"delete", id}`.
+fallback:false, repos:["in_out_button", ...], tasks:[...], error:null}`. Sent
+on ready, after every mutation (accepted or rejected), when the tab is shown
+and the file changed on disk, and whenever a workflow ends. A rejected
+mutation also carries `{type:"rejected", id, message}` so the page can keep
+the dialog open and show why. `{type:"busy", busy:true|false}` gates editing.
+Page to C#: `{type:"ready"}`, `{type:"upsert", task:{...}}` (the task carries
+the `rev` it was given, or 0 for a new task), `{type:"delete", id, rev}`.
 
 Page behaviour: lanes sort as in section 1; the progress glyph click cycles
 notStarted, inProgress, complete; "Due this week" means not complete and due
@@ -265,6 +326,83 @@ public string? TasksFile { get; set; }         // override; derived when null
 
 No new controls. These are edited in `settings.json` by hand.
 
+### 2.9 Scrubber
+
+`Scrub.Message(string? text)` is applied to every string that originates
+outside the app before it reaches a `ProviderUsage.Message`, a page, or the
+log: Codex error text, exception messages, HTTP reason phrases. It replaces
+with `[redacted]` any match of `Bearer\s+\S+`, `sk-[A-Za-z0-9_-]{8,}`, a JWT
+shape `eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`, a query string `\?\S+`, and
+`(?i)\b(token|key|secret|password|authorization)\b\s*[=:]\s*\S+`; collapses
+whitespace; and truncates to 200 characters with "…". Tested with injected
+synthetic secrets (section 3).
+
+### 2.10 Public surface the builders code against
+
+```csharp
+// Usage.cs
+public sealed record UsageMeter(string Key, string Name, int WindowMinutes, double UsedPercent,
+                                DateTimeOffset ResetsAt, string Severity, string? Note);
+public sealed record ProviderAction(string Id, string Label);
+public sealed record ProviderUsage(string Provider, string? Plan, string State, string? Message,
+                                   string? Detail, IReadOnlyList<UsageMeter> Meters, string? Footnote,
+                                   IReadOnlyList<ProviderAction> Actions, DateTimeOffset? UpdatedAt);
+public sealed record UsageSnapshot(DateTimeOffset UpdatedAt, IReadOnlyList<ProviderUsage> Providers);
+public static class Scrub { public static string Message(string? text); }
+public static class AnthropicUsage {
+    public static string CredentialsPath { get; }
+    public static ProviderUsage Parse(string json, string? plan, DateTimeOffset now);   // pure
+    public static Task<ProviderUsage> ReadAsync(HttpClient http, CancellationToken ct);
+}
+public sealed record CodexLaunch(string FileName, IReadOnlyList<string> LeadingArgs);
+public static class CodexUsage {
+    public static Task<CodexLaunch?> FindAsync(string? overridePath, CancellationToken ct);
+    public static string WindowLabel(int minutes);                       // pure
+    public static string Severity(double usedPercent, bool reached);      // pure
+    public static ProviderUsage Parse(string replyJson, DateTimeOffset now); // pure
+    public static Task<ProviderUsage> ReadAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct);
+}
+public static class GeminiUsage { public static ProviderUsage Read(); }
+public sealed class UsageService {
+    public UsageService(Action<string> log);
+    public UsageSnapshot? Last { get; }
+    public bool Busy { get; }
+    public DateTimeOffset? LastCompleted { get; }
+    public event Action<UsageSnapshot>? Updated;
+    public event Action<bool>? BusyChanged;
+    public Task RefreshAsync(bool fresh, AppSettings settings, CancellationToken ct);
+}
+
+// Tasks.cs
+public enum TaskBucket { Projects, Admin, Misc }
+public enum TaskProgress { NotStarted, InProgress, Complete }
+public enum TaskPriority { Normal, Important, Urgent }
+public sealed class ChecklistItem { public string Text { get; set; } = ""; public bool Done { get; set; } }
+public sealed class TaskItem {
+    public string Id { get; set; } = ""; public int Rev { get; set; }
+    public string Title { get; set; } = ""; public TaskBucket Bucket { get; set; }
+    public TaskProgress Progress { get; set; } public DateOnly? Due { get; set; }
+    public TaskPriority Priority { get; set; } public string? Repo { get; set; }
+    public List<ChecklistItem> Checklist { get; set; } = []; public string? Notes { get; set; }
+    public DateTimeOffset Created { get; set; } public DateTimeOffset Updated { get; set; }
+    public DateTimeOffset? Completed { get; set; }
+}
+public sealed class TaskDocument { public int Version { get; set; } = 1; public List<TaskItem> Tasks { get; set; } = []; }
+public sealed record TaskStoreResult(bool Ok, bool Rejected, string? Message, TaskDocument Document);
+public sealed class TaskStore {
+    public TaskStore(string path);
+    public string Path { get; }
+    public static JsonSerializerOptions JsonOptions { get; }
+    public TaskStoreResult Load();
+    public TaskStoreResult Upsert(TaskItem incoming, DateTimeOffset now);
+    public TaskStoreResult Delete(string id, int rev);
+    public bool ChangedSinceLoad();
+}
+public static class TaskPaths {
+    public static string Resolve(AppSettings settings, IEnumerable<RepoRow> repos, out bool fallback);
+}
+```
+
 ### 2.7 Form1 changes
 
 - `main` row 1 becomes a `TabControl` spanning both columns. The Repos page
@@ -272,9 +410,12 @@ No new controls. These are edited in `settings.json` by hand.
   and the existing `leftPanel` and `rightPanel`. The AI usage and Tasks pages
   each hold one `WebHost`, initialised on first selection.
 - Tab selection drives the usage timer gate and the tasks reload check.
-- `_repos` names feed the tasks page's `repos` list after every scan.
-- `SignInAllAsync` ends by refreshing usage (if ever shown) and re-sending the
-  tasks state (the pull may have changed the file).
+- `_repos` names feed the tasks page's `repos` list after every scan, and the
+  tasks path is resolved once the first scan completes.
+- `SetBusy(true)` posts `busy:true` to the tasks page; `SetBusy(false)` posts
+  `busy:false`, reloads the tasks file if it changed, re-sends state, and
+  triggers a usage read if the usage page has ever been shown.
+- Form close cancels any in-flight usage read through its token.
 
 ### 2.8 Project file
 
@@ -298,10 +439,30 @@ Expected values come from captured data, not from the code under test.
    meters, the second labelled "5-hour".
 5. Window label: 300, 285, 315, 1440, 10080, 10500, 720.
 6. Codex severity: 79, 80, 100, and `rateLimitReachedType` set.
-7. TaskStore: upsert then load round-trips every field; nulls are omitted.
-8. TaskStore: an external edit between load and upsert survives the upsert.
-9. TaskStore: delete removes only that id; no temp file remains after a write.
-10. TaskStore: a malformed file loads as an error, not as an empty document.
+7. TaskStore: upsert then load round-trips every field; nulls are omitted;
+   `rev` is 1 after creation and 2 after one edit.
+8. TaskStore: an external edit to task B between load and an upsert of task A
+   survives the upsert.
+9. TaskStore: a stale upsert (incoming `rev` behind the disk) is rejected, the
+   file is unchanged, and the result carries the fixed message.
+10. TaskStore: an upsert of a task deleted on disk (incoming `rev` > 0, id
+    unknown) is rejected; it is not resurrected.
+11. TaskStore: delete removes only that id; delete with a stale `rev` is
+    rejected; no temp file remains after any write.
+12. TaskStore: a malformed file loads as an error, not as an empty document;
+    an unsupported `version` loads as an error.
+13. TaskStore: a write that fails (target file made read-only) leaves the
+    previous content intact and returns an error result.
+14. Scrub: a bearer token, an `sk-` key, a JWT, a query string, and a
+    `token=` pair are all replaced; plain text passes through; a 1,000
+    character message is cut to 200.
+15. Codex driver: pointed at a process that never answers (PowerShell
+    `Start-Sleep`), with a 2 s cap, returns unavailable "timed out" within 5 s
+    and leaves no child process running.
+16. Codex driver: pointed at a process that prints garbage and exits, returns
+    unavailable "exited early" or "unexpected output", never throws.
+17. Codex parser: an error reply with a synthetic bearer token in `message`
+    yields a Message with no token in it.
 
 ## 4. Verification before the pre-review commit
 
@@ -336,3 +497,20 @@ Expected values come from captured data, not from the code under test.
   line; the Repos tab still works.
 - The Theme's amber and red fail colorblind separation when adjacent. The pages
   use amber `#c48604`, which passes beside the Theme's green and red.
+
+## 7. Plan review log
+
+Astra (gpt-6-astra, high), 2026-10-17 18:17, in
+`docs/2026-10-17-usage-and-tasks-tabs-spec.review/20261017-181714/`.
+
+| # | Finding | Triage | Change |
+|---|---|---|---|
+| 1 | Reload-before-write still loses edits: a stale whole-task upsert overwrites newer fields and can resurrect a deleted task; mtime is not a reliable change detector | Real, blocking | Per-task `rev`, always reload before write, stale and resurrecting writes rejected with the draft kept (2.4, 2.5, tests 9 to 11) |
+| 2 | Task saves are not coordinated with git; a save after `git add -A` misses the sign-out commit; only sign-in triggered a reload | Real, blocking | Busy gate on the page during any workflow; reload and re-send when any workflow ends (2.4, 2.7) |
+| 3 | Credential-safety contract contradicted itself: Codex `error.message` was forwarded unscrubbed | Real, blocking | Fixed messages for known cases, `Scrub.Message` on everything else and on every exception message (2.2, 2.9, tests 14, 17) |
+| 4 | Process and UI contract incomplete: no cancellation on blocked reads, cleanup on every exit path unspecified, `ProcessRunner` unfit (no stdin, merged stderr), store I/O on the UI thread | Real, blocking | `JsonLineProcess` driver contract with one cap token, bounded buffers, kill in `finally`; store I/O on a worker (2.2, 2.4, tests 15, 16) |
+| 5 | Refresh rules had two owners; no immediate first read; page-initiated refresh ignored visibility | Real, medium | Form1 owns scheduling; page only reports `stale`; immediate read on first show (2.2) |
+| A | Verify every machine resolves the same repo; fallback could strand tasks; opening Tasks before the scan finishes | Partly | Path resolved after the first scan; fallback shown as a banner in the page, not only a log line (2.4). The five-machine inventory is Caleb's to confirm at first use on each machine |
+| B | Five disposable clones, concurrent same-task edits through git merge | Declined for this cut | The in-app race is closed by `rev`; a git-level conflict surfaces as a failed push, as for every other file in persistent-memory. Recorded as a known limitation |
+| C | Bridge origin and navigation restrictions, message validation, safe rendering | Real | Added to 2.1 |
+| D | "No secrets" is not established by a grep | Real | Replaced by the injection tests (14, 17) plus the grep as a secondary check |

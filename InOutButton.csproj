@@ -9,4 +9,17 @@
     <ApplicationIcon></ApplicationIcon>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Directory.Build.targets drops the package's wpf assembly reference -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4258.31" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- the test project lives under tests/; keep its sources out of the exe -->
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
+    <!-- the webview pages ship beside the exe -->
+    <None Include="web/**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

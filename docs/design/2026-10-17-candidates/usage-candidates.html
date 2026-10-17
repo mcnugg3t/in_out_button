@@ -1,0 +1,561 @@
+<title>In / Out Usage Candidates</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+:root {
+  --bg: #ffffff; --fg: #18212f; --fg-strong: #18212f; --muted: #78808c;
+  --window: #f1f3f6; --card: #ffffff; --border: #d8dce3; --grid: #e9ecf1; --axis: #c4cad4;
+  --accent: #2563eb; --accent-track: #dbeafe; --accent-wash: rgba(37, 99, 235, 0.10);
+  --warn: #b45309; --warn-track: #fbe5cd; --warn-wash: rgba(180, 83, 9, 0.10);
+  --warn-soft: #fdf0e1; --warn-ink: #93420a;
+  --hover: #edf1f7; --selection: #dbeafe; --altrow: #f8f9fb;
+  --fuse: #a3acb9; --fuse-track: #e6eaf0; --chip: #edf1f7;
+  --btn: #ffffff; --focus: #2563eb;
+  --tip-bg: #18212f; --tip-fg: #f1f5f9; --tip-muted: #aab4c3;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0a1020; --fg: #cbd5e1; --fg-strong: #e9eef6; --muted: #8693a8;
+    --window: #0f172a; --card: #162037; --border: #2b3a58; --grid: #22304d; --axis: #3d4d6e;
+    --accent: #4f8cff; --accent-track: #203458; --accent-wash: rgba(79, 140, 255, 0.16);
+    --warn: #d97706; --warn-track: #3f3015; --warn-wash: rgba(217, 119, 6, 0.16);
+    --warn-soft: #3a2a0f; --warn-ink: #fbbf24;
+    --hover: #1c2946; --selection: #1d3866; --altrow: #121b30;
+    --fuse: #55667f; --fuse-track: #24324e; --chip: #212d4a;
+    --btn: #1a2540; --focus: #7fb0ff;
+    --tip-bg: #e2e8f0; --tip-fg: #0f172a; --tip-muted: #475569;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0a1020; --fg: #cbd5e1; --fg-strong: #e9eef6; --muted: #8693a8;
+  --window: #0f172a; --card: #162037; --border: #2b3a58; --grid: #22304d; --axis: #3d4d6e;
+  --accent: #4f8cff; --accent-track: #203458; --accent-wash: rgba(79, 140, 255, 0.16);
+  --warn: #d97706; --warn-track: #3f3015; --warn-wash: rgba(217, 119, 6, 0.16);
+  --warn-soft: #3a2a0f; --warn-ink: #fbbf24;
+  --hover: #1c2946; --selection: #1d3866; --altrow: #121b30;
+  --fuse: #55667f; --fuse-track: #24324e; --chip: #212d4a;
+  --btn: #1a2540; --focus: #7fb0ff;
+  --tip-bg: #e2e8f0; --tip-fg: #0f172a; --tip-muted: #475569;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif; }
+p { margin: 0; }
+code { font-family: Consolas, ui-monospace, monospace; font-size: 0.95em; }
+.page { max-width: 1134px; margin: 0 auto; padding-block: 24px 40px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.page-head h1 { margin: 0 0 2px; font-size: 18px; font-weight: 600; color: var(--fg-strong); }
+.page-head p { color: var(--muted); }
+
+.cand { margin-top: 30px; }
+.cand-label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; margin-bottom: 10px; }
+.cand-tag { font-weight: 600; color: var(--accent); }
+.cand-name { font-weight: 600; font-size: 14px; color: var(--fg-strong); }
+.cand-what { color: var(--muted); }
+.frame-scroll { overflow-x: auto; }
+.trade { margin-top: 10px; font-size: 12.5px; }
+.trade b { font-weight: 600; color: var(--fg-strong); }
+.trade .sep { color: var(--muted); margin: 0 6px; }
+
+/* the framed tab panel */
+.frame { width: 1100px; height: 560px; background: var(--window); border: 1px solid var(--border); border-radius: 6px; display: flex; flex-direction: column; overflow: hidden; }
+.ph { flex: none; height: 44px; display: flex; align-items: center; gap: 14px; padding: 0 16px; background: var(--card); border-bottom: 1px solid var(--border); }
+.ph .tab { align-self: stretch; display: flex; align-items: center; font-size: 14px; font-weight: 600; color: var(--fg-strong); border-bottom: 2px solid var(--accent); margin-bottom: -1px; padding: 0 2px; }
+.ph .upd { color: var(--muted); font-size: 12px; }
+.ph .upd time { font-family: Consolas, ui-monospace, monospace; }
+.ph .grow { flex: 1; }
+.pb { flex: 1; min-height: 0; padding: 16px; transition: opacity 0.2s; }
+.frame.busy .pb { opacity: 0.5; }
+
+.btn { font: inherit; font-size: 12.5px; color: var(--fg); background: var(--btn); border: 1px solid var(--border); border-radius: 4px; padding: 4px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.btn:hover { background: var(--hover); }
+.btn .gl { font-size: 13px; line-height: 1; }
+.btn:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; }
+.prov-h { display: flex; align-items: baseline; gap: 8px; }
+.prov-name { font-weight: 600; font-size: 13.5px; color: var(--fg-strong); }
+.prov-plan { color: var(--muted); font-size: 12px; }
+.chip { display: inline-block; font-size: 11px; font-weight: 500; line-height: 17px; padding: 0 7px; border-radius: 9px; background: var(--chip); color: var(--muted); }
+.chip.warn { background: var(--warn-soft); color: var(--warn-ink); }
+.tm { cursor: default; }
+
+/* candidate A: rings and fuses */
+.a-body { display: grid; grid-template-columns: 600px 1fr 1fr; gap: 12px; }
+.a-prov { display: flex; flex-direction: column; padding: 14px 16px 12px; min-width: 0; }
+.a-meters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; align-items: start; margin-top: 88px; }
+.a-meters.one { grid-template-columns: 1fr; }
+.a-meter { display: flex; flex-direction: column; align-items: center; padding: 8px 2px; border-radius: 6px; }
+.a-meter:hover { background: var(--hover); }
+.m-name { display: flex; align-items: center; gap: 6px; height: 18px; white-space: nowrap; font-weight: 600; font-size: 12.5px; color: var(--fg-strong); }
+.ring-box { width: 100%; height: 120px; margin: 12px 0 14px; display: flex; align-items: center; justify-content: center; }
+.ring { position: relative; }
+.ring svg { display: block; }
+.ring circle { fill: none; }
+.arc.normal { stroke: var(--accent); } .arc.warn { stroke: var(--warn); }
+.trk.normal { stroke: var(--accent-track); } .trk.warn { stroke: var(--warn-track); }
+.ring-c { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; line-height: 1; }
+.ring-n { font-size: 30px; font-weight: 600; letter-spacing: -0.5px; color: var(--fg-strong); }
+.ring-n small { font-size: 0.55em; font-weight: 600; margin-left: 1px; }
+.ring.sm .ring-n { font-size: 22px; }
+.ring-u { margin-top: 4px; font-size: 11px; color: var(--muted); }
+.fuse { width: 100%; height: 4px; display: flex; gap: 2px; }
+.fuse i { background: var(--fuse); border-radius: 2px 0 0 2px; }
+.fuse b { flex: 1 1 0; min-width: 3px; background: var(--fuse-track); border-radius: 0 2px 2px 0; }
+.fuse-l, .m-sub { align-self: stretch; text-align: right; white-space: nowrap; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.fuse-l { margin-top: 6px; }
+.fuse-l strong { font-weight: 600; color: var(--fg); }
+.m-sub { margin-top: 1px; }
+.a-slot { margin: 14px 2px 0; padding: 9px 8px; border: 1px dashed var(--border); border-radius: 6px; text-align: center; font-size: 12px; color: var(--muted); }
+.prov-f { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--grid); font-size: 12px; color: var(--muted); }
+.prov-f b { font-weight: 600; color: var(--fg); }
+.a-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; text-align: center; padding-bottom: 24px; }
+.ghost { width: 72px; height: 72px; border-radius: 50%; border: 1.5px dashed var(--axis); display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 18px; margin-bottom: 6px; }
+.e1 { font-weight: 600; color: var(--fg); }
+.e2 { font-size: 12px; color: var(--muted); max-width: 300px; }
+.e-btns { display: flex; flex-direction: column; align-items: center; gap: 8px; margin-top: 6px; }
+.e-btns.row { flex-direction: row; justify-content: center; }
+
+/* candidate B: bars on a shared clock */
+.b-body { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+.b-list { display: flex; flex-direction: column; overflow: hidden; }
+.b-cols, .b-row { display: grid; grid-template-columns: 210px 1fr 72px 80px; column-gap: 16px; align-items: center; padding: 0 16px; }
+.b-cols { flex: none; height: 30px; font-size: 11.5px; color: var(--muted); border-bottom: 1px solid var(--border); }
+.b-cols .r, .b-left { text-align: right; }
+.b-group { display: flex; align-items: baseline; gap: 8px; padding: 12px 16px 2px; }
+.b-group .extra { margin-left: auto; font-size: 12px; color: var(--muted); }
+.b-group .extra b { font-weight: 600; color: var(--fg); }
+.b-row { min-height: 48px; border-top: 1px solid var(--grid); }
+.b-group + .b-row { border-top: 0; }
+.b-row.tm:hover { background: var(--hover); }
+.b-row.hl, .b-row.hl:hover { background: var(--selection); }
+.b-name { display: flex; flex-direction: column; line-height: 1.3; color: var(--fg-strong); }
+.b-name small { font-size: 11.5px; color: var(--muted); }
+.b-bar { display: flex; gap: 2px; height: 8px; }
+.b-bar i { background: var(--accent); border-radius: 0 4px 4px 0; }
+.b-bar b { flex: 1 1 0; min-width: 3px; background: var(--accent-track); border-radius: 0 4px 4px 0; }
+.b-bar.warn i { background: var(--warn); }
+.b-bar.warn b { background: var(--warn-track); }
+.b-left { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.b-left strong { font-size: 14px; font-weight: 600; color: var(--fg-strong); }
+.b-none { grid-column: 2 / 5; color: var(--muted); }
+.b-off { display: flex; align-items: center; gap: 16px; padding: 10px 16px 12px; margin-top: 2px; background: var(--altrow); color: var(--muted); }
+.b-off .txt { flex: 1; min-width: 0; }
+.b-off .e1 { color: var(--fg); font-weight: 500; }
+.b-off .e2 { max-width: none; font-size: 11.5px; }
+.b-off .e-btns { margin: 0; }
+.b-time { display: flex; flex-direction: column; overflow: hidden; }
+.b-time-h { display: flex; align-items: baseline; gap: 8px; padding: 12px 16px 0; }
+.b-time svg { display: block; }
+.tl-grid { stroke: var(--grid); }
+.tl-axis, .tl-now, .tl-lead { stroke: var(--axis); fill: none; }
+.tl-dot { fill: var(--accent); stroke: var(--card); stroke-width: 2; }
+.tl-day { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tl-t1 { fill: var(--fg-strong); font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tl-rel { fill: var(--muted); font-weight: 400; }
+.tl-m { fill: var(--fg); font-size: 12px; cursor: default; }
+.tl-m.hl { fill: var(--fg-strong); font-weight: 600; }
+
+/* candidate C: burn pace tiles */
+.c-body { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-rows: auto 1fr auto 1fr; column-gap: 12px; row-gap: 6px; }
+.c-cap { display: flex; align-items: baseline; gap: 8px; padding: 0 2px; }
+.c-cap.second { margin-top: 8px; }
+.c-cap .extra { margin-left: auto; font-size: 12px; color: var(--muted); }
+.c-cap .extra b { font-weight: 600; color: var(--fg); }
+.c-tile { min-height: 0; padding: 11px 14px 6px; display: flex; flex-direction: column; }
+.c-tile.tm:hover { border-color: var(--axis); }
+.c-top { display: flex; align-items: center; gap: 8px; }
+.c-win { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+.c-nums { display: flex; gap: 28px; margin-top: 4px; }
+.c-nums div { display: flex; align-items: baseline; gap: 5px; }
+.c-nums b { font-size: 24px; font-weight: 600; letter-spacing: -0.3px; color: var(--fg-strong); }
+.c-nums span { font-size: 12px; color: var(--muted); }
+.c-chart { margin-top: auto; }
+.c-chart svg { display: block; }
+.cg { stroke: var(--grid); }
+.cax { stroke: var(--axis); }
+.cguide { stroke: var(--muted); stroke-width: 1.6; stroke-dasharray: 0.1 4; stroke-linecap: round; fill: none; }
+.carea.normal { fill: var(--accent-wash); } .carea.warn { fill: var(--warn-wash); }
+.cline { stroke-width: 2; stroke-linecap: round; }
+.cline.normal { stroke: var(--accent); } .cline.warn { stroke: var(--warn); }
+.cdot { stroke: var(--card); stroke-width: 2; }
+.cdot.normal { fill: var(--accent); } .cdot.warn { fill: var(--warn); }
+.clab { fill: var(--muted); font-size: 11px; }
+.c-ghost { position: relative; margin-top: auto; }
+.c-ghost p { position: absolute; inset: 0 0 14px; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+.c-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; text-align: center; padding-bottom: 6px; }
+
+.tip { position: fixed; z-index: 10; pointer-events: none; max-width: 300px; padding: 7px 10px; border-radius: 5px; background: var(--tip-bg); color: var(--tip-muted); font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums; }
+.tip .t1 { color: var(--tip-fg); font-weight: 600; }
+.tip[hidden] { display: none; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="page">
+  <header class="page-head">
+    <h1>In / Out Usage Candidates</h1>
+    <p>Choose a layout for the AI usage tab, which shows how much is left in each rate-limit window and when it resets.</p>
+  </header>
+
+  <!-- candidate A -->
+  <section class="cand">
+    <div class="cand-label">
+      <span class="cand-tag">Candidate A</span>
+      <span class="cand-name">Rings and fuses</span>
+      <span class="cand-what">Makes the amount left in each window the first thing you read.</span>
+    </div>
+    <div class="frame-scroll">
+      <div class="frame">
+        <div class="ph">
+          <span class="tab">AI usage</span>
+          <span class="upd">Updated <time>4:43 PM</time></span>
+          <span class="grow"></span>
+          <button class="btn refresh" type="button"><span class="gl" aria-hidden="true">&#8635;</span>Refresh</button>
+        </div>
+        <div class="pb a-body">
+          <section class="card a-prov">
+            <header class="prov-h"><span class="prov-name">Anthropic</span><span class="prov-plan">Claude Max 20x</span></header>
+            <div class="a-meters">
+              <div class="a-meter tm" tabindex="0" data-tm="session">
+                <div class="m-name">Session <span class="chip">normal</span></div>
+                <div class="ring-box"><div class="ring" data-m="session" data-size="120"></div></div>
+                <div class="fuse"><i style="width:54%"></i><b></b></div>
+                <div class="fuse-l">resets in <strong>2&nbsp;h&nbsp;17&nbsp;m</strong> · 7:00 PM</div>
+              </div>
+              <div class="a-meter tm" tabindex="0" data-tm="weekly">
+                <div class="m-name">Weekly, all models <span class="chip warn">warning</span></div>
+                <div class="ring-box"><div class="ring sm" data-m="weekly" data-size="92"></div></div>
+                <div class="fuse"><i style="width:98.6%"></i><b></b></div>
+                <div class="fuse-l">resets in <strong>2&nbsp;h&nbsp;17&nbsp;m</strong> · 7:00 PM</div>
+              </div>
+              <div class="a-meter tm" tabindex="0" data-tm="fable">
+                <div class="m-name">Weekly, Fable only <span class="chip">normal</span></div>
+                <div class="ring-box"><div class="ring sm" data-m="fable" data-size="92"></div></div>
+                <div class="fuse"><i style="width:98.6%"></i><b></b></div>
+                <div class="fuse-l">resets in <strong>2&nbsp;h&nbsp;17&nbsp;m</strong> · 7:00 PM</div>
+                <div class="m-sub">headroom 15% of weekly</div>
+              </div>
+            </div>
+            <footer class="prov-f"><b>Extra usage on</b> · $0.00 of $200.00 used</footer>
+          </section>
+          <section class="card a-prov">
+            <header class="prov-h"><span class="prov-name">OpenAI</span><span class="prov-plan">ChatGPT plan via Codex</span></header>
+            <div class="a-meters one">
+              <div class="a-meter tm" tabindex="0" data-tm="codex">
+                <div class="m-name">Weekly <span class="chip">normal</span></div>
+                <div class="ring-box"><div class="ring" data-m="codex" data-size="120"></div></div>
+                <div class="fuse"><i style="width:0.4%"></i><b></b></div>
+                <div class="fuse-l">resets in <strong>6&nbsp;d&nbsp;23&nbsp;h</strong> · Fri 4:08 PM</div>
+              </div>
+            </div>
+            <div class="a-slot">No 5-hour window reported</div>
+          </section>
+          <section class="card a-prov">
+            <header class="prov-h"><span class="prov-name">Google</span><span class="prov-plan">Gemini AI Pro</span></header>
+            <div class="a-empty">
+              <div class="ghost" aria-hidden="true">&ndash;</div>
+              <p class="e1">No local source on this machine.</p>
+              <p class="e2">The Gemini CLI stopped serving AI Pro on 2026-06-18. The Antigravity CLI (<code>agy</code>) is not installed.</p>
+              <div class="e-btns">
+                <button class="btn" type="button">Open usage page</button>
+                <button class="btn" type="button">Set up Antigravity</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+    <p class="trade"><b>Best at:</b> remaining amount per meter, read from the big numbers.<span class="sep">/</span><b>Costs:</b> time to reset is a second read, in the fuse label under each ring.</p>
+  </section>
+
+  <!-- candidate B -->
+  <section class="cand">
+    <div class="cand-label">
+      <span class="cand-tag">Candidate B</span>
+      <span class="cand-name">Bars on a shared clock</span>
+      <span class="cand-what">Makes the order of resets obvious by putting every reset on one seven-day clock.</span>
+    </div>
+    <div class="frame-scroll">
+      <div class="frame">
+        <div class="ph">
+          <span class="tab">AI usage</span>
+          <span class="upd">Updated <time>4:43 PM</time></span>
+          <span class="grow"></span>
+          <button class="btn refresh" type="button"><span class="gl" aria-hidden="true">&#8635;</span>Refresh</button>
+        </div>
+        <div class="pb b-body">
+          <section class="card b-list">
+            <div class="b-cols"><span>Meter</span><span>Used</span><span class="r">Left</span><span>Status</span></div>
+
+            <div class="b-group"><span class="prov-name">Anthropic</span><span class="prov-plan">Claude Max 20x</span><span class="extra"><b>Extra usage on</b> · $0.00 of $200.00 used</span></div>
+            <div class="b-row tm" tabindex="0" data-tm="session" data-key="c-session">
+              <div class="b-name">Session<small>5-hour window</small></div>
+              <div class="b-bar"><i style="width:34%"></i><b></b></div>
+              <div class="b-left"><strong>66%</strong> left</div>
+              <div><span class="chip">normal</span></div>
+            </div>
+            <div class="b-row tm" tabindex="0" data-tm="weekly" data-key="c-weekly">
+              <div class="b-name">Weekly, all models<small>7-day window</small></div>
+              <div class="b-bar warn"><i style="width:80%"></i><b></b></div>
+              <div class="b-left"><strong>20%</strong> left</div>
+              <div><span class="chip warn">warning</span></div>
+            </div>
+            <div class="b-row tm" tabindex="0" data-tm="fable" data-key="c-fable">
+              <div class="b-name">Weekly, Fable only<small>7-day window · headroom 15% of weekly</small></div>
+              <div class="b-bar"><i style="width:70%"></i><b></b></div>
+              <div class="b-left"><strong>30%</strong> left</div>
+              <div><span class="chip">normal</span></div>
+            </div>
+
+            <div class="b-group"><span class="prov-name">OpenAI</span><span class="prov-plan">ChatGPT plan via Codex</span></div>
+            <div class="b-row tm" tabindex="0" data-tm="codex" data-key="x-weekly">
+              <div class="b-name">Weekly<small>7-day window</small></div>
+              <div class="b-bar"><i style="width:6%"></i><b></b></div>
+              <div class="b-left"><strong>94%</strong> left</div>
+              <div><span class="chip">normal</span></div>
+            </div>
+            <div class="b-row">
+              <div class="b-name">5-hour<small>5-hour window</small></div>
+              <div class="b-none">No 5-hour window reported</div>
+            </div>
+
+            <div class="b-group"><span class="prov-name">Google</span><span class="prov-plan">Gemini AI Pro</span></div>
+            <div class="b-off">
+              <div class="txt">
+                <p class="e1">No local source on this machine.</p>
+                <p class="e2">The Gemini CLI stopped serving AI Pro on 2026-06-18. The Antigravity CLI (<code>agy</code>) is not installed.</p>
+              </div>
+              <div class="e-btns row">
+                <button class="btn" type="button">Open usage page</button>
+                <button class="btn" type="button">Set up Antigravity</button>
+              </div>
+            </div>
+          </section>
+          <section class="card b-time">
+            <div class="b-time-h"><span class="prov-name">Resets</span><span class="prov-plan">now to 7 days out</span></div>
+            <svg id="b-tl" width="350" height="430" viewBox="0 0 350 430" role="img" aria-label="Reset timeline: Claude session, weekly and Fable reset at 7:00 PM today; Codex weekly resets Friday 4:08 PM."></svg>
+          </section>
+        </div>
+      </div>
+    </div>
+    <p class="trade"><b>Best at:</b> which window resets first, since all resets sit on one clock.<span class="sep">/</span><b>Costs:</b> more rows to read; less visual than rings.</p>
+  </section>
+
+  <!-- candidate C -->
+  <section class="cand">
+    <div class="cand-label">
+      <span class="cand-tag">Candidate C</span>
+      <span class="cand-name">Burn pace tiles</span>
+      <span class="cand-what">Shows in one mark whether each window is being spent faster or slower than it refills.</span>
+    </div>
+    <div class="frame-scroll">
+      <div class="frame">
+        <div class="ph">
+          <span class="tab">AI usage</span>
+          <span class="upd">Updated <time>4:43 PM</time></span>
+          <span class="grow"></span>
+          <button class="btn refresh" type="button"><span class="gl" aria-hidden="true">&#8635;</span>Refresh</button>
+        </div>
+        <div class="pb c-body">
+          <div class="c-cap" style="grid-column: 1 / 4"><span class="prov-name">Anthropic</span><span class="prov-plan">Claude Max 20x</span><span class="extra"><b>Extra usage on</b> · $0.00 of $200.00 used</span></div>
+
+          <div class="card c-tile tm" tabindex="0" data-tm="session" data-pace="1">
+            <div class="c-top"><span class="m-name">Session</span><span class="chip">normal</span><span class="c-win">5-hour window</span></div>
+            <div class="c-nums"><div><b>66%</b><span>left</span></div><div><b>2&nbsp;h&nbsp;17&nbsp;m</b><span>to reset</span></div></div>
+            <div class="c-chart" data-m="session" data-guide="1"></div>
+          </div>
+          <div class="card c-tile tm" tabindex="0" data-tm="weekly" data-pace="1">
+            <div class="c-top"><span class="m-name">Weekly, all models</span><span class="chip warn">warning</span><span class="c-win">7-day window</span></div>
+            <div class="c-nums"><div><b>20%</b><span>left</span></div><div><b>2&nbsp;h&nbsp;17&nbsp;m</b><span>to reset</span></div></div>
+            <div class="c-chart" data-m="weekly"></div>
+          </div>
+          <div class="card c-tile tm" tabindex="0" data-tm="fable" data-pace="1">
+            <div class="c-top"><span class="m-name">Weekly, Fable only</span><span class="chip">normal</span><span class="c-win">headroom 15% of weekly</span></div>
+            <div class="c-nums"><div><b>30%</b><span>left</span></div><div><b>2&nbsp;h&nbsp;17&nbsp;m</b><span>to reset</span></div></div>
+            <div class="c-chart" data-m="fable"></div>
+          </div>
+
+          <div class="c-cap second" style="grid-column: 1 / 3"><span class="prov-name">OpenAI</span><span class="prov-plan">ChatGPT plan via Codex</span></div>
+          <div class="c-cap second" style="grid-column: 3 / 4"><span class="prov-name">Google</span><span class="prov-plan">Gemini AI Pro</span></div>
+
+          <div class="card c-tile tm" tabindex="0" data-tm="codex" data-pace="1">
+            <div class="c-top"><span class="m-name">Weekly</span><span class="chip">normal</span><span class="c-win">7-day window</span></div>
+            <div class="c-nums"><div><b>94%</b><span>left</span></div><div><b>6&nbsp;d&nbsp;23&nbsp;h</b><span>to reset</span></div></div>
+            <div class="c-chart" data-m="codex"></div>
+          </div>
+          <div class="card c-tile">
+            <div class="c-top"><span class="m-name">5-hour</span><span class="c-win">5-hour window</span></div>
+            <div class="c-ghost"><div class="c-chart" data-ghost="1"></div><p>No 5-hour window reported</p></div>
+          </div>
+          <div class="card c-tile">
+            <div class="c-empty">
+              <p class="e1">No local source on this machine.</p>
+              <p class="e2">The Gemini CLI stopped serving AI Pro on 2026-06-18. The Antigravity CLI (<code>agy</code>) is not installed.</p>
+              <div class="e-btns row">
+                <button class="btn" type="button">Open usage page</button>
+                <button class="btn" type="button">Set up Antigravity</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="trade"><b>Best at:</b> both quantities and the pace in one mark.<span class="sep">/</span><b>Costs:</b> needs a few seconds to learn; the busiest of the three.</p>
+  </section>
+</div>
+
+<div id="tip" class="tip" role="tooltip" hidden></div>
+
+<script>
+(function () {
+  // live reads, 2026-10-17 4:43 PM CDT
+  var M = {
+    session: { used: 34, left: 66, el: 54, sev: 'normal', win: '5-hour window', reset: '2026-10-17 7:00 PM CDT', name: 'Claude session' },
+    weekly:  { used: 80, left: 20, el: 98.6, sev: 'warn', win: '7-day window', reset: '2026-10-17 7:00 PM CDT', name: 'Claude weekly, all models' },
+    fable:   { used: 70, left: 30, el: 98.6, sev: 'normal', win: '7-day window, Fable only', reset: '2026-10-17 7:00 PM CDT', name: 'Claude weekly, Fable only' },
+    codex:   { used: 6, left: 94, el: 0.4, sev: 'normal', win: '7-day window', reset: '2026-10-24 4:08 PM CDT', name: 'Codex weekly' }
+  };
+  var keyOf = { session: 'c-session', weekly: 'c-weekly', fable: 'c-fable', codex: 'x-weekly' };
+
+  function tipLines(key, pace) {
+    var m = M[key];
+    var lines = [m.used + '% used · ' + m.left + '% left', 'Resets ' + m.reset, m.win];
+    if (pace) lines.push((m.used <= m.el ? 'Below' : 'Above') + ' even pace: ' + m.el + '% of the window has passed');
+    return lines;
+  }
+  document.querySelectorAll('[data-tm]').forEach(function (el) {
+    var lines = tipLines(el.dataset.tm, el.dataset.pace);
+    el.dataset.tip = lines.join('|');
+    el.setAttribute('aria-label', M[el.dataset.tm].name + ': ' + lines.join('. '));
+  });
+
+  // A: rings show the remaining share, starting at 12 o'clock
+  document.querySelectorAll('.ring').forEach(function (el) {
+    var m = M[el.dataset.m], size = +el.dataset.size, sw = size >= 110 ? 8 : 7;
+    var c = size / 2, r = (size - sw) / 2, C = 2 * Math.PI * r;
+    // round caps add half a stroke at each end, so trim the dash to keep the visible arc true
+    var dash = Math.max(0.01, m.left / 100 * C - sw);
+    el.innerHTML =
+      '<svg width="' + size + '" height="' + size + '" viewBox="0 0 ' + size + ' ' + size + '" aria-hidden="true">' +
+      '<circle class="trk ' + m.sev + '" cx="' + c + '" cy="' + c + '" r="' + r + '" stroke-width="' + sw + '"/>' +
+      '<circle class="arc ' + m.sev + '" cx="' + c + '" cy="' + c + '" r="' + r + '" stroke-width="' + sw + '" stroke-linecap="round"' +
+      ' stroke-dasharray="' + dash.toFixed(2) + ' ' + C.toFixed(2) + '" stroke-dashoffset="' + (-sw / 2) + '" transform="rotate(-90 ' + c + ' ' + c + ')"/>' +
+      '</svg><div class="ring-c"><span class="ring-n">' + m.left + '<small>%</small></span><span class="ring-u">left</span></div>';
+  });
+
+  // B: one linear clock, now to 7 days out
+  (function () {
+    var svg = document.getElementById('b-tl');
+    var W = 350, ax = 82, y0 = 24, y1 = 400, span = 168;
+    function y(h) { return +(y0 + h / span * (y1 - y0)).toFixed(1); }
+    var s = '';
+    s += '<line class="tl-now" x1="8" x2="' + (W - 8) + '" y1="' + y0 + '" y2="' + y0 + '"/>';
+    s += '<text class="tl-day" x="' + (ax - 10) + '" y="' + (y0 - 6) + '" text-anchor="end">now 4:43 PM</text>';
+    ['Sat 18', 'Sun 19', 'Mon 20', 'Tue 21', 'Wed 22', 'Thu 23', 'Fri 24'].forEach(function (n, i) {
+      var yy = y(7 + 17 / 60 + 24 * i);
+      s += '<line class="tl-grid" x1="16" x2="' + (ax + 6) + '" y1="' + yy + '" y2="' + yy + '"/>';
+      s += '<text class="tl-day" x="' + (ax - 10) + '" y="' + (yy + 14) + '" text-anchor="end">' + n + '</text>';
+    });
+    s += '<line class="tl-axis" x1="' + ax + '" x2="' + ax + '" y1="' + y0 + '" y2="' + y1 + '"/>';
+    s += '<line class="tl-axis" x1="' + (ax - 4) + '" x2="' + (ax + 4) + '" y1="' + y1 + '" y2="' + y1 + '"/>';
+    s += '<text class="tl-day" x="' + (ax - 10) + '" y="' + (y1 + 4) + '" text-anchor="end">+7 days</text>';
+
+    // claude: three meters share one reset, so one dot carries a stacked label
+    var yc = y(2 + 17 / 60), tx = ax + 22, ly = yc + 18;
+    s += '<path class="tl-lead" d="M' + (ax + 7) + ' ' + yc + ' L' + (ax + 18) + ' ' + (ly - 4) + '"/>';
+    s += '<text class="tl-t1" x="' + tx + '" y="' + ly + '">7:00 PM today<tspan class="tl-rel" dx="6">in 2 h 17 m</tspan></text>';
+    ['session', 'weekly', 'fable'].forEach(function (k, i) {
+      s += '<text class="tl-m" data-key="' + keyOf[k] + '" data-tip="' + tipLines(k).join('|') + '" x="' + tx + '" y="' + (ly + 16 * (i + 1)) + '">' + M[k].name + '</text>';
+    });
+    s += '<circle class="tl-dot" cx="' + ax + '" cy="' + yc + '" r="4.5"/>';
+
+    // codex sits at the end of the clock, so its label reads upward from the dot
+    var yk = y(167 + 25 / 60);
+    s += '<path class="tl-lead" d="M' + (ax + 7) + ' ' + yk + ' L' + (ax + 18) + ' ' + (yk - 10) + '"/>';
+    s += '<text class="tl-t1" x="' + tx + '" y="' + (yk - 22) + '">Fri 4:08 PM<tspan class="tl-rel" dx="6">in 6 d 23 h</tspan></text>';
+    s += '<text class="tl-m" data-key="x-weekly" data-tip="' + tipLines('codex').join('|') + '" x="' + tx + '" y="' + (yk - 6) + '">Codex weekly</text>';
+    s += '<circle class="tl-dot" cx="' + ax + '" cy="' + yk + '" r="4.5"/>';
+    svg.innerHTML = s;
+  })();
+
+  // C: x is time through the window, y is percent used; the dotted line is even burn
+  document.querySelectorAll('.c-chart').forEach(function (el) {
+    var W = 318, H = 106, x0 = 8, x1 = W - 42, top = 8, base = 86, mid = (top + base) / 2;
+    var s = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" aria-hidden="true">';
+    s += '<line class="cg" x1="' + x0 + '" x2="' + x1 + '" y1="' + top + '" y2="' + top + '"/>';
+    s += '<line class="cg" x1="' + x0 + '" x2="' + x1 + '" y1="' + mid + '" y2="' + mid + '"/>';
+    s += '<line class="cg" x1="' + x1 + '" x2="' + x1 + '" y1="' + top + '" y2="' + base + '"/>';
+    s += '<line class="' + (el.dataset.ghost ? 'cg' : 'cax') + '" x1="' + x0 + '" x2="' + x1 + '" y1="' + base + '" y2="' + base + '"/>';
+    if (!el.dataset.ghost) {
+      var m = M[el.dataset.m];
+      var dx = +(x0 + m.el / 100 * (x1 - x0)).toFixed(1), dy = +(base - m.used / 100 * (base - top)).toFixed(1);
+      s += '<line class="cguide" x1="' + x0 + '" y1="' + base + '" x2="' + x1 + '" y2="' + top + '"/>';
+      if (el.dataset.guide) {
+        var gx = x0 + 0.78 * (x1 - x0), gy = base - 0.78 * (base - top) - 6;
+        var ang = -Math.atan((base - top) / (x1 - x0)) * 180 / Math.PI;
+        s += '<text class="clab" x="' + gx.toFixed(1) + '" y="' + gy.toFixed(1) + '" text-anchor="middle" transform="rotate(' + ang.toFixed(1) + ' ' + gx.toFixed(1) + ' ' + gy.toFixed(1) + ')">even pace</text>';
+      }
+      s += '<polygon class="carea ' + m.sev + '" points="' + x0 + ',' + base + ' ' + dx + ',' + dy + ' ' + dx + ',' + base + '"/>';
+      s += '<line class="cline ' + m.sev + '" x1="' + x0 + '" y1="' + base + '" x2="' + dx + '" y2="' + dy + '"/>';
+      s += '<circle class="cdot ' + m.sev + '" cx="' + dx + '" cy="' + dy + '" r="5"/>';
+      var lx = Math.min(Math.max(dx, x0 + 4), x1 - 10);
+      s += '<text class="clab" x="' + lx + '" y="' + (base + 15) + '" text-anchor="middle">now</text>';
+      s += '<text class="clab" x="' + (x1 + 6) + '" y="' + (base + 4) + '">reset</text>';
+    }
+    el.innerHTML = s + '</svg>';
+  });
+
+  // tooltip: hover and keyboard focus show the same text
+  var tip = document.getElementById('tip');
+  function fill(el) {
+    var lines = el.dataset.tip.split('|');
+    tip.innerHTML = lines.map(function (l, i) { return '<div' + (i ? '' : ' class="t1"') + '>' + l + '</div>'; }).join('');
+    tip.hidden = false;
+  }
+  function place(x, y) {
+    var w = tip.offsetWidth, h = tip.offsetHeight, vw = window.innerWidth, vh = window.innerHeight;
+    var left = x + 14, top = y + 16;
+    if (left + w > vw - 8) left = Math.max(8, x - w - 14);
+    if (top + h > vh - 8) top = Math.max(8, y - h - 12);
+    tip.style.left = left + 'px'; tip.style.top = top + 'px';
+  }
+  function hl(el, on) {
+    var k = el && el.dataset.key, frame = el && el.closest('.frame');
+    if (!k || !frame) return;
+    frame.querySelectorAll('[data-key="' + k + '"]').forEach(function (n) { n.classList.toggle('hl', on); });
+  }
+  var cur = null;
+  document.addEventListener('mouseover', function (e) {
+    var el = e.target.closest('[data-tip]');
+    if (el === cur) return;
+    if (cur) hl(cur, false);
+    cur = el;
+    if (!el) { tip.hidden = true; return; }
+    fill(el); place(e.clientX, e.clientY); hl(el, true);
+  });
+  document.addEventListener('mousemove', function (e) { if (cur) place(e.clientX, e.clientY); });
+  document.addEventListener('focusin', function (e) {
+    var el = e.target.closest('[data-tip]');
+    if (!el) return;
+    var r = el.getBoundingClientRect();
+    fill(el); place(r.left + Math.min(r.width / 2, 120), r.bottom - 8); hl(el, true);
+  });
+  document.addEventListener('focusout', function (e) {
+    var el = e.target.closest('[data-tip]');
+    if (el) { tip.hidden = true; hl(el, false); }
+  });
+  window.addEventListener('scroll', function () { tip.hidden = true; }, { passive: true });
+
+  // refresh: hold the current render at reduced opacity, no layout jump
+  document.querySelectorAll('.refresh').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var f = b.closest('.frame');
+      f.classList.add('busy');
+      setTimeout(function () { f.classList.remove('busy'); }, 650);
+    });
+  });
+})();
+</script>

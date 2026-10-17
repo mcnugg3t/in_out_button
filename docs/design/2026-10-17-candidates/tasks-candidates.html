@@ -1,0 +1,469 @@
+<title>In / Out Tasks Candidates</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<style>
+:root{
+  --bg:#f1f3f6; --frame:#f1f3f6; --head:#ffffff; --card:#ffffff; --field:#ffffff; --cell:#f8f9fb;
+  --fg:#18212f; --subtle:#78808c; --border:#d8dce3;
+  --accent:#2563eb; --accent-text:#2563eb; --on-status:#ffffff;
+  --hover:#edf1f7; --selection:#dbeafe; --alt:#f8f9fb;
+  --ok:#15803d; --warn:#c48604; --fail:#dc2626; --fail-text:#b91c1c;
+  --glyph-idle:#8a929e;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f172a; --frame:#0f172a; --head:#162037; --card:#162037; --field:#101a30; --cell:#121c33;
+    --fg:#cbd5e1; --subtle:#8b97ad; --border:#2a3858;
+    --accent:#4d8dff; --accent-text:#8cb4ff; --on-status:#ffffff;
+    --hover:#1f2c4a; --selection:#1c3567; --alt:#131d33;
+    --ok:#0e9f6e; --warn:#c48604; --fail:#dc2626; --fail-text:#fca5a5;
+    --glyph-idle:#7f8ba3;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f172a; --frame:#0f172a; --head:#162037; --card:#162037; --field:#101a30; --cell:#121c33;
+  --fg:#cbd5e1; --subtle:#8b97ad; --border:#2a3858;
+  --accent:#4d8dff; --accent-text:#8cb4ff; --on-status:#ffffff;
+  --hover:#1f2c4a; --selection:#1c3567; --alt:#131d33;
+  --ok:#0e9f6e; --warn:#c48604; --fail:#dc2626; --fail-text:#fca5a5;
+  --glyph-idle:#7f8ba3;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 "Segoe UI",system-ui,-apple-system,sans-serif}
+button,input,select,textarea{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media (prefers-reduced-motion: no-preference){
+  .card,.chip,.btn,.pill,.add,.tog,.foot,.seg button{transition:background-color .12s ease}
+  .foot svg{transition:transform .12s ease}
+}
+
+/* page */
+.page{max-width:1132px;margin:0 auto;padding-block:20px 36px;padding-left:max(16px, env(safe-area-inset-left, 0px));padding-right:max(16px, env(safe-area-inset-right, 0px))}
+.page-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 14px}
+.page-head h1{font-size:18px;font-weight:600;margin:0}
+.page-head p{margin:0;color:var(--subtle)}
+.cand{margin-top:28px}
+.cand-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;margin-bottom:8px}
+.cand-id{font-size:12px;font-weight:600;color:var(--accent-text)}
+.cand-head h2{font-size:15px;font-weight:600;margin:0}
+.cand-head p{margin:0;color:var(--subtle)}
+.trade{margin:8px 0 0;font-size:12.5px}
+.trade b{font-weight:600}
+.trade .sep{color:var(--subtle);padding:0 6px}
+.frame-scroll{overflow-x:auto;overflow-y:hidden;max-width:100%}
+.frame{width:1100px;height:560px;border:1px solid var(--border);border-radius:6px;background:var(--frame);display:flex;flex-direction:column;overflow:hidden}
+
+/* shared chrome */
+.tabhead{flex:none;height:40px;display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--head);border-bottom:1px solid var(--border)}
+.tabname{font-size:14px;font-weight:600}
+.saved{margin-left:auto;color:var(--subtle);font-size:12px}
+.btn{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;border:1px solid var(--border);border-radius:4px;background:var(--card);cursor:pointer;white-space:nowrap}
+.btn:hover{background:var(--hover)}
+.btn.ghost{border-color:transparent;background:transparent;color:var(--subtle)}
+.btn.ghost:hover{background:var(--hover);color:var(--fg)}
+.i{width:12px;height:12px;flex:none;fill:none;stroke:currentColor;stroke-width:1.3;stroke-linecap:round;stroke-linejoin:round}
+.flag{width:12px;height:12px;flex:none}
+.flag path{stroke:currentColor;stroke-width:1.2;stroke-linejoin:round;stroke-linecap:round}
+.flag .fl{fill:currentColor}
+.flag .pole{fill:none}
+.flag.urgent{color:var(--fail)}
+.flag.important{color:var(--warn)}
+.glyph{display:inline-flex;width:16px;height:16px;flex:none}
+.glyph svg{width:100%;height:100%;display:block}
+.g-idle{fill:none;stroke:var(--glyph-idle);stroke-width:1.5}
+.g-ring{fill:none;stroke:var(--accent);stroke-width:1.5}
+.g-half{fill:var(--accent)}
+.g-done{fill:var(--ok)}
+.g-check{fill:none;stroke:var(--on-status);stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.n{color:var(--subtle);font-weight:400;font-variant-numeric:tabular-nums}
+.empty{color:var(--subtle);font-size:12px;padding:6px 4px}
+
+/* card */
+.card{display:grid;grid-template-columns:16px minmax(0,1fr);column-gap:8px;padding:9px 10px;background:var(--card);border:1px solid var(--border);border-radius:6px;cursor:grab}
+.card:hover{background:var(--hover)}
+.card>.glyph{margin-top:1px}
+.title{font-size:13px;line-height:18px;overflow-wrap:anywhere}
+.done .title{text-decoration:line-through;color:var(--subtle)}
+.card.sel,.card.sel:hover{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);background:var(--selection)}
+.repo{font-family:Consolas,ui-monospace,monospace;font-size:11.5px;line-height:16px;color:var(--subtle);margin-top:2px;overflow-wrap:anywhere}
+.meta{display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;margin-top:6px;font-size:12px;color:var(--subtle);font-variant-numeric:tabular-nums}
+.meta>span,.chip-m>span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.due.over{color:var(--fail-text);background:color-mix(in srgb, var(--fail) 12%, transparent);padding:0 6px;border-radius:4px;font-weight:600;line-height:18px}
+.due.today{color:var(--accent-text);font-weight:600}
+.done .due.today{color:var(--subtle);font-weight:400}
+.prio{color:var(--fg)}
+.done .prio{color:var(--subtle)}
+.add{display:flex;align-items:center;gap:6px;width:100%;height:30px;flex:none;padding:0 8px;border:0;border-radius:4px;background:transparent;color:var(--accent-text);cursor:pointer;text-align:left}
+.add:hover{background:var(--hover)}
+.colhead,.lane-head{display:flex;align-items:center;gap:7px;font-weight:600;padding:2px 2px 8px;margin-bottom:6px;border-bottom:1px solid var(--border);flex:none}
+
+/* A: Planner, grouped by progress */
+.a-body{flex:1;min-height:0;display:flex}
+.a-main{flex:1;min-width:0;display:flex;flex-direction:column;padding:12px 14px 10px}
+.a-bar{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex:none}
+.pills{display:flex;gap:8px}
+.pill{display:inline-flex;align-items:center;gap:8px;height:28px;padding:0 12px;border:1px solid var(--border);border-radius:14px;background:var(--card);cursor:pointer}
+.pill:hover{background:var(--hover)}
+.pill[aria-selected="true"]{background:var(--selection);border-color:var(--accent);color:var(--accent-text);font-weight:600}
+.pill[aria-selected="true"] .n{color:var(--accent-text)}
+.a-bar .btn.ghost{margin-left:auto}
+.a-cols{flex:1;min-height:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.col{display:flex;flex-direction:column;min-height:0}
+.col-list{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:2px}
+.col.dim .colhead{color:var(--subtle)}
+.col.dim .card{background:var(--alt)}
+.col.dim .card:hover{background:var(--hover)}
+.a-pane{flex:none;width:300px;border-left:1px solid var(--border);background:var(--card);overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.a-pane[hidden]{display:none}
+.pane-top{display:grid;grid-template-columns:16px minmax(0,1fr) 24px;gap:6px;align-items:start}
+.pane-top .glyph{margin-top:6px}
+.ttl{width:100%;height:44px;padding:4px 6px;border:1px solid transparent;border-radius:4px;background:transparent;font-weight:600;font-size:13.5px;line-height:18px;resize:none}
+.ttl:hover{border-color:var(--border)}
+.icon-btn{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:4px;background:transparent;color:var(--subtle);cursor:pointer}
+.icon-btn:hover{background:var(--hover);color:var(--fg)}
+.fld{display:flex;flex-direction:column;gap:3px;min-width:0}
+.lbl{font-size:11.5px;color:var(--subtle)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.ctl{display:block;width:100%;height:28px;padding:0 8px;border:1px solid var(--border);border-radius:4px;background:var(--field);color:var(--fg)}
+.ctl:hover{border-color:var(--subtle)}
+textarea.ctl{height:auto;padding:5px 8px;line-height:17px;resize:none}
+.mono{font-family:Consolas,ui-monospace,monospace;font-size:12px}
+.dd{position:relative;display:block}
+.dd select{appearance:none;-webkit-appearance:none;padding-right:24px;cursor:pointer}
+.dd::after{content:"";position:absolute;right:10px;top:50%;width:6px;height:6px;margin-top:-5px;border-right:1.5px solid var(--subtle);border-bottom:1.5px solid var(--subtle);transform:rotate(45deg);pointer-events:none}
+.with-ic{position:relative;display:block}
+.with-ic .i{position:absolute;left:9px;top:8px;color:var(--subtle);pointer-events:none}
+.with-ic .ctl{padding-left:27px}
+.cl{display:flex;flex-direction:column}
+.cl label{display:flex;align-items:center;gap:8px;min-height:22px;padding:0 4px;border-radius:4px;cursor:pointer;font-size:12.5px}
+.cl label:hover{background:var(--hover)}
+.cl input{accent-color:var(--accent);margin:0;width:14px;height:14px;flex:none}
+.cl input:checked+span{text-decoration:line-through;color:var(--subtle)}
+.add.sm{height:24px;font-size:12.5px;padding:0 4px}
+
+/* B: three lanes */
+.b-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:10px 14px;gap:10px}
+.b-filter{display:flex;align-items:center;gap:12px;flex:none}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:4px;background:var(--card);overflow:hidden}
+.seg button{height:26px;padding:0 12px;border:0;border-right:1px solid var(--border);background:transparent;cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button:hover{background:var(--hover)}
+.seg button:focus-visible{outline-offset:-2px}
+.seg button[aria-pressed="true"]{background:var(--selection);color:var(--accent-text);font-weight:600}
+.search{margin-left:auto;width:240px}
+.b-lanes{flex:1;min-height:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.lane{display:flex;flex-direction:column;min-height:0}
+.lane-list{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:2px}
+.foot{display:flex;align-items:center;gap:6px;width:100%;height:30px;flex:none;padding:0 8px;border:0;border-top:1px solid var(--border);background:transparent;color:var(--subtle);cursor:pointer;text-align:left}
+.foot:hover{background:var(--hover);color:var(--fg)}
+.foot[aria-expanded="true"] svg{transform:rotate(90deg)}
+
+/* C: swimlanes */
+.c-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:10px 14px;gap:10px}
+.c-bar{display:flex;align-items:center;gap:8px;flex:none}
+.tog{height:26px;padding:0 12px;border:1px solid var(--border);border-radius:13px;background:var(--card);cursor:pointer}
+.tog:hover{background:var(--hover)}
+.tog[aria-pressed="true"]{background:var(--selection);border-color:var(--accent);color:var(--accent-text);font-weight:600}
+.chkbox{display:inline-flex;align-items:center;gap:6px;margin-left:10px;cursor:pointer}
+.chkbox input{accent-color:var(--accent);margin:0;width:14px;height:14px}
+.hint{margin-left:auto;color:var(--subtle);font-size:12px}
+.c-grid{display:grid;grid-template-columns:104px repeat(3,minmax(0,1fr));gap:6px;align-content:start}
+.c-grid.two{grid-template-columns:104px repeat(2,minmax(0,1fr))}
+.c-colhead{display:flex;align-items:center;gap:7px;font-weight:600;padding:2px 4px}
+.c-rowhead{display:flex;flex-direction:column;gap:1px;padding:8px 4px}
+.c-rowhead b{font-weight:600}
+.c-rowhead span{color:var(--subtle);font-size:12px;font-variant-numeric:tabular-nums}
+.c-cell{background:var(--cell);border:1px solid var(--border);border-radius:6px;padding:6px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.c-cell .add{height:24px;font-size:12px;color:var(--subtle)}
+.c-cell .add:hover{color:var(--accent-text)}
+.chip{position:relative;display:flex;align-items:center;gap:6px;height:28px;padding:0 8px;background:var(--card);border:1px solid var(--border);border-radius:4px;cursor:grab;min-width:0}
+.chip:hover{background:var(--hover)}
+.chip>.glyph{width:14px;height:14px}
+.chip-t{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chip.done .chip-t{text-decoration:line-through;color:var(--subtle)}
+.chip-m{flex:none;display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--subtle);font-variant-numeric:tabular-nums}
+.chip-m .due.over{line-height:16px}
+.pop{display:none;position:absolute;z-index:5;left:-1px;right:-1px;top:-1px;grid-template-columns:14px minmax(0,1fr);column-gap:6px;padding:6px 8px 7px;background:var(--hover);border:1px solid var(--accent);border-radius:4px;cursor:grab}
+.pop>.glyph{width:14px;height:14px;margin-top:2px}
+.chip:hover .pop,.chip:focus-visible .pop{display:grid}
+.pop .meta{margin-top:4px}
+</style>
+
+<div class="page">
+  <header class="page-head">
+    <h1>In / Out Tasks Candidates</h1>
+    <p>Choose how the Tasks tab arranges the three buckets and the three progress states.</p>
+  </header>
+
+  <section class="cand">
+    <div class="cand-head">
+      <span class="cand-id">Candidate A</span>
+      <h2>Planner, grouped by progress</h2>
+      <p>Makes it easiest to see where one bucket's tasks stand and to edit the selected one.</p>
+    </div>
+    <div class="frame-scroll" tabindex="0" role="region" aria-label="Candidate A mockup">
+      <div class="frame" id="cand-a">
+        <div class="tabhead">
+          <span class="tabname">Tasks</span>
+          <button class="btn" type="button"><svg class="i" viewBox="0 0 12 12"><path d="M6 2v8M2 6h8"/></svg>New task</button>
+          <span class="saved">Saved to persistent-memory · synced at sign-out</span>
+        </div>
+        <div class="a-body">
+          <div class="a-main">
+            <div class="a-bar">
+              <div class="pills" role="tablist" aria-label="Buckets"></div>
+              <button class="btn ghost" type="button">Group by: Progress <svg class="i" viewBox="0 0 12 12"><path d="M3 4.5l3 3 3-3"/></svg></button>
+            </div>
+            <div class="a-cols"></div>
+          </div>
+          <aside class="a-pane" aria-label="Task details"></aside>
+        </div>
+      </div>
+    </div>
+    <p class="trade"><b>Best at:</b> feels like Planner, full edit pane, one bucket's work in focus.<span class="sep">/</span><b>Costs:</b> switching pills to see the other buckets; busiest to build.</p>
+  </section>
+
+  <section class="cand">
+    <div class="cand-head">
+      <span class="cand-id">Candidate B</span>
+      <h2>Three lanes</h2>
+      <p>Makes it easiest to see every open task in all three buckets at once, in progress first.</p>
+    </div>
+    <div class="frame-scroll" tabindex="0" role="region" aria-label="Candidate B mockup">
+      <div class="frame" id="cand-b">
+        <div class="tabhead">
+          <span class="tabname">Tasks</span>
+          <button class="btn" type="button"><svg class="i" viewBox="0 0 12 12"><path d="M6 2v8M2 6h8"/></svg>New task</button>
+          <span class="saved">Saved to persistent-memory · synced at sign-out</span>
+        </div>
+        <div class="b-body">
+          <div class="b-filter">
+            <div class="seg" role="group" aria-label="Filter">
+              <button type="button" data-f="all" aria-pressed="true">All</button>
+              <button type="button" data-f="week" aria-pressed="false">Due this week</button>
+              <button type="button" data-f="over" aria-pressed="false">Overdue</button>
+            </div>
+            <label class="search with-ic"><svg class="i" viewBox="0 0 12 12"><circle cx="5.2" cy="5.2" r="3.5"/><path d="M7.8 7.8l2.7 2.7"/></svg><input class="ctl" type="search" placeholder="Search tasks" aria-label="Search tasks"></label>
+          </div>
+          <div class="b-lanes"></div>
+        </div>
+      </div>
+    </div>
+    <p class="trade"><b>Best at:</b> the whole week on one screen, nothing hidden, simplest to build and to keep tidy.<span class="sep">/</span><b>Costs:</b> progress is only a glyph; no in-place editor, so editing opens a dialog.</p>
+  </section>
+
+  <section class="cand">
+    <div class="cand-head">
+      <span class="cand-id">Candidate C</span>
+      <h2>Swimlanes</h2>
+      <p>Makes it easiest to see the full bucket by progress matrix, all nine cells at once.</p>
+    </div>
+    <div class="frame-scroll" tabindex="0" role="region" aria-label="Candidate C mockup">
+      <div class="frame" id="cand-c">
+        <div class="tabhead">
+          <span class="tabname">Tasks</span>
+          <button class="btn" type="button"><svg class="i" viewBox="0 0 12 12"><path d="M6 2v8M2 6h8"/></svg>New task</button>
+          <span class="saved">Saved to persistent-memory · synced at sign-out</span>
+        </div>
+        <div class="c-body">
+          <div class="c-bar">
+            <button class="tog" type="button" data-w="today" aria-pressed="false">Today</button>
+            <button class="tog" type="button" data-w="week" aria-pressed="false">This week</button>
+            <label class="chkbox"><input type="checkbox" checked>Show completed</label>
+            <span class="hint">Drag a card to any cell to change its bucket or progress</span>
+          </div>
+          <div class="c-grid"></div>
+        </div>
+      </div>
+    </div>
+    <p class="trade"><b>Best at:</b> the full matrix of bucket by state at once, and dragging between any two cells.<span class="sep">/</span><b>Costs:</b> cells get cramped past about six cards; single-line cards hide detail.</p>
+  </section>
+</div>
+
+<script>
+(() => {
+  // sample tasks are illustrative; "today" is fixed so the due chips read the same on every load
+  const TODAY = '2026-10-17', WEEK_END = '2026-10-23';
+  const BUCKETS = [['p', 'Projects'], ['a', 'Admin'], ['m', 'Misc']];
+  const STATES = ['Not started', 'In progress', 'Completed'];
+  const SRC = [
+    {id: 1, b: 'p', t: 'Usage and tasks tabs: Astra plan review', s: 1, due: '2026-10-18', pr: 'Important', cl: [2, 5], repo: 'in_out_button'},
+    {id: 2, b: 'p', t: 'Refit buffer pH GAM with September data', s: 0, due: '2026-10-24', repo: 'rrl_sikora'},
+    {id: 3, b: 'p', t: 'Fix rerun row merge in review grid', s: 2, due: '2026-10-15', cl: [4, 4], repo: 'watertown_agronomy'},
+    {id: 4, b: 'p', t: 'Capacity plan 2027: staffing table', s: 0, due: '2026-10-31', repo: 'capacity_estimation'},
+    {id: 5, b: 'p', t: 'Proficiency scraper: NAPT round 2026-3 import', s: 1, due: '2026-10-21', cl: [1, 3], repo: 'rrl_proficiency_scraper'},
+    {id: 6, b: 'a', t: 'October expense report', s: 0, due: '2026-10-20', pr: 'Urgent'},
+    {id: 7, b: 'a', t: 'Prep notes for Thursday one-on-one', s: 1, due: '2026-10-23'},
+    {id: 8, b: 'a', t: 'Renew OneDrive app consent with IT', s: 0, due: '2026-11-01'},
+    {id: 9, b: 'a', t: 'Approve timesheets', s: 2, due: '2026-10-17'},
+    {id: 10, b: 'm', t: 'Order winter rye for food plots', s: 0, due: '2026-10-22', pr: 'Important'},
+    {id: 11, b: 'm', t: 'Rebuild Debug exe after sign-in change', s: 2, due: '2026-10-10'},
+    {id: 12, b: 'm', t: 'Read Kugel, chapter 4', s: 0, due: null},
+    {id: 13, b: 'm', t: 'Truck oil change', s: 0, due: '2026-10-15'}
+  ];
+  const CHECKLISTS = {
+    1: [['Write usage tab spec', 1], ['Write tasks tab spec', 1], ['Send both specs to Astra', 0], ['Triage Astra findings', 0], ['Commit the post-review spec', 0]],
+    3: [['Reproduce with a rerun sample', 1], ['Merge rows on sample id', 1], ['Add a regression test', 1], ['Check the grid totals', 1]],
+    5: [['Download the round 2026-3 report', 1], ['Map analytes to lab codes', 0], ['Import and spot-check', 0]]
+  };
+  const NOTES = {1: 'Pick one candidate per tab first.\nThen send both specs to Astra.'};
+  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  const I = {
+    plus: '<svg class="i" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 2v8M2 6h8"/></svg>',
+    cal: '<svg class="i" viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="2.5" width="9" height="8" rx="1.5"/><path d="M1.5 5.2h9M4 1.3v2.2M8 1.3v2.2"/></svg>',
+    chk: '<svg class="i" viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="9" rx="2"/><path d="M3.8 6.1l1.6 1.6 2.9-3"/></svg>',
+    chev: '<svg class="i" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 3l3 3-3 3"/></svg>',
+    x: '<svg class="i" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6"/></svg>'
+  };
+  const GLYPH = [
+    '<circle class="g-idle" cx="8" cy="8" r="6.25"/>',
+    '<circle class="g-ring" cx="8" cy="8" r="6.25"/><path class="g-half" d="M8 1.75a6.25 6.25 0 0 1 0 12.5z"/>',
+    '<circle class="g-done" cx="8" cy="8" r="7"/><path class="g-check" d="M4.9 8.3l2 2 4.2-4.4"/>'
+  ];
+
+  const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const fmt = iso => { const [, m, d] = iso.split('-').map(Number); return MON[m - 1] + ' ' + d; };
+  const longDate = iso => fmt(iso) + ', ' + iso.slice(0, 4);
+  const byDue = (x, y) => (x.due || '9999').localeCompare(y.due || '9999');
+  const glyph = s => `<span class="glyph" role="img" aria-label="${STATES[s]}" title="${STATES[s]}"><svg viewBox="0 0 16 16">${GLYPH[s]}</svg></span>`;
+  const flag = pr => `<svg class="flag ${pr.toLowerCase()}" viewBox="0 0 12 12" aria-hidden="true"><path class="pole" d="M2.5 11V1.5"/><path class="fl" d="M2.5 2h6.6L7.6 4.5 9.1 7H2.5z"/></svg>`;
+  function dueInfo(t) {
+    if (!t.due) return null;
+    if (t.s !== 2 && t.due < TODAY) return {cls: 'over', txt: 'Overdue · ' + fmt(t.due)};
+    if (t.due === TODAY) return {cls: 'today', txt: 'Today'};
+    return {cls: '', txt: fmt(t.due)};
+  }
+  function metaParts(t, icons) {
+    const m = [], d = dueInfo(t);
+    if (d) m.push(`<span class="due ${d.cls}">${icons ? I.cal : ''}${d.txt}</span>`);
+    if (t.pr) m.push(`<span class="prio">${flag(t.pr)}${t.pr}</span>`);
+    if (t.cl) m.push(`<span title="Checklist: ${t.cl[0]} of ${t.cl[1]} done">${I.chk}${t.cl[0]}/${t.cl[1]}</span>`);
+    return m.join('');
+  }
+  const body = t => { const m = metaParts(t, true); return `<div class="body"><div class="title">${esc(t.t)}</div>${t.repo ? `<div class="repo">${t.repo}</div>` : ''}${m ? `<div class="meta">${m}</div>` : ''}</div>`; };
+  const card = (t, sel) => `<div class="card${t.s === 2 ? ' done' : ''}${sel ? ' sel' : ''}" tabindex="0" draggable="true" data-id="${t.id}">${glyph(t.s)}${body(t)}</div>`;
+  const options = (list, pick) => list.map(v => `<option${v === pick ? ' selected' : ''}>${v}</option>`).join('');
+
+  // candidate A: one bucket, columns by progress, detail pane
+  const A = {bucket: 'p', sel: 1, open: true, tasks: SRC.map(t => ({...t, cl: t.cl ? [...t.cl] : null})),
+    cl: Object.fromEntries(Object.entries(CHECKLISTS).map(([k, v]) => [k, v.map(i => [...i])]))};
+  const aRoot = document.getElementById('cand-a');
+  function renderAPills() {
+    aRoot.querySelector('.pills').innerHTML = BUCKETS.map(([k, n]) =>
+      `<button class="pill" type="button" role="tab" aria-selected="${A.bucket === k}" data-b="${k}">${n}<span class="n">${A.tasks.filter(t => t.b === k).length}</span></button>`).join('');
+  }
+  function renderACols() {
+    const list = A.tasks.filter(t => t.b === A.bucket);
+    aRoot.querySelector('.a-cols').innerHTML = STATES.map((name, s) => {
+      const ts = list.filter(t => t.s === s).sort(byDue);
+      return `<div class="col${s === 2 ? ' dim' : ''}"><div class="colhead">${glyph(s)}${name}<span class="n">${ts.length}</span></div>` +
+        `<div class="col-list">${ts.map(t => card(t, A.open && t.id === A.sel)).join('') || '<div class="empty">No tasks</div>'}` +
+        `<button class="add" type="button">${I.plus}Add task</button></div></div>`;
+    }).join('');
+  }
+  function renderAPane() {
+    const pane = aRoot.querySelector('.a-pane');
+    pane.hidden = !A.open;
+    if (!A.open) return;
+    const t = A.tasks.find(x => x.id === A.sel), items = A.cl[t.id] || [];
+    const done = items.filter(i => i[1]).length;
+    pane.innerHTML =
+      `<div class="pane-top">${glyph(t.s)}<textarea class="ttl" rows="2" aria-label="Title">${esc(t.t)}</textarea>` +
+      `<button class="icon-btn" type="button" data-close aria-label="Close details">${I.x}</button></div>` +
+      `<div class="row2"><label class="fld"><span class="lbl">Bucket</span><span class="dd"><select class="ctl">${options(BUCKETS.map(b => b[1]), BUCKETS.find(b => b[0] === t.b)[1])}</select></span></label>` +
+      `<label class="fld"><span class="lbl">Progress</span><span class="dd"><select class="ctl">${options(STATES, STATES[t.s])}</select></span></label></div>` +
+      `<div class="row2"><label class="fld"><span class="lbl">Due date</span><span class="with-ic">${I.cal}<input class="ctl" value="${t.due ? longDate(t.due) : ''}" placeholder="None"></span></label>` +
+      `<label class="fld"><span class="lbl">Priority</span><span class="dd"><select class="ctl">${options(['Urgent', 'Important', 'Medium', 'Low'], t.pr || 'Medium')}</select></span></label></div>` +
+      (t.repo ? `<label class="fld"><span class="lbl">Repo</span><input class="ctl mono" value="${t.repo}"></label>` : '') +
+      `<div class="fld"><span class="lbl">Checklist <span class="cl-n">${items.length ? done + '/' + items.length : ''}</span></span><div class="cl">` +
+      items.map((it, i) => `<label><input type="checkbox" data-i="${i}"${it[1] ? ' checked' : ''}><span>${esc(it[0])}</span></label>`).join('') +
+      `</div><button class="add sm" type="button">${I.plus}Add an item</button></div>` +
+      `<label class="fld"><span class="lbl">Notes</span><textarea class="ctl" rows="3" placeholder="Add a note">${esc(NOTES[t.id] || '')}</textarea></label>`;
+  }
+  aRoot.addEventListener('click', e => {
+    const pill = e.target.closest('.pill');
+    if (pill) { A.bucket = pill.dataset.b; renderAPills(); renderACols(); aRoot.querySelector(`.pill[data-b="${A.bucket}"]`).focus(); return; }
+    const c = e.target.closest('.card');
+    if (c) { A.sel = +c.dataset.id; A.open = true; renderACols(); renderAPane(); aRoot.querySelector(`.card[data-id="${A.sel}"]`).focus(); return; }
+    if (e.target.closest('[data-close]')) { A.open = false; renderACols(); renderAPane(); }
+  });
+  aRoot.addEventListener('keydown', e => {
+    if ((e.key === 'Enter' || e.key === ' ') && e.target.classList.contains('card')) { e.preventDefault(); e.target.click(); }
+  });
+  aRoot.addEventListener('change', e => {
+    const box = e.target.closest('.cl input');
+    if (!box) return;
+    const t = A.tasks.find(x => x.id === A.sel), items = A.cl[t.id];
+    items[+box.dataset.i][1] = box.checked ? 1 : 0;
+    t.cl = [items.filter(i => i[1]).length, items.length];
+    aRoot.querySelector('.cl-n').textContent = t.cl[0] + '/' + t.cl[1];
+    renderACols();
+  });
+  renderAPills(); renderACols(); renderAPane();
+
+  // candidate B: buckets are the columns, completed folded into a footer
+  const B = {f: 'all', q: '', open: new Set()};
+  const bRoot = document.getElementById('cand-b');
+  function matchB(t) {
+    if (B.q && !(t.t + ' ' + (t.repo || '')).toLowerCase().includes(B.q)) return false;
+    if (B.f === 'week') return !!t.due && t.due >= TODAY && t.due <= WEEK_END;
+    if (B.f === 'over') return t.s !== 2 && !!t.due && t.due < TODAY;
+    return true;
+  }
+  function renderB() {
+    bRoot.querySelector('.b-lanes').innerHTML = BUCKETS.map(([k, n]) => {
+      const all = SRC.filter(t => t.b === k && matchB(t));
+      const open = [...all.filter(t => t.s === 1).sort(byDue), ...all.filter(t => t.s === 0).sort(byDue)];
+      const done = all.filter(t => t.s === 2).sort(byDue), ex = B.open.has(k);
+      return `<section class="lane" aria-label="${n}"><div class="lane-head">${n}<span class="n">${all.length}</span></div><div class="lane-list">` +
+        (open.map(t => card(t)).join('') || '<div class="empty">No matching tasks</div>') +
+        `<button class="add" type="button">${I.plus}Add task</button>` +
+        (done.length ? `<button class="foot" type="button" data-b="${k}" aria-expanded="${ex}">${I.chev}Completed (${done.length})</button>${ex ? done.map(t => card(t)).join('') : ''}` : '') +
+        `</div></section>`;
+    }).join('');
+  }
+  bRoot.addEventListener('click', e => {
+    const f = e.target.closest('.seg button');
+    if (f) { B.f = f.dataset.f; bRoot.querySelectorAll('.seg button').forEach(b => b.setAttribute('aria-pressed', b === f)); renderB(); return; }
+    const foot = e.target.closest('.foot');
+    if (foot) { const k = foot.dataset.b; B.open.has(k) ? B.open.delete(k) : B.open.add(k); renderB(); bRoot.querySelector(`.foot[data-b="${k}"]`).focus(); }
+  });
+  bRoot.querySelector('input[type="search"]').addEventListener('input', e => { B.q = e.target.value.trim().toLowerCase(); renderB(); });
+  renderB();
+
+  // candidate C: bucket rows by progress columns, single-line chips
+  const C = {when: null, done: true};
+  const cRoot = document.getElementById('cand-c');
+  function matchC(t) {
+    if (C.when === 'today') return t.due === TODAY;
+    if (C.when === 'week') return !!t.due && t.due >= TODAY && t.due <= WEEK_END;
+    return true;
+  }
+  const chip = t => `<div class="chip${t.s === 2 ? ' done' : ''}" tabindex="0" draggable="true" title="${esc(t.t)}">${glyph(t.s)}` +
+    `<span class="chip-t">${esc(t.t)}</span><span class="chip-m">${metaParts(t, false)}</span>` +
+    `<div class="pop" aria-hidden="true">${glyph(t.s)}${body(t)}</div></div>`;
+  function renderC() {
+    const states = C.done ? [0, 1, 2] : [0, 1], vis = SRC.filter(matchC), grid = cRoot.querySelector('.c-grid');
+    grid.classList.toggle('two', !C.done);
+    let h = '<div></div>' + states.map(s => `<div class="c-colhead">${glyph(s)}${STATES[s]}<span class="n">${vis.filter(t => t.s === s).length}</span></div>`).join('');
+    for (const [k, n] of BUCKETS) {
+      const bt = vis.filter(t => t.b === k && states.includes(t.s));
+      h += `<div class="c-rowhead"><b>${n}</b><span>${bt.length} ${bt.length === 1 ? 'task' : 'tasks'}</span></div>`;
+      h += states.map(s => `<div class="c-cell">${bt.filter(t => t.s === s).sort(byDue).map(chip).join('')}<button class="add" type="button">${I.plus}Add task</button></div>`).join('');
+    }
+    grid.innerHTML = h;
+  }
+  cRoot.addEventListener('click', e => {
+    const tog = e.target.closest('.tog');
+    if (!tog) return;
+    C.when = C.when === tog.dataset.w ? null : tog.dataset.w;
+    cRoot.querySelectorAll('.tog').forEach(b => b.setAttribute('aria-pressed', b.dataset.w === C.when));
+    renderC();
+  });
+  cRoot.querySelector('.chkbox input').addEventListener('change', e => { C.done = e.target.checked; renderC(); });
+  renderC();
+})();
+</script>

@@ -1,0 +1,76 @@
+# Plan review council
+
+- Spec: C:\Users\caleb\Tools\in_out_button\docs\2026-10-18-burn-pace-gemini-token-spec.md
+- Prompt: prompt.txt (108112 chars)
+- Framing question: The app must never write Claude Code's credentials file. Is the refresh ladder (claude auth status, then a one-word Haiku call) safe for a running Claude Code session, and is the stale-reading display honest enough? Does the Antigravity driver bound every failure mode? Is the burn-history store sound across window resets and app restarts?
+- Run started: 20261018-163547
+- Outer timeout: 30 min
+
+## Status
+
+| Reviewer | Provider | Effort | Status | Seconds | Exit | Detail |
+|---|---|---|---|---:|---:|---|
+| Astra | OpenAI gpt-6-astra via codex | high | ok | 99.3 | 0 |  |
+| Argon | Google gemini-4-argon via the Antigravity CLI | high | error | 99.3 | 0 | jetski: no output produced — a tool required the "read_file" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under per... |
+
+---
+
+## Astra - ok - 99.3s
+
+OpenAI gpt-6-astra via codex, effort high, file astra.md
+
+(1) The five most confident objections
+
+a. The refresh ladder is not yet demonstrated safe for a running session. Empty tools, strict MCP configuration, and a neutral working directory do not disable user hooks. Hooks can execute commands or additional model calls. Claude Code’s own refresh coordination also says nothing about the tray app’s competing writes. Unaddressed, an automatic refresh can trigger unrelated work or race credential replacement. “Cannot race” is unsupported. [Claude Code hook documentation](https://code.claude.com/docs/en/hooks#disable-or-remove-hooks)
+
+b. Antigravity’s failure bounds cover the immediate process incompletely. JsonLineProcess.Dispose skips killing descendants when the parent has already exited. Its parent-only IsAlive test cannot establish tree cleanup. A browser opened through an existing browser process also falls outside that cleanup. The redirected log has no stated size or secret-handling bound. Unaddressed, a timed-out invocation can leave processes, browser activity, or sensitive disk output behind. Microsoft explicitly distinguishes parent exit from descendant termination. [Process.Kill documentation](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.kill)
+
+c. Timestamp filtering does not establish which quota window a point belongs to. History lacks account identity, window identity, and the meter’s quota definition. Switching accounts or moving reset boundaries can retain incompatible observations under the same key. The inclusive boundary also admits an old-window observation exactly at the new window’s start. Unaddressed, plausible charts can describe the wrong account or combine different allowance periods.
+
+d. Atomic replacement does not prevent lost updates. Two instances can load the same store, collect different readings, and overwrite each other’s histories. Within one instance, parallel provider completion and shared reader tasks need an explicit serialization and append-once rule. Write failures, unsupported versions, and recovery after an unreadable startup load are unspecified. Unaddressed, restarts can expose missing history or a valid store overwritten from an empty in-memory state.
+
+e. The stale display still makes unsupported claims. “Percent left” sounds current; the tooltip compares an old measurement against today’s elapsed fraction. It can move from above pace to below pace without another observation. Connecting the origin to the first sample invents consumption timing, and the normal flat tail asserts no intervening consumption. Unaddressed, the chart can encourage use based on apparent headroom that was never measured. Label inferred segments and evaluate historical pace at the observation time.
+
+(2) Assumptions to verify before building
+
+- Refresh behavior and authentication selection: test the exact installed version with expired, rejected-but-unexpired, revoked, and missing credentials. Verify which account/configuration the child uses, including environment overrides. An increased expiresAt is not proof that the usage request succeeds.
+- Running-session safety: in a controlled account, exercise simultaneous refreshes and timeout cancellation while another Claude session continues. Attribute credential-file writes to processes and verify subsequent authentication. Assess the tray writer separately.
+- Hook isolation and cost: install harmless sentinel hooks and inspect child processes and request counts. One requested output word does not establish one request or a few thousand input tokens.
+- Antigravity behavior: test expired sign-in, unavailable keyring, unknown slash command, malformed output, and executable upgrades. Confirm these paths cannot silently become model prompts.
+- Window semantics: capture consecutive readings through idle activation and an actual reset. Two idle observations do not establish a fixed, zero-based consumption window. One successful auth-status refresh likewise does not justify deleting the fallback for every state.
+
+(3) Missing or untestable acceptance criteria
+
+Define measurable requirements for:
+
+- Zero credential-file writes by the app; explicitly permitted writes by Claude Code; continued usability of the existing session.
+- Total ladder duration, cancellation cleanup, manual-click coalescing, and attempt limits across restarts. Once per expiresAt is not a daily spending bound.
+- Discovery, pipe overflow, parent-exits-first, surviving descendants, malformed field types, duplicate bucket IDs, and parser exceptions. Every eligible failure must enter cooldown.
+- Concurrent store writers, interrupted replacement, disk-full/access-denied saves, unknown versions, account changes, reset-boundary observations, and cached reads that must not become new observations.
+- Startup age enforcement and stale tooltips, labels, and accessibility text using the same historical timestamp.
+
+(4) First thing I would probe
+
+Run an Antigravity stand-in that spawns a child holding stdout open, then exits immediately. Let the cap fire. Check the child itself. The supplied Dispose logic skips tree termination once the parent has exited.
+
+(5) Checked and cleared
+
+I found no direct credential-file write in the supplied code or proposed app logic. Shell-free ArgumentList removes the described MSYS conversion path. Stale results preserve the successful read’s timestamp and remove the flat tail. Stable, nonoverlapping windows ordinarily filter correctly, apart from the shared boundary.
+
+This was source and plan review, supported by current documentation. I did not run refreshes, validate the captured Antigravity fixture, or establish live-session safety.
+
+---
+
+## Argon - error - 99.3s
+
+Google gemini-4-argon via the Antigravity CLI, effort high, file argon.md
+
+(no answer: error. jetski: no output produced — a tool required the "read_file" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. read_file(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.)
+
+---
+
+Three independent reads of the same prompt, not a verdict. Synthesis is Fable's
+job: weigh the objections, discard the ones that do not apply, and decide what
+changes before anything is built. Do not pass this file forward as a conclusion.
+
+After judging, log each reviewer outcome in agent-cooperation/routing-log/log.jsonl.

@@ -115,10 +115,12 @@ public sealed record UsageMeter(string Key, string Name, int WindowMinutes, doub
 
 `History` holds the readings the app has made of this meter inside its
 current window, oldest first, including the current reading as the last
-point. Current window means `At >= ResetsAt - WindowMinutes` and
-`At <= ResetsAt`. Readers construct meters with an empty history; the
-service fills it from the store after each read (section 4). The page draws
-the curve from the window's origin through these points.
+point. Membership is by window identity (section 4). Readers construct
+meters with an empty history; the service fills it from the store after
+each read. The page draws the curve from the window's origin through these
+points, and draws the segments it infers (origin to the first point, and
+the flat tail from the last point to now) dashed, so observed and inferred
+consumption look different.
 
 ### 3.3 Action `claude-refresh`
 
@@ -157,18 +159,33 @@ One file, `%APPDATA%\InOutButton\usage-store.json`, owned by a new
 
 - `last` keeps the most recent `ok` `ProviderUsage` per provider, with its
   `History` stripped (history lives in `history`).
-- `history` keys are `<provider>/<meter key>`; values are `[epochMs, usedPercent]`
-  pairs, oldest first. On every `ok` read the service appends a point per
-  meter, drops points older than 8 days, and caps each series at 3,000
-  points (seven days at five minutes is 2,016). Points are not deduplicated:
-  a repeated value at a new time is a real observation that the meter did
-  not move.
+- `history` keys are `<provider>/<meter key>`; values are
+  `[epochMs, usedPercent, resetsAtEpochMs]` triples, oldest first. The third
+  value is the window identity: the meter's `ResetsAt` at the time of the
+  observation. On every live `ok` read (never a cache hit, which is the same
+  observation again) the service appends a point per meter, drops points
+  older than 8 days, and caps each series at 3,000 points (seven days at
+  five minutes is 2,016). Points are not deduplicated: a repeated value at a
+  new time is a real observation that the meter did not move.
+- Window membership is by identity, not by time range: a point belongs to
+  the current window when `|point.resetsAt - meter.ResetsAt| <= 2 min`. A
+  point taken in the previous window, even one second before the reset,
+  carries the old reset time and is excluded. An idle Antigravity bucket
+  reports a moving reset time, so each idle read is its own one-point
+  window, which draws as a dot at the origin.
+- All store access runs under one lock: load, append, filter, save. The
+  readers finish in parallel, so appends serialize here.
 - Written after every read that changed it, atomically (temp file in the
-  same folder, then `File.Move` with overwrite). Read once at startup. A
-  missing or unreadable file is an empty store; a malformed file is logged
-  once and treated as empty, never thrown to the UI thread.
+  same folder, then `File.Move` with overwrite). A write failure is logged
+  once per run and never thrown to the UI thread; the in-memory store keeps
+  going. Read once at startup. A missing file is an empty store. A file that
+  does not parse, or carries a `version` the app does not know, is renamed
+  to `usage-store.bak.json` (overwriting an older `.bak`) and treated as
+  empty, so a newer app's data is not destroyed by an older build.
+- Two app instances would overwrite each other's store. The app assumes one
+  instance per login session, as it does for `settings.json`.
 - The service fills each meter's `History` from the store filtered to the
-  current window (section 3.2) before posting, for `ok` and `stale` alike.
+  current window before posting, for `ok` and `stale` alike.
 - Under test the store takes an explicit path; the default is the settings
   folder.
 
@@ -193,7 +210,17 @@ lengths are logged), working directory `%APPDATA%\InOutButton` (no project
 1. `claude auth status`. No model call.
 2. `claude -p "Reply with the single word OK." --model haiku --max-turns 1
    --tools "" --strict-mcp-config --no-session-persistence
-   --output-format json --system-prompt "You reply with one word."`
+   --setting-sources "" --output-format json
+   --system-prompt "You reply with one word."`
+
+`--setting-sources ""` loads no user, project, or local settings, so no
+hook runs; `--strict-mcp-config` with no `--mcp-config` starts no MCP
+server; `--no-session-persistence` writes no transcript. Measured on
+2026-10-18 from an empty folder: 11.8 s, 1,006 input tokens (all cache
+creation), 4 output tokens, one turn, no file left in the folder, no
+transcript under `~/.claude/projects`, credentials file untouched.
+`--bare` is not used: it skips hooks too, but it never reads OAuth
+credentials and so cannot refresh them.
 
 After each step the reader re-reads `.credentials.json`. If `expiresAt` is
 later than the value that triggered the ladder, the ladder stops, logs
@@ -217,13 +244,28 @@ shim (an extensionless file or `.cmd`), prefer
 exists, so no `cmd.exe` is involved. A hit is cached; a miss is not; a cached
 hit that fails to start is discarded, as the Codex driver does.
 
-### 5.4 Cost and side effects
+### 5.4 Bounds, cost, and side effects
 
-Step 2 is one Haiku call of a few thousand input tokens and one output
-word, at most a few times a day. It writes no session file and starts no
-MCP server. Claude Code coordinates its own cross-process refresh (the docs
-list "another Claude Code process is refreshing it" as a known state), so
-the ladder cannot race a running session.
+- Duration: two steps of at most 60 s each, so the ladder holds the
+  Anthropic read for at most 120 s; the other providers are not held.
+- Count: once per `expiresAt` value per app process when automatic. A
+  token expires once per eight hours, so three automatic runs a day is the
+  ceiling for an app that runs all day; a relaunch allows one more for the
+  same token. Manual clicks coalesce into the single flight; a click during
+  a run joins it.
+- Cost: step 2 is one Haiku call of about a thousand input tokens and one
+  output word (measured in 5.2).
+- Session safety: the ladder only ever asks Claude Code to act. Claude Code
+  serializes its own refresh across processes (its errors page documents
+  "another Claude Code process is refreshing it" as a state), and a
+  running session re-reads the file it owns. What the app cannot
+  guarantee is the tray app in section 2, which writes the same file on
+  its own clock; that is a reason to retire it, not something the ladder
+  can defend against.
+- Account: the child inherits the app's environment, so it uses the same
+  `CLAUDE_CONFIG_DIR` and the same login the reader reads. An advanced
+  `expiresAt` is treated as "try the live read now", never as success; the
+  usage request decides.
 
 ### 5.5 What stays
 
@@ -254,7 +296,21 @@ internal static ProviderUsage Parse(string replyJson, DateTimeOffset now);
 - Whole-call cap 25 s (injectable for tests). Stdout capped at 1 MB,
   stderr at 8 KB, both through the same bounded-pipe pattern as
   `JsonLineProcess` (add a `ReadAllAsync` to it, or a sibling helper that
-  reuses its `Start` and `Dispose`). Process-tree kill in `finally`.
+  reuses its `Start` and `Dispose`).
+- Descendants die with the parent. `JsonLineProcess.Start` puts the child
+  in a Windows job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+  (CreateJobObject, SetInformationJobObject, AssignProcessToJobObject;
+  about forty lines of P/Invoke), and `Dispose` closes the job handle
+  after its kill. `Process.Kill(entireProcessTree: true)` alone leaves
+  grandchildren alive once the parent has exited, which is exactly the
+  case where a child holding stdout open makes the read wait for the cap.
+  This covers the Codex driver too. A browser `agy` might open through an
+  already running browser is outside any job; the cap and cooldown bound
+  how often that could happen.
+- The redirected `agy` log is overwritten on every run and was 19 to 28 KB
+  in today's runs; it holds the account email and trace ids and no token
+  (checked: the keyring line logs only the expiry). Nothing from it is
+  read by the app.
 - Outcomes: timeout "Antigravity CLI timed out after 25 s"; could not
   start "Antigravity CLI (agy) could not be started"; non-zero exit or a
   `status` other than `SUCCESS` or stdout that is not one JSON object:
@@ -270,10 +326,10 @@ becomes one meter:
 
 | Field | Source |
 |---|---|
-| `Key` | `bucket.id` (`gemini-weekly`, `gemini-5h`, `3p-weekly`, `3p-5h`, `gemini-argon-wtu-weekly`) |
+| `Key` | `bucket.id` (`gemini-weekly`, `gemini-5h`, `3p-weekly`, `3p-5h`, `gemini-argon-wtu-weekly`); a repeated id keeps the first bucket and logs the duplicate |
 | `Name` | `group.name` verbatim ("Gemini Models", "Claude and GPT models", "Gemini 4 Argon") |
 | `WindowMinutes` | `window`: `weekly` → 10080, `5h` → 300; any other value skips the bucket with one log line |
-| `UsedPercent` | `(1 - remaining_fraction) * 100`, rounded to one decimal, clamped 0..100 |
+| `UsedPercent` | `(1 - remaining_fraction) * 100`, rounded to one decimal, clamped 0..100; a missing or non-numeric fraction skips the bucket with one log line |
 | `ResetsAt` | `reset_time` parsed as ISO 8601; unparsable skips the bucket with one log line |
 | `Severity` | the shared thresholds used for Codex |
 | `Note` | null |
@@ -281,7 +337,12 @@ becomes one meter:
 Provider-level: `Plan` = "Antigravity CLI", `Footnote` = null, `Actions` =
 empty on `ok`. A report with no usable bucket is "usage report changed shape
 (no buckets)". `response` text is never shown; the JSON data is the
-contract.
+contract. A parser exception of any kind is a failure with the fixed
+shape-change message, never a crash. Every failure in this section, parse
+failures included, sets the 10-minute cooldown. Note that `agy` exits 0
+and reports `status: "SUCCESS"` when its own `--print-timeout` fires,
+with a partial or empty `response` and no `command.data`; that lands on
+the shape-change path, which is the right outcome.
 
 ### 6.3 Why the five meters all show
 
@@ -331,8 +392,11 @@ the plot box. Drawn with `createElementNS` and attributes only.
 - Burn path: starts at the origin (a window starts at zero by definition),
   passes through each `history` point at (`elapsedAt(point.at)`,
   `point.usedPercent`), ends at the last point, then runs flat to now when
-  now is later than the last point. Without history the path is the
-  mock's single segment from the origin to (now, used).
+  now is later than the last point. Observed segments (point to point) are
+  solid; inferred segments (origin to the first point, and the flat tail)
+  are dashed. Without history the path is one dashed segment from the
+  origin to (now, used): a single reading implies a rate, it does not
+  observe one.
 - Area under the path in the severity wash; the path in the severity
   stroke; a dot at the end; "now" under the dot; "reset" at the right.
 - The 30 s tick re-derives "to reset", the now x-position, and the flat
@@ -352,6 +416,12 @@ with the same lines.
   its action buttons (the Anthropic one carries "Refresh via Claude
   Code"). Its tiles get class `stale`: muted numbers, grey wash, the chart
   path drawn to the reading's time rather than to now, with no flat tail.
+  Everything on a stale tile is evaluated at the reading's time, not now:
+  the numbers row reads `<left>% left as of <time>`, the pace verdict in
+  the tooltip and the `aria-label` compares the reading against the
+  elapsed fraction at the reading's time, and "to reset" is still
+  counted from now because the reset is a fact about the clock, not the
+  reading.
 - Any meter whose `resetsAt` has passed shows "reset at <time> · waiting
   for refresh" in place of "to reset", as today. For `ok` providers the
   page posts `{type:"stale"}` under today's rules (once per meter per
@@ -405,21 +475,33 @@ Google:
 
 Store:
 7. Round trip: save, load, equal; history filtered to a window keeps only
-   points inside it, in order, with the current reading last.
+   the points whose reset identity matches, in order, with the current
+   reading last; a point from the previous window taken one second before
+   the reset is excluded.
 8. Pruning: points older than 8 days drop; the cap holds.
-9. A malformed file loads as empty without throwing.
+9. A malformed file, and one with an unknown `version`, load as empty
+   without throwing and leave a `.bak` beside the store.
+10. A cache hit adds no point: two `RefreshAsync(fresh: false)` calls
+    inside the cache window leave one observation.
 
 Service:
-10. A failed read with a stored `ok` reading from an hour ago yields
+11. A failed read with a stored `ok` reading from an hour ago yields
     `stale` with the stored meters, the failure's message, and the stored
     `UpdatedAt`; one from eight days ago yields `unavailable`.
 
+Processes:
+12. A stand-in that starts a grandchild holding stdout open and then exits
+    at once: after the cap fires, the grandchild is dead (the job object
+    test; the Codex timeout test keeps its parent check).
+
 Anthropic ladder (no network; the credentials path is injected):
-11. With a fake step list, a step that advances `expiresAt` stops the
+13. With a fake step list, a step that advances `expiresAt` stops the
     ladder and the reader goes on to the HTTP read; steps that do not
     advance it leave the expired outcome with the `claude-refresh` action.
-12. The automatic ladder runs once per `expiresAt` value; a second expired
+14. The automatic ladder runs once per `expiresAt` value; a second expired
     read with the same value does not run it; the manual path does.
+15. The credentials fixture is byte-identical after every reader path the
+    tests drive (valid, expired, rejected): the app never writes it.
 
 The existing Gemini empty-state test moves to the not-found path.
 
@@ -472,4 +554,20 @@ pointed at scratch while the login-launched exe holds `bin/Debug`:
 
 ## 12. Plan-review triage
 
-Filled after the review runs.
+Astra (high effort, 99 s) and Argon (high effort) reviewed revision 1 of
+this spec with the first spec and `Usage.cs` as context; the raw answers
+are in `2026-10-18-burn-pace-gemini-token-spec.review/`. Rows marked
+"fixed" changed the section named.
+
+| # | Reviewer | Finding | Judgement | Outcome |
+|---|---|---|---|---|
+| A1 | Astra | The Haiku step's flags do not disable hooks; a hook can run commands or more model calls. "Cannot race" the tray app is unsupported. | Real on hooks: `--tools ""` and `--strict-mcp-config` leave settings hooks live. The tray-app point is accepted as a limit, not a defect the ladder can fix. | Fixed in 5.2: `--setting-sources ""`, measured with no hook firing. 5.4 rewritten with the tray app named as an external writer. |
+| A2 | Astra | `Process.Kill(entireProcessTree)` skips descendants once the parent has exited; the parent-only `IsAlive` test cannot show tree cleanup; the redirected log has no stated bound. | Real. A child holding stdout open after its parent exits is exactly the timeout case. | Fixed in 6.1: Windows job object on every child, test 12. Log bound and content stated. |
+| A3 | Astra | Time-range filtering does not identify the window; the inclusive boundary admits an old-window point; no account identity. | Real on window identity. Account identity declined: one login per machine is the app's standing assumption. | Fixed in 3.2 and 4: points carry the window's reset time; membership by identity within 2 min. |
+| A4 | Astra | Atomic replace does not stop lost updates between instances or between parallel readers; write failures, unknown versions, and recovery are unspecified. | Real within one instance; two instances declined (same assumption as `settings.json`). | Fixed in 4: one lock, `.bak` on unknown or unreadable, write failures logged; test 9 and 10. |
+| A5 | Astra | The stale tile's "percent left" sounds current; pace compares an old reading with today's elapsed fraction; origin-to-first-point and the flat tail are inventions drawn as facts. | Real. | Fixed in 7.3 and 7.5: inferred segments dashed; stale numbers "as of <time>"; pace evaluated at the reading's time. |
+| A6 | Astra | Verify refresh behaviour on the installed version with expired, rejected, revoked, and missing credentials; an advanced `expiresAt` is not proof the usage call succeeds. | Partly. Expired cannot be produced today without logging out; the ladder's log line is the planned observation. The second point is accepted. | 5.4: an advanced `expiresAt` only means "try the live read". Tests 13 to 15 cover the paths that can be faked. |
+| A7 | Astra | Once per `expiresAt` is not a daily spending bound; ladder duration, cancellation, click coalescing, and limits across restarts are unstated. | Real. | Fixed in 5.4 with the ceiling derived from the token lifetime. |
+| A8 | Astra | Parser cases: duplicate bucket ids, malformed field types, parser exceptions, every failure entering cooldown. | Real. | Fixed in 6.2. |
+| A9 | Astra | A cached read must not become a new observation. | Real. | Fixed in 4 and test 10. |
+| A10 | Astra | Two idle observations do not establish a zero-based consumption window for Antigravity. | Accepted as an open assumption; the store will record consecutive readings through a real window, which is the evidence. | 10 unchanged; 4 now draws an idle bucket as a one-point window so a wrong guess costs nothing. |

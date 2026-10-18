@@ -1,0 +1,2349 @@
+FRAMING QUESTION: The app must never write Claude Code's credentials file. Is the refresh ladder (claude auth status, then a one-word Haiku call) safe for a running Claude Code session, and is the stale-reading display honest enough? Does the Antigravity driver bound every failure mode? Is the burn-history store sound across window resets and app restarts?
+
+Review this plan before anything is built.
+
+Return, in this order:
+
+(1) The five most confident objections. For each one: why it matters, and what
+    would happen if it goes unaddressed.
+(2) Assumptions the plan makes that should be verified before building, and how
+    to verify each one.
+(3) Acceptance criteria that are missing or untestable.
+(4) The first thing you would probe if you had to break this.
+(5) Checked and cleared: what you looked for and did not find.
+
+Plain text, under 800 words. Do not restate the plan. Do not flatter. Say when
+you lack information.
+
+=== PLAN ===
+
+# Burn pace view, Gemini through Antigravity, and a sturdier Anthropic reader
+
+Spec written 2026-10-18 for the second session on the AI usage tab. The
+first session's spec, `2026-10-17-usage-and-tasks-tabs-spec.md`, remains the
+design record for the tab's host, message channel, scrubber, and the Codex
+driver; this spec changes only what it names. Section 12 holds the
+plan-review triage once it has run.
+
+## 1. Goals and non-goals
+
+Goals, in Caleb's order:
+
+1. Replace the rings-and-fuses page with the burn-pace view (design
+   candidate C) and make the chart a real burn history rather than one line
+   from the window start.
+2. Read Google usage from the Antigravity CLI, which is installed and signed
+   in on this machine and will be on the others.
+3. Stop the Anthropic tile from going blank every morning. The Claude Code
+   access token lives eight hours; the tile said "token expired" for every
+   hour until the first Claude Code use of the day.
+
+Non-goals:
+
+- Refreshing or writing Claude Code's `.credentials.json` from this app.
+  Only Claude Code writes that file. Unchanged from the first spec.
+- Calling any Google endpoint directly. Google suspended accounts for
+  third-party use of the Antigravity endpoint in March 2026; only the CLI
+  talks to Google.
+- A view toggle between A and C. C replaces A; A stays in git history and in
+  `docs/design/2026-10-17-candidates/`.
+- The Tasks tab's switch to candidate A. Separate job.
+- The nullable `resets_at` debt (O4). Still deferred; see section 10.
+
+## 2. Facts established today
+
+Each line was verified on this machine on 2026-10-18.
+
+- `agy -p /usage --output-format json` returns one JSON object in about 3 s
+  with `status`, `response` (the tab-separated text report), and
+  `command.data.groups[].buckets[]`, each bucket carrying `id`, `name`,
+  `window` (`weekly` or `5h`), `remaining_fraction` (0..1), `reset_time`
+  (ISO 8601 UTC). `num_turns` is 0 and no model endpoint is called; the CLI
+  log shows `Print mode: running slash command /usage` and a
+  `retrieveUserQuotaSummary` fetch. Captured as
+  `tests/fixtures/agy-usage-2026-10-18.json`.
+- The report has three groups: "Gemini Models" (weekly and 5-hour),
+  "Claude and GPT models" (weekly and 5-hour), and "Gemini 4 Argon" (weekly
+  only). An idle window reports `reset_time` as now plus the window, so its
+  elapsed fraction is 0.
+- `agy` refreshes its own Google token from the Windows keyring on every run
+  (one-hour access tokens; the log line is `browser.go: token refreshed`).
+  The app never sees that token.
+- `--log-file <path>` redirects the CLI's per-run log and overwrites it on
+  each run. Without it every run leaves a ~20 KB file in
+  `~/.gemini/antigravity-cli/log/`.
+- From Git Bash, `/usage` is rewritten to `C:/Program Files/Git/usage` by
+  MSYS path conversion and reaches the model as a prompt, which then burns
+  five model calls. The app starts processes with `ArgumentList` and no
+  shell, so this cannot happen in the app; it is recorded so nobody repeats
+  the test from Git Bash.
+- Claude Code's `.credentials.json` holds `claudeAiOauth.{accessToken,
+  refreshToken, expiresAt, refreshTokenExpiresAt, scopes, subscriptionType,
+  rateLimitTier}` and a top-level `organizationUuid`. Today's `expiresAt`
+  was exactly 8.00 h after the file's write time.
+- `claude auth status` exists (Claude Code 2.1.299), takes under 3 s, prints
+  JSON with `loggedIn` and `subscriptionType`, and did not touch the
+  credentials file while the token was valid. Whether it refreshes an
+  expired token is unknown; the docs do not say which commands refresh.
+- `claude.cmd` in the npm folder runs
+  `node_modules\@anthropic-ai\claude-code\bin\claude.exe`, a native
+  executable the app can start directly.
+- `claude -p` accepts `--tools ""`, `--strict-mcp-config` (with no
+  `--mcp-config`, no MCP server starts), `--no-session-persistence`,
+  `--max-turns 1`, `--model haiku`, and `--system-prompt`. `--bare` is
+  documented as never reading OAuth credentials, so it must not be used
+  for a refresh.
+- The `ClaudeUsage` tray app (`~/Tools/claudeusagewin`) is in HKCU Run and
+  running. It refreshes the token five minutes before expiry without a
+  client id, overwrites the file without a temp-and-rename, drops
+  `refreshTokenExpiresAt`, `rateLimitTier` and `organizationUuid`, writes
+  `subscriptionType` as null, and logs the full tokens to debug output.
+  This app's plan label reads the two fields it drops. Retiring it is
+  Caleb's call and is outside this spec.
+
+## 3. Contract changes
+
+All additive. A page that ignores the new fields still renders. Serialized
+camelCase by `WebHost`, as before.
+
+### 3.1 `ProviderUsage.State` gains `stale`
+
+`ok | unavailable | stale`. A `stale` provider carries the meters, plan, and
+footnote of its last successful read, `UpdatedAt` is that read's time, and
+`Message` (plus optional `Detail`) says why the live read failed. The page
+shows the tiles dimmed with the reading's age. `UsageState.Stale = "stale"`.
+
+Rules in `UsageService`:
+
+- A provider's outcome becomes `stale` when the live read fails and the
+  store holds an `ok` reading for that provider from the last 7 days.
+  Older than that, or none, and it stays `unavailable` as today.
+- `Plan` comes from the failure when it has one (Anthropic's expired path
+  reads the plan from the file), else from the stored reading.
+- `Actions` come from the failure. Stale is a display state, not a change
+  to what the user can do.
+
+### 3.2 `UsageMeter` gains `History`
+
+```csharp
+public sealed record UsagePoint(DateTimeOffset At, double UsedPercent);
+public sealed record UsageMeter(string Key, string Name, int WindowMinutes, double UsedPercent,
+                                DateTimeOffset ResetsAt, string Severity, string? Note,
+                                IReadOnlyList<UsagePoint> History);
+```
+
+`History` holds the readings the app has made of this meter inside its
+current window, oldest first, including the current reading as the last
+point. Current window means `At >= ResetsAt - WindowMinutes` and
+`At <= ResetsAt`. Readers construct meters with an empty history; the
+service fills it from the store after each read (section 4). The page draws
+the curve from the window's origin through these points.
+
+### 3.3 Action `claude-refresh`
+
+The Anthropic reader attaches `ProviderAction("claude-refresh", "Refresh via
+Claude Code")` to its expired and rejected outcomes. Form1 handles the id by
+running the refresh ladder (section 5) with the once-per-token bound
+bypassed, then `ReadUsageAsync(fresh: true)`. The page keeps rendering
+actions as buttons; it never learns what an id does.
+
+### 3.4 Settings
+
+Added to `AppSettings`, hand-edited in `%APPDATA%\InOutButton\settings.json`:
+
+```csharp
+public string? ClaudeExecutable { get; set; }      // override; discovered when null
+public string? AgyExecutable { get; set; }         // override; discovered when null
+public bool ClaudeRefreshAuto { get; set; } = true; // run the refresh ladder without a click
+```
+
+`UsageService.RefreshAsync(bool fresh, UsageOptions options, CancellationToken ct)`
+replaces the growing parameter list, with
+`UsageOptions(string? CodexExecutable, string? ClaudeExecutable, string? AgyExecutable, bool ClaudeRefreshAuto)`.
+
+## 4. The usage store
+
+One file, `%APPDATA%\InOutButton\usage-store.json`, owned by a new
+`UsageStore` class (`UsageStore.cs`):
+
+```json
+{
+  "version": 1,
+  "last": { "Anthropic": { ...ProviderUsage with state ok... } },
+  "history": { "Anthropic/weekly": [[1792358324731, 43.0], ...] }
+}
+```
+
+- `last` keeps the most recent `ok` `ProviderUsage` per provider, with its
+  `History` stripped (history lives in `history`).
+- `history` keys are `<provider>/<meter key>`; values are `[epochMs, usedPercent]`
+  pairs, oldest first. On every `ok` read the service appends a point per
+  meter, drops points older than 8 days, and caps each series at 3,000
+  points (seven days at five minutes is 2,016). Points are not deduplicated:
+  a repeated value at a new time is a real observation that the meter did
+  not move.
+- Written after every read that changed it, atomically (temp file in the
+  same folder, then `File.Move` with overwrite). Read once at startup. A
+  missing or unreadable file is an empty store; a malformed file is logged
+  once and treated as empty, never thrown to the UI thread.
+- The service fills each meter's `History` from the store filtered to the
+  current window (section 3.2) before posting, for `ok` and `stale` alike.
+- Under test the store takes an explicit path; the default is the settings
+  folder.
+
+## 5. Anthropic: the refresh ladder
+
+### 5.1 Trigger
+
+The ladder runs when `AnthropicUsage` would report `Expired` (local
+`expiresAt` check) or `Rejected` (401 or 403 with an unchanged token). It
+runs at most once per distinct `expiresAt` value when started automatically
+(`ClaudeRefreshAuto`), and whenever the user clicks `claude-refresh`. It
+never runs concurrently with itself (single flight, like the readers).
+
+### 5.2 Steps
+
+Each step is a child process started with `ArgumentList`, no shell, no
+window, capped at 60 s with a process-tree kill in `finally`, stdout and
+stderr drained to bounded buffers whose content is never surfaced (only
+lengths are logged), working directory `%APPDATA%\InOutButton` (no project
+`CLAUDE.md`, no git).
+
+1. `claude auth status`. No model call.
+2. `claude -p "Reply with the single word OK." --model haiku --max-turns 1
+   --tools "" --strict-mcp-config --no-session-persistence
+   --output-format json --system-prompt "You reply with one word."`
+
+After each step the reader re-reads `.credentials.json`. If `expiresAt` is
+later than the value that triggered the ladder, the ladder stops, logs
+`token refresh: <step> advanced expiresAt to <time>`, and the reader
+proceeds to the live HTTP read with the new token. If neither step moves
+it, the reader reports `Expired` (or `Rejected`) with the message
+"Claude Code token expired; the refresh ladder did not advance it", the
+`claude-refresh` action, and the log keeps each step's exit code, duration,
+and output lengths. Step 2 is skipped when `claude` is not found; the
+message then says "Claude Code (claude) not found; set ClaudeExecutable".
+
+The log line is the experiment: it records which step is enough. If the
+first morning's log shows step 1 advancing the token, step 2 becomes dead
+code to delete.
+
+### 5.3 Finding `claude`
+
+`ClaudeExecutable` when set; else `where.exe claude`. When the hit is the npm
+shim (an extensionless file or `.cmd`), prefer
+`<shim folder>\node_modules\@anthropic-ai\claude-code\bin\claude.exe` when it
+exists, so no `cmd.exe` is involved. A hit is cached; a miss is not; a cached
+hit that fails to start is discarded, as the Codex driver does.
+
+### 5.4 Cost and side effects
+
+Step 2 is one Haiku call of a few thousand input tokens and one output
+word, at most a few times a day. It writes no session file and starts no
+MCP server. Claude Code coordinates its own cross-process refresh (the docs
+list "another Claude Code process is refreshing it" as a known state), so
+the ladder cannot race a running session.
+
+### 5.5 What stays
+
+The local `expiresAt` pre-check stays, now as the ladder's trigger. The 401
+re-read-once rule stays. The 60 s cache, the no-retry on 429, and the
+`Retry-After` cooldown stay.
+
+## 6. Google: the Antigravity reader
+
+`GeminiUsage` keeps its class name and provider string "Google" and becomes
+asynchronous:
+
+```csharp
+public static Task<ReaderOutcome> ReadOutcomeAsync(string? overridePath, CancellationToken ct);  // 25 s cap
+internal static Task<ReaderOutcome> ReadOutcomeAsync(AgyLaunch launch, TimeSpan cap, CancellationToken ct);
+internal static ProviderUsage Parse(string replyJson, DateTimeOffset now);
+```
+
+### 6.1 Driver
+
+- Find `agy`: `AgyExecutable` when set; else `where.exe agy` with the
+  Codex driver's caching rules. Not found: today's empty state, unchanged
+  message and actions.
+- Start `agy` with arguments `-p /usage --output-format json --print-timeout 20s
+  --log-file <%APPDATA%\InOutButton\agy-usage.log>`. Never pass
+  `--disable-slash-commands`: it would turn `/usage` into a prompt and spend
+  five model calls. Stdin closed.
+- Whole-call cap 25 s (injectable for tests). Stdout capped at 1 MB,
+  stderr at 8 KB, both through the same bounded-pipe pattern as
+  `JsonLineProcess` (add a `ReadAllAsync` to it, or a sibling helper that
+  reuses its `Start` and `Dispose`). Process-tree kill in `finally`.
+- Outcomes: timeout "Antigravity CLI timed out after 25 s"; could not
+  start "Antigravity CLI (agy) could not be started"; non-zero exit or a
+  `status` other than `SUCCESS` or stdout that is not one JSON object:
+  "Antigravity CLI did not report usage; run agy in a terminal to check its
+  sign-in" with `Detail` = `Scrub.Message` of the first 200 characters of
+  stdout when it is not JSON, else of `response`. A failure sets a 10-minute
+  cooldown for the provider so a broken `agy` runs at most six times an hour.
+
+### 6.2 Parse
+
+From `command.data.groups[]`, in report order, each `buckets[]` entry
+becomes one meter:
+
+| Field | Source |
+|---|---|
+| `Key` | `bucket.id` (`gemini-weekly`, `gemini-5h`, `3p-weekly`, `3p-5h`, `gemini-argon-wtu-weekly`) |
+| `Name` | `group.name` verbatim ("Gemini Models", "Claude and GPT models", "Gemini 4 Argon") |
+| `WindowMinutes` | `window`: `weekly` → 10080, `5h` → 300; any other value skips the bucket with one log line |
+| `UsedPercent` | `(1 - remaining_fraction) * 100`, rounded to one decimal, clamped 0..100 |
+| `ResetsAt` | `reset_time` parsed as ISO 8601; unparsable skips the bucket with one log line |
+| `Severity` | the shared thresholds used for Codex |
+| `Note` | null |
+
+Provider-level: `Plan` = "Antigravity CLI", `Footnote` = null, `Actions` =
+empty on `ok`. A report with no usable bucket is "usage report changed shape
+(no buckets)". `response` text is never shown; the JSON data is the
+contract.
+
+### 6.3 Why the five meters all show
+
+The Claude and GPT bucket is Opus 5.5 and Sonnet 5.5 capacity through
+Antigravity, separate from the Anthropic subscription; Argon has its own
+weekly meter. Caleb's reviewer roster now includes Argon. Hiding any of the
+three groups would hide spare compute.
+
+## 7. The page: burn pace
+
+`web/usage.html` is rewritten; `web/shared.css`, `web/bridge.js` keep their
+roles. The message contract is unchanged on the wire except for the
+additive fields in section 3.
+
+### 7.1 Layout
+
+- Header as today: title, "Updated <time>", Refresh button disabled while
+  busy.
+- One caption row per provider (name, plan, right-aligned footnote), then
+  that provider's tiles in a three-column grid. Providers in the order
+  posted. The page scrolls vertically when the tiles outgrow the tab.
+- An `unavailable` provider renders one card spanning all three columns
+  with its message, detail, and action buttons.
+- A provider with a weekly meter and no 5-hour meter gets a ghost tile
+  "No 5-hour window reported" after its meters, as the mock shows. No
+  other absence is invented.
+
+### 7.2 Tile
+
+Top row: meter name, severity chip with the word (`normal`, `warning`,
+`critical`), window label on the right ("5-hour window", "7-day window",
+or the meter's `note` when present, as "headroom 15% of weekly" is today).
+Numbers row: `<left>% left` and `<d h m> to reset`. Chart below.
+
+Severity classes `normal | warn | crit` map to `--accent`, `--warn`
+(`#c48604`), and `--fail` from `shared.css`; the mock's `#b45309` is not
+used. Critical gets its own fill and stroke, which the mock lacked.
+
+### 7.3 Chart
+
+x is the fraction of the window elapsed, y is percent used, both 0..1 of
+the plot box. Drawn with `createElementNS` and attributes only.
+
+- Grid: top, middle, and base lines; a right edge at the reset.
+- Guide: a dotted diagonal from the origin to (1, 100), the even-pace line.
+  The first tile of each provider labels it "even pace".
+- Burn path: starts at the origin (a window starts at zero by definition),
+  passes through each `history` point at (`elapsedAt(point.at)`,
+  `point.usedPercent`), ends at the last point, then runs flat to now when
+  now is later than the last point. Without history the path is the
+  mock's single segment from the origin to (now, used).
+- Area under the path in the severity wash; the path in the severity
+  stroke; a dot at the end; "now" under the dot; "reset" at the right.
+- The 30 s tick re-derives "to reset", the now x-position, and the flat
+  tail from the clock; the history points are fixed once posted.
+
+### 7.4 Tooltip and keyboard
+
+Hover or focus on a tile shows: `<used>% used · <left>% left`, "Resets
+<absolute time with weekday when not today>", the window length, and
+"Above even pace: <elapsed>% of the window has passed" or "Below even
+pace: …". Text through `textContent`; the tile carries an `aria-label`
+with the same lines.
+
+### 7.5 Stale and reset-passed states
+
+- A `stale` provider's caption gains "last read <age> · <message>" and
+  its action buttons (the Anthropic one carries "Refresh via Claude
+  Code"). Its tiles get class `stale`: muted numbers, grey wash, the chart
+  path drawn to the reading's time rather than to now, with no flat tail.
+- Any meter whose `resetsAt` has passed shows "reset at <time> · waiting
+  for refresh" in place of "to reset", as today. For `ok` providers the
+  page posts `{type:"stale"}` under today's rules (once per meter per
+  snapshot, at most once per 60 s). For `stale` providers it does not post;
+  the timer, the Refresh button, and the end of a workflow are the ways
+  back.
+
+### 7.6 Browser fixture
+
+`web/sample-data.js` gains: the Google provider as `ok` with the five
+meters from the captured report (two with nonzero usage so the chart has
+shape), history points on the Anthropic weekly meter, and a `stale`
+Anthropic variant selectable with `?scenario=stale` so the page can be
+checked in a browser. The host never loads it.
+
+## 8. Form1 wiring
+
+- `OnUsageMessage` `action` case: `claude-refresh` calls
+  `_usage.RefreshClaudeTokenAsync(options, ct)` then a fresh read; the two
+  URL actions are unchanged; unknown ids are ignored as today.
+- `ReadUsageAsync` passes `UsageOptions` built from settings.
+- First read: when the usage tab is first shown while a scan or workflow
+  is busy, mark it shown and skip the immediate read; the existing
+  `SetBusy(false)` read runs it when the machine is quieter. This is the
+  deploy-day timeout from the handoff.
+- Startup: construct `UsageStore` from the settings folder and pass it to
+  `UsageService`. `_usage.Last` at `ready` time may now carry `stale`
+  providers from the store before any live read, so the page shows last
+  night's numbers within a second of opening the tab. That is intended:
+  the first live read follows at once.
+
+## 9. Tests
+
+xunit in `tests/InOutButton.Tests`, same two-tier rule as before: expected
+values come from the captured fixtures by hand, never from the code under
+test.
+
+Google:
+1. `Parse` on `agy-usage-2026-10-18.json` yields five meters with the keys,
+   names, windows, percents (0, 0, 0, 0, 1.0), and reset times read off the
+   file; the Argon one is `2026-10-25T21:19:47Z`.
+2. A mutated fixture with `remaining_fraction` 0.2 on `gemini-weekly` gives
+   80.0 and the severity the shared thresholds assign.
+3. An unknown `window` value skips that bucket and keeps the rest.
+4. `status` other than `SUCCESS`, and stdout that is not JSON, give the
+   fixed messages; `Detail` passes through `Scrub.Message`.
+5. A scripted stand-in (`powershell.exe -Command` printing the fixture)
+   drives the whole `ReadOutcomeAsync` path to `ok`.
+6. A stand-in that sleeps past the cap gives the timeout message and the
+   child is dead afterwards (same `IsAlive` check as the Codex test).
+
+Store:
+7. Round trip: save, load, equal; history filtered to a window keeps only
+   points inside it, in order, with the current reading last.
+8. Pruning: points older than 8 days drop; the cap holds.
+9. A malformed file loads as empty without throwing.
+
+Service:
+10. A failed read with a stored `ok` reading from an hour ago yields
+    `stale` with the stored meters, the failure's message, and the stored
+    `UpdatedAt`; one from eight days ago yields `unavailable`.
+
+Anthropic ladder (no network; the credentials path is injected):
+11. With a fake step list, a step that advances `expiresAt` stops the
+    ladder and the reader goes on to the HTTP read; steps that do not
+    advance it leave the expired outcome with the `claude-refresh` action.
+12. The automatic ladder runs once per `expiresAt` value; a second expired
+    read with the same value does not run it; the manual path does.
+
+The existing Gemini empty-state test moves to the not-found path.
+
+## 10. Risks and open questions
+
+- **`claude auth status` may not refresh.** Then step 2 runs each morning
+  at the cost of one Haiku call. Known the first morning from the log.
+- **`agy` with a lapsed Google sign-in.** Unknown behaviour in print mode;
+  it may try to open a browser. The cap, the tree kill, and the 10-minute
+  cooldown bound the damage; the message tells Caleb to run `agy` in a
+  terminal.
+- **Idle-window reset semantics.** `reset_time` equal to now plus the
+  window on an idle bucket is an inference from two runs. If a bucket
+  instead reports a fixed schedule, the burn chart's x-origin shifts but
+  nothing breaks.
+- **Three fixed group names** are not depended on; only the bucket ids are
+  used as keys and the names are displayed verbatim.
+- **Tile count.** Anthropic 3, OpenAI 1 or 2, Google 5: ten tiles at the
+  1060×750 launch size means the tab scrolls. Checked by screenshot before
+  shipping.
+- **O4 stays open.** A meter with null `resets_at` is still dropped. With
+  the burn chart it has no x-axis anyway; the fix is a tile that says "no
+  active window", which needs the nullable contract change and is deferred
+  again.
+- **The tray app.** While `ClaudeUsage` runs, the plan label can blank
+  after one of its rewrites and the file can be mid-write when this app
+  reads it. The reader already treats an unreadable file as a failure
+  (now: a stale display), so the app survives it. Retirement is Caleb's
+  call.
+
+## 11. Delivery
+
+Order, each step building and testing green with `--artifacts-path`
+pointed at scratch while the login-launched exe holds `bin/Debug`:
+
+1. `spec:` commit of this file and the fixture.
+2. Plan review: Astra and Argon on this spec; triage into section 12.
+3. Page port (web only), checked in a browser against `sample-data.js`
+   and then in the app.
+4. Store, stale state, history fill, Form1 options.
+5. Antigravity reader and tests.
+6. Refresh ladder and tests.
+7. `pre-review:` commit; code review by Sol 6.1 and Grok 4.7; fixes;
+   `post-review:` commit with `Reviewed-by:`.
+8. Docs: CLAUDE.md usage section, README, HANDOFF.md (which also has
+   control bytes at its Antigravity path line to repair), the
+   persistent-memory project note, routing-log rows.
+9. Ship: close the app, `dotnet build -c Debug`, relaunch, confirm the
+   three tiles live.
+
+## 12. Plan-review triage
+
+Filled after the review runs.
+
+=== FILE: 2026-10-17-usage-and-tasks-tabs-spec.md ===
+# Spec: AI usage tab and Tasks tab
+
+Date: 2026-10-17. Author: Fable, from Caleb's request and his answers to the
+forks (WebView2, tasks file in persistent-memory, Gemini empty state, usage
+candidate A, tasks candidate B). Design candidates and the brief are in
+`docs/design/2026-10-17-candidates/`.
+
+## 1. What changes for the user
+
+The window gains a tab strip in its middle row. The title, the Sign in / Sign
+out button row, and the log stay visible on every tab.
+
+- **Repos**: the existing folders card, rclone card, toolbar, and repo grid,
+  unchanged.
+- **AI usage**: one column per subscription. Anthropic shows three rings
+  (session, weekly all models, weekly Fable only), OpenAI shows one ring per
+  rate-limit window the account reports, Google shows an empty state with two
+  buttons. Each ring shows the percent left; a thin bar under it shows how far
+  through the window we are, labelled "resets in 2 h 17 m · 7:00 PM". A
+  "Refresh" button and an "Updated 4:43 PM" line sit in the tab header.
+- **Tasks**: three lanes, Projects, Admin, Misc. Cards show a progress glyph,
+  title, due chip, priority flag, checklist count, and a repo label on Projects
+  cards. In-progress cards first, then not started by due date, then a
+  collapsed "Completed (n)" footer. A filter row (All, Due this week, Overdue)
+  and a search box. "+ Add task" at the foot of each lane. Clicking a card opens
+  an in-page edit dialog. Dragging a card to another lane changes its bucket.
+
+## 2. Architecture
+
+```
+Form1.cs            TabControl in main row 1; usage timer; wiring
+WebHost.cs          WebView2 wrapper: lazy init, virtual host, JSON bridge
+Usage.cs            UsageSnapshot/ProviderUsage/UsageMeter, three readers, UsageService
+Tasks.cs            TaskItem, TaskDocument, TaskStore
+web/shared.css      theme tokens copied from Theme in Form1.cs
+web/bridge.js       send()/onMessage() over window.chrome.webview, browser fallback
+web/usage.html      candidate A, driven by messages
+web/tasks.html      candidate B, driven by messages
+tests/InOutButton.Tests/   xunit: parsers, window labels, TaskStore
+```
+
+The pages are plain HTML, CSS, and JavaScript with no libraries and no build
+step. The `web/` folder is copied to the output directory on build
+(`CopyToOutputDirectory=PreserveNewest`). C# is the single source of truth:
+every page renders only what C# sends, and every user action is a message to
+C# that answers with the full new state.
+
+### 2.1 WebHost
+
+- NuGet `Microsoft.Web.WebView2`, latest stable at build time.
+- `WebHost : UserControl` holding one `WebView2` docked fill. `InitializeAsync`
+  runs on first show: `CoreWebView2Environment.CreateAsync(null,
+  %LOCALAPPDATA%\InOutButton\WebView2)`, `EnsureCoreWebView2Async(env)`,
+  `SetVirtualHostNameToFolderMapping("inout.local", <exe dir>\web, Allow)`,
+  then `Navigate("https://inout.local/<page>.html")`.
+- Settings: `PreferredColorScheme = Light` (the WinForms chrome is light
+  regardless of the OS theme), default context menus off, status bar off,
+  dev tools on, built-in error page on.
+- Bridge: C# to page with `PostWebMessageAsJson` (camelCase JSON); page to C#
+  through `WebMessageReceived`, parsed as `JsonElement` and raised on the UI
+  thread as `MessageReceived`. Messages posted before the page says
+  `{type:"ready"}` are queued and flushed on ready.
+- Containment: `NavigationStarting` cancels any navigation whose URI is not
+  under `https://inout.local/`; `NewWindowRequested` is marked handled and
+  dropped (external links go through the action map only). Incoming messages
+  must be a JSON object with a string `type` from the page's known set; anything
+  else is ignored and counted in a debug log line at most once per session. The
+  pages render all data through `textContent` or attribute assignment, never
+  through `innerHTML` with data in it.
+- If `EnsureCoreWebView2Async` throws (runtime missing), the control shows a
+  label: "WebView2 runtime not found. Install the Evergreen WebView2 runtime
+  from Microsoft, then restart." and the log gets one line. The rest of the app
+  is unaffected.
+
+### 2.2 Usage data layer
+
+Types (records, serialized camelCase):
+
+```
+UsageSnapshot(DateTimeOffset UpdatedAt, IReadOnlyList<ProviderUsage> Providers)
+ProviderUsage(string Provider, string? Plan, string State /* ok | unavailable */,
+              string? Message, IReadOnlyList<UsageMeter> Meters, string? Footnote,
+              IReadOnlyList<ProviderAction> Actions, DateTimeOffset? UpdatedAt)
+UsageMeter(string Key, string Name, int WindowMinutes, double UsedPercent,
+           DateTimeOffset ResetsAt, string Severity /* normal | warning | critical */,
+           string? Note)
+ProviderAction(string Id, string Label)
+```
+
+**UsageService** owns one reader per provider and the policy:
+
+- Per-provider cache of 60 s. `RefreshAsync(fresh: false)` serves the cache;
+  `fresh: true` (the page's Refresh button) skips the cache.
+- Per-provider cooldown. A cooldown is never skipped, fresh or not.
+- Single flight per provider: concurrent callers share one pending read.
+- Providers are read in parallel; one failing provider never hides another.
+- A reader failure produces `State = unavailable` with a one-line `Message`
+  that never contains a token, a URL query string, or a response body.
+
+**Anthropic reader** (specification: `persistent-memory/agent-cooperation/
+claude-usage-mcp/src/usage.mjs`, lines 100-230 for parsing and 453-542 for the
+request; its fixture is copied to this repo as
+`tests/fixtures/anthropic-usage-2026-10-13.json`):
+
+- Credentials: `%CLAUDE_CONFIG_DIR%\.credentials.json` if the variable is set,
+  else `~\.claude\.credentials.json`. Read as UTF-8, strip a BOM, take
+  `claudeAiOauth.accessToken`, `subscriptionType`, `rateLimitTier`,
+  `expiresAt` (epoch ms). The file is re-read on every live call and is never
+  written. If `expiresAt` is in the past, don't call; report "Claude Code token
+  expired; run any claude command to refresh it".
+- Request: `GET https://api.anthropic.com/api/oauth/usage`, headers
+  `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`,
+  `Accept: application/json`, `User-Agent: InOutButton/<assembly version>`.
+  10 s timeout, auto-redirect off (a redirect is a failure), no cookies.
+- Response handling: 200 parse; 401 or 403 re-read the file once and retry only
+  if the token changed, else "token rejected; run any claude command so Claude
+  Code refreshes it"; 429 never retried, cooldown from `Retry-After` (seconds
+  or HTTP date, default 60 s, floor 1 s); 5xx one retry after 1 s, then a 10 s
+  cooldown; network error one retry after 1 s.
+- Parsing: meters come from `limits[]`. `kind` `session` maps to Key `session`,
+  Name "Session", 300 min; `weekly_all` to `weekly`, "Weekly, all models",
+  10080 min; `weekly_scoped` to `weekly_<display_name lowercased>`, "Weekly,
+  {scope.model.display_name} only", 10080 min, with Note "headroom {h}% of
+  weekly" where h = (100 - percent) * allowance / 100 and allowance comes from
+  `weekly_scoped_shares[]` joined on `limit_index`. Percent prefers the float
+  `five_hour.utilization` / `seven_day.utilization` over the integer
+  `limits[].percent` where the kind matches. `resets_at` is ISO 8601 with
+  offset; parse with `DateTimeOffset`. Severity is the API's `severity`
+  string, lower-cased; anything unrecognised becomes `normal`. Unknown kinds
+  are ignored. If `limits[]` is absent, fall back to the `five_hour` and
+  `seven_day` objects. Footnote from `extra_usage` when `is_enabled`: "Extra
+  usage on · $U of $L used" with amounts scaled by `decimal_places`. Plan from
+  `subscriptionType` and `rateLimitTier` ("Claude Max 20x" style when the tier
+  is recognisable, else the raw strings).
+
+**OpenAI reader** (Codex app-server; verified live 2026-10-17):
+
+- Executable discovery, first hit wins: `settings.CodexExecutable`; the native
+  exe beside the npm shim found with `where.exe codex`, at
+  `<shim dir>\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\
+  vendor\x86_64-pc-windows-msvc\bin\codex.exe`; else `node` with
+  `<shim dir>\node_modules\@openai\codex\bin\codex.js`. Nothing found means
+  "Codex CLI not found on PATH". Discovery runs inside the whole-call cap and
+  honours cancellation ("Codex discovery timed out" when the cap fires there);
+  a successful `where.exe` find is kept for the session, a miss is not, and the
+  override is checked on every read (Opus review, round 1).
+- Protocol: start `<exe> app-server` with stdin, stdout, and stderr all
+  redirected, no shell, UTF-8, through a dedicated `JsonLineProcess` driver
+  (not `ProcessRunner`, which has no stdin and merges stderr into stdout).
+  Write `{"id":1,"method":"initialize","params":{"clientInfo":{"name":"InOutButton","version":"<v>"}}}`
+  and wait for the reply with `id` 1. Then write `{"method":"initialized"}` and
+  `{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}`
+  and read stdout lines until the object with `id` 2 arrives; notifications in
+  between are ignored. Then close stdin and wait up to 5 s for exit.
+- Driver contract: one `CancellationTokenSource` with the whole-call cap
+  (default 20 s, injectable for tests) covers every read and write; stderr is
+  drained concurrently into a buffer capped at 8 KB; stdout is capped at 256
+  lines or 1 MB, after which the call fails as "unexpected output"; a
+  non-JSON line is skipped; early exit, malformed output, a failed
+  initialize, cancellation, and form close all end in the same `finally`,
+  which kills the process tree if it has not exited. Nothing from stderr or
+  from an unparsed stdout line is ever surfaced; only its length is logged.
+- Parsing: `result.rateLimits.primary` and `.secondary`, each
+  `{usedPercent, windowDurationMins, resetsAt (Unix seconds)}`; a null window is
+  simply absent. Window label by duration, matching Codex's own rule: within
+  5% of 300 min "5-hour", of 1440 "Daily", of 10080 "Weekly", else "{n}-hour".
+  Key `codex_<label lowercased>`. Plan from `planType`. Severity: `critical` if
+  `rateLimitReachedType` is non-null or usedPercent >= 100, `warning` if >= 80,
+  else `normal` (the 80 mirrors the threshold Anthropic's API applied today;
+  overridable). An error reply, or no reply within the cap, is unavailable.
+- Messages shown for Codex are fixed strings for the known cases: executable
+  not found, not signed in (an error reply whose message contains "login" or
+  "auth"), timed out, exited early, unexpected output. Any other error text
+  passes through `Scrub.Message` first (section 2.9) and is capped at 200
+  characters. The same scrubber wraps every exception message that reaches
+  `ProviderUsage.Message` or the log, for every provider.
+- The app never reads `auth.json` and never refreshes a token. Codex does.
+
+**Google reader**: always unavailable. Message "No local source on this
+machine." Second line "The Gemini CLI stopped serving AI Pro on 2026-06-18. The
+Antigravity CLI (agy) is not installed." Actions `gemini-usage` ("Open usage
+page") and `antigravity-setup` ("Set up Antigravity"). When `agy` is found on
+PATH the second line becomes "Antigravity CLI found; reading its usage report
+is not implemented yet." Follow-up, not in this cut: parse `agy -p /usage`.
+
+**Actions** from the page (`{type:"action", id}`) map to fixed URLs in C#:
+`gemini-usage` to `https://gemini.google.com/`, `antigravity-setup` to
+`https://antigravity.google/docs/install/`. The page never supplies a URL.
+
+**Refresh policy**, owned entirely by Form1; the page never schedules a read:
+
+- First selection of the usage tab reads immediately (not fresh).
+- A 60 s `System.Windows.Forms.Timer` ticks; if the usage tab is selected and
+  the last completed read is older than `UsageRefreshMinutes`, read (not
+  fresh). A hidden tab never triggers a read.
+- After any batch workflow ends (`SetBusy(false)`), read once if the usage
+  page has ever been shown, since sign-in may have refreshed the Claude token.
+- The page's Refresh button posts `{type:"refresh"}`: a fresh read (cache
+  skipped, cooldowns kept). When a meter's `resetsAt` passes, the page shows
+  "reset at 7:00 PM · waiting for refresh" and posts `{type:"stale"}` once
+  per meter per snapshot; Form1 treats `stale` as a normal read subject to the
+  visibility gate and the cache, and only when some meter's `resetsAt` has
+  passed and is later than its provider's `updatedAt`. Every refresh stamps a
+  new snapshot even when each provider came from cache, so without that check
+  a stale page could force a read every minute (Opus review, round 1).
+- "Last read" is the completion time of the last `RefreshAsync`, success or
+  failure, so a failing provider cannot cause a tight loop.
+- None of this touches `SetBusy`.
+
+**Logging**, quiet by default: one line per provider on its first successful
+read of the session ("usage: Anthropic ok, 3 meters"), one line on every state
+change (ok to unavailable or back, with the message), and one line when a
+cooldown starts. Nothing on routine refreshes.
+
+### 2.3 Page contract: usage
+
+C# to page: `{type:"snapshot", snapshot:<UsageSnapshot>, busy:false}` after
+every read, and `{type:"snapshot", busy:true}` while one is in flight so the
+Refresh button can disable. Page to C#: `{type:"ready"}`, `{type:"refresh"}`,
+`{type:"stale"}`, `{type:"action", id}`.
+
+The page renders from the snapshot and re-derives "resets in" and the fuse
+position every 30 s from `resetsAt` and the clock, so the countdown stays
+right between reads. Same-day resets show the time ("7:00 PM"); other days add
+the weekday ("Fri 4:08 PM"). When a window has passed its reset without a new
+read, the label reads "reset at 7:00 PM · waiting for refresh" and the page
+posts `{type:"stale"}` once per meter per snapshot and at most once per 60 s;
+Form1 decides whether that becomes a read (section 2.2). (Corrected
+2026-10-17 after the web builder found this paragraph contradicting 2.2.)
+
+### 2.4 Tasks data layer
+
+File: `settings.TasksFile`, default `<persistent-memory>\tasks\tasks.json`,
+where persistent-memory is located exactly as `RunMachineSyncAsync` does (the
+scanned repo named `persistent-memory`, else `~\Tools\persistent-memory`). If
+that folder does not exist, fall back to `%APPDATA%\InOutButton\tasks.json`
+and log once. The `tasks\` folder is created on first save.
+
+```json
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "8f3c2a1e9b7d4c6f",
+      "rev": 3,
+      "title": "Refit buffer pH GAM with September data",
+      "bucket": "projects",
+      "progress": "notStarted",
+      "due": "2026-10-24",
+      "priority": "normal",
+      "repo": "rrl_sikora",
+      "checklist": [{ "text": "Pull September rows", "done": false }],
+      "notes": "",
+      "created": "2026-10-17T22:10:00Z",
+      "updated": "2026-10-17T22:10:00Z",
+      "completed": null
+    }
+  ]
+}
+```
+
+- `bucket`: projects | admin | misc. `progress`: notStarted | inProgress |
+  complete. `priority`: normal | important | urgent. `due` is a date with no
+  time, local. `repo` is a repo name from the scan or free text. Fields the app
+  does not know, on the document or on a task, are kept from the file and
+  written back unchanged; a task's come from the file, never from the page
+  (Opus review, round 1). Nulls are
+  omitted on write; `id` is 16 hex characters from a GUID.
+- Serialization: `System.Text.Json`, camelCase, enums as strings, indented,
+  tasks ordered by `created` then `id`, so git diffs stay small.
+- `TaskStore.Load()` reads and validates; a malformed file is reported in the
+  log and the tab shows the error instead of an empty board (an empty board
+  would invite a save that overwrites the file).
+- `rev` is a per-task revision counter, 1 on creation, incremented by every
+  accepted write. The page sends back the `rev` it was given.
+- `Upsert(task)` and `Delete(id, rev)` always reload the file first (it is
+  small; last-write time is not trusted to detect every change). A write is
+  accepted only when the task is new (`rev` 0 or absent, id unknown) or the
+  incoming `rev` equals the on-disk `rev`. Otherwise the result is a rejection
+  with a fixed message ("This task changed on disk. Your edit was not saved;
+  reopen it to see the current version."), the document on disk is untouched,
+  and the page keeps the dialog open with the user's draft. An upsert for an id
+  the page knew (`rev` > 0) that is no longer on disk is rejected the same way,
+  so a deleted task is never resurrected. `completed` is set when progress
+  becomes complete and cleared when it leaves.
+- Writes are atomic: temp file in the same folder, then `File.Move` with
+  overwrite. A failed write (access denied, disk full) leaves the previous
+  file intact, is reported to the page with the scrubbed exception message,
+  and keeps the draft.
+- All store I/O runs on a worker thread through one serial chain in Form1
+  (`RunStoreAsync`), and every workflow entry point awaits
+  `DrainTaskWritesAsync` right after `SetBusy(true)`, so git never runs while
+  an accepted save is still flushing (Sol review, round 1, finding 2).
+- A cross-process lock file in `%TEMP%` (named from a hash of the tasks file's
+  full path, `TaskStore.LockPath`) is held for the whole read-check-write of
+  `Load`, `Upsert`, and `Delete`, retried for 3 s, so two app instances on one
+  machine cannot both pass the revision check and overwrite each other (Sol
+  review, round 1, finding 3). A locked file returns an error result with a
+  fixed message; nothing is written.
+- Git coordination: while any workflow is busy (`SetBusy(true)`), the page is
+  told `{type:"busy", busy:true}`, disables editing, and shows "Syncing
+  repositories…"; a mutation that arrives anyway is rejected with a state
+  re-send. When the workflow ends (`SetBusy(false)`), Form1 reloads the file
+  and re-sends state, because sign-in, "Git pull (all)", a selected-repo pull,
+  or a discard may all have changed it. This closes the window in which a save
+  could land after `git add -A` and miss the sign-out commit.
+- Sign-out commits the file with everything else in persistent-memory. Two
+  machines editing without a sign-out in between can conflict on push; the
+  existing `pull --rebase` retry handles the easy cases and a real conflict
+  surfaces as a failed push for that repo, as today. Five-clone merge drills
+  are out of scope for this cut (section 7).
+- Path resolution waits for the first repo scan to finish, so the tasks page
+  shows "Waiting for the repository scan" until then, and the fallback to
+  `%APPDATA%` is shown as a persistent banner in the page ("Saving to a local
+  file because persistent-memory was not found; these tasks will not follow
+  you to other machines"), not only as a log line.
+- `TaskPaths.Resolve` reports a `TaskPathSource`: `Override`, `ScannedRepo`,
+  `DefaultClone`, or `LocalFallback`. `DefaultClone` means no scanned repo is
+  named persistent-memory and `~\Tools\persistent-memory` was used; sign-in
+  and sign-out touch only scanned repos, so that file never syncs, and the
+  page shows a second persistent banner: "persistent-memory is not among the
+  scanned repositories, so these tasks will not sync until its folder is
+  added to the scan roots." (Opus review, round 1.)
+
+### 2.5 Page contract: tasks
+
+C# to page: `{type:"state", today:"2026-10-17", file:"persistent-memory\\tasks\\tasks.json",
+fallback:false, unsynced:false, repos:["in_out_button", ...], tasks:[...], error:null}`. Sent
+on ready, after every mutation (accepted or rejected), when the tab is shown
+and the file changed on disk, and whenever a workflow ends. A rejected
+mutation also carries `{type:"rejected", id, message}` so the page can keep
+the dialog open and show why. `{type:"busy", busy:true|false}` gates editing.
+Page to C#: `{type:"ready"}`, `{type:"upsert", task:{...}}` (the task carries
+the `rev` it was given, or 0 for a new task), `{type:"delete", id, rev}`.
+
+Page behaviour: lanes sort as in section 1; the progress glyph click cycles
+notStarted, inProgress, complete; "Due this week" means not complete and due
+within the next seven days or earlier; "Overdue" means not complete and due
+before today; search matches title, repo, and notes. The edit dialog has
+title, bucket, progress, due, priority, repo (with a datalist of `repos`),
+checklist (add, toggle, remove), notes, Save, Cancel, and Delete with an
+in-page confirmation. Enter in the lane's "+ Add task" box adds a notStarted
+task with that title and the lane's bucket. Drag a card onto a lane to change
+its bucket. The header's right side shows the file path in subtle text.
+
+While a card's save is in flight, its progress glyph, its drag, and the
+dialog's Save are disabled and dimmed, so two quick clicks cannot send two
+upserts on one `rev` and have the second refused as changed on disk. The lock
+lifts when a `state` carries that task at a higher `rev` than the one sent or
+no longer carries it, when a `rejected` for that id arrives, or on
+`busy:true` (Opus review, round 1).
+
+### 2.6 Settings
+
+```csharp
+public int UsageRefreshMinutes { get; set; } = 5;
+public string? CodexExecutable { get; set; }   // override; discovered when null
+public string? TasksFile { get; set; }         // override; derived when null
+```
+
+No new controls. These are edited in `settings.json` by hand.
+
+### 2.9 Scrubber
+
+`Scrub.Message(string? text)` is applied to every string that originates
+outside the app before it reaches a `ProviderUsage.Message`, a page, or the
+log: Codex error text, exception messages, HTTP reason phrases. It replaces
+with `[redacted]` any match of `Bearer\s+\S+`, `sk-[A-Za-z0-9_-]{8,}`, a JWT
+shape `eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`, a query string `\?\S+`, a
+key-value pair whose key ends in token, key, secret, password,
+authorization, cookie, or session after a prefix of up to 40 word characters
+or hyphens (so `access_token`, `client_secret`, and `x-api-key` match), with
+or without quotes around the key and the value (Sol review, round 1, finding
+1), the value taking an optional scheme word first so `Authorization: Basic
+<base64>` loses the credential (round 2); the prefix is capped because an
+unbounded one took 30 s on 20 KB of `a-a-a-`; and, as a last net, any
+run of 24 or more characters from `[A-Za-z0-9_-]` (opaque tokens look like
+that; a GUID or a long file name in an exception message is redacted too,
+which is accepted); collapses whitespace; and truncates to 200 characters
+with "…". Tested with injected synthetic secrets (section 3).
+
+### 2.10 Public surface the builders code against
+
+```csharp
+// Usage.cs
+public sealed record UsageMeter(string Key, string Name, int WindowMinutes, double UsedPercent,
+                                DateTimeOffset ResetsAt, string Severity, string? Note);
+public sealed record ProviderAction(string Id, string Label);
+public sealed record ProviderUsage(string Provider, string? Plan, string State, string? Message,
+                                   string? Detail, IReadOnlyList<UsageMeter> Meters, string? Footnote,
+                                   IReadOnlyList<ProviderAction> Actions, DateTimeOffset? UpdatedAt);
+public sealed record UsageSnapshot(DateTimeOffset UpdatedAt, IReadOnlyList<ProviderUsage> Providers);
+public static class Scrub { public static string Message(string? text); }
+public static class AnthropicUsage {
+    public static string CredentialsPath { get; }
+    public static ProviderUsage Parse(string json, string? plan, DateTimeOffset now);   // pure
+    public static Task<ProviderUsage> ReadAsync(HttpClient http, CancellationToken ct);
+}
+public sealed record CodexLaunch(string FileName, IReadOnlyList<string> LeadingArgs);
+public static class CodexUsage {
+    public static Task<CodexLaunch?> FindAsync(string? overridePath, CancellationToken ct);
+    public static string WindowLabel(int minutes);                       // pure
+    public static string Severity(double usedPercent, bool reached);      // pure
+    public static ProviderUsage Parse(string replyJson, DateTimeOffset now); // pure
+    public static Task<ProviderUsage> ReadAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct);
+}
+public static class GeminiUsage { public static ProviderUsage Read(); }
+public sealed class UsageService {
+    public UsageService(Action<string> log);
+    public UsageSnapshot? Last { get; }
+    public bool Busy { get; }
+    public DateTimeOffset? LastCompleted { get; }
+    public event Action<UsageSnapshot>? Updated;
+    public event Action<bool>? BusyChanged;
+    public Task RefreshAsync(bool fresh, AppSettings settings, CancellationToken ct);
+}
+
+// Tasks.cs
+public enum TaskBucket { Projects, Admin, Misc }
+public enum TaskProgress { NotStarted, InProgress, Complete }
+public enum TaskPriority { Normal, Important, Urgent }
+public sealed class ChecklistItem { public string Text { get; set; } = ""; public bool Done { get; set; } }
+public sealed class TaskItem {
+    public string Id { get; set; } = ""; public int Rev { get; set; }
+    public string Title { get; set; } = ""; public TaskBucket Bucket { get; set; }
+    public TaskProgress Progress { get; set; } public DateOnly? Due { get; set; }
+    public TaskPriority Priority { get; set; } public string? Repo { get; set; }
+    public List<ChecklistItem> Checklist { get; set; } = []; public string? Notes { get; set; }
+    public DateTimeOffset Created { get; set; } public DateTimeOffset Updated { get; set; }
+    public DateTimeOffset? Completed { get; set; }
+}
+public sealed class TaskDocument { public int Version { get; set; } = 1; public List<TaskItem> Tasks { get; set; } = []; }
+public sealed record TaskStoreResult(bool Ok, bool Rejected, string? Message, TaskDocument Document);
+public sealed class TaskStore {
+    public TaskStore(string path);
+    public string Path { get; }
+    public static JsonSerializerOptions JsonOptions { get; }
+    public TaskStoreResult Load();
+    public TaskStoreResult Upsert(TaskItem incoming, DateTimeOffset now);
+    public TaskStoreResult Delete(string id, int rev);
+    public bool ChangedSinceLoad();
+}
+public static class TaskPaths {
+    public static string Resolve(AppSettings settings, IEnumerable<RepoRow> repos, out bool fallback);
+}
+```
+
+### 2.7 Form1 changes
+
+- `main` row 1 becomes a `TabControl` spanning both columns. The Repos page
+  holds a 2-column `TableLayoutPanel` with the existing 300 px / fill styles
+  and the existing `leftPanel` and `rightPanel`. The AI usage and Tasks pages
+  each hold one `WebHost`, initialised on first selection.
+- Tab selection drives the usage timer gate and the tasks reload check.
+- `_repos` names feed the tasks page's `repos` list after every scan, and the
+  tasks path is resolved once the first scan completes.
+- `SetBusy(true)` posts `busy:true` to the tasks page; `SetBusy(false)` posts
+  `busy:false`, reloads the tasks file if it changed, re-sends state, and
+  triggers a usage read if the usage page has ever been shown.
+- Form close cancels any in-flight usage read through its token.
+
+### 2.8 Project file
+
+- `PackageReference` to `Microsoft.Web.WebView2`.
+- `<None Include="web\**" CopyToOutputDirectory="PreserveNewest" />`.
+- `<Compile Remove="tests\**" />` and `<None Remove="tests\**" />` so the test
+  project's sources never fold into the app.
+
+## 3. Tests (xunit, `tests/InOutButton.Tests`)
+
+Expected values come from captured data, not from the code under test.
+
+1. Anthropic parser on the 2026-10-13 fixture: three meters with the fixture's
+   percents and reset instants, the scoped meter's note, the plan string, the
+   extra-usage footnote.
+2. Anthropic parser with `limits[]` removed: falls back to the two window
+   objects.
+3. Codex parser on the 2026-10-17 captured reply (account id redacted): one
+   meter "Weekly", 6 used, resets 2026-10-24T21:08:18Z; no 5-hour meter.
+4. Codex parser on a synthetic reply with a 300-minute secondary window: two
+   meters, the second labelled "5-hour".
+5. Window label: 300, 285, 315, 1440, 10080, 10500, 720.
+6. Codex severity: 79, 80, 100, and `rateLimitReachedType` set.
+7. TaskStore: upsert then load round-trips every field; nulls are omitted;
+   `rev` is 1 after creation and 2 after one edit.
+8. TaskStore: an external edit to task B between load and an upsert of task A
+   survives the upsert.
+9. TaskStore: a stale upsert (incoming `rev` behind the disk) is rejected, the
+   file is unchanged, and the result carries the fixed message.
+10. TaskStore: an upsert of a task deleted on disk (incoming `rev` > 0, id
+    unknown) is rejected; it is not resurrected.
+11. TaskStore: delete removes only that id; delete with a stale `rev` is
+    rejected; no temp file remains after any write.
+12. TaskStore: a malformed file loads as an error, not as an empty document;
+    an unsupported `version` loads as an error.
+13. TaskStore: a write that fails (target file made read-only) leaves the
+    previous content intact and returns an error result.
+14. Scrub: a bearer token, an `sk-` key, a JWT, a query string, and a
+    `token=` pair are all replaced; plain text passes through; a 1,000
+    character message is cut to 200.
+15. Codex driver: pointed at a process that never answers (PowerShell
+    `Start-Sleep`), with a 2 s cap, returns unavailable "timed out" within 5 s
+    and leaves no child process running.
+16. Codex driver: pointed at a process that prints garbage and exits, returns
+    unavailable "exited early" or "unexpected output", never throws.
+17. Codex parser: an error reply with a synthetic bearer token in `message`
+    yields a Message with no token in it.
+
+## 4. Verification before the pre-review commit
+
+- `dotnet build -c Debug -o <scratch>` succeeds with no warnings new to this
+  change. Never build in place while `InOutButton.exe` is running.
+- `dotnet test tests/InOutButton.Tests` passes.
+- Run the scratch exe, open each tab, screenshot, close that process only.
+  The usage tab shows live Anthropic and Codex numbers; the tasks tab shows
+  the board; adding, editing, dragging, and deleting a task round-trips to
+  `tasks.json`.
+- No token, bearer header, or credentials path content appears in the log or
+  in any exception message. Grep the sources for `accessToken` to confirm it is
+  only ever read into a local.
+
+## 5. Out of scope for this cut
+
+- **Burn pace tiles for the usage tab.** Caleb's preferred view is candidate C
+  (burn pace tiles), with A (rings and fuses) second; A was already built when
+  he said so (2026-10-17), so A ships now and C is the first follow-up. It is a
+  page-only change: `web/usage.html` renders the same snapshot, so C can
+  replace A or sit behind a view toggle in the page header without touching
+  C#. The candidate markup is in `docs/design/2026-10-17-candidates/`.
+- Parsing `agy -p /usage` for Gemini.
+- A dark theme for the WinForms chrome.
+- Task ordering by hand, assignees, attachments, recurring tasks.
+- Styling the TabControl beyond defaults.
+- Reading the Claude status-line JSON as an alternative source.
+
+## 6. Risks named
+
+- The Anthropic endpoint is undocumented. A shape change degrades to
+  unavailable with the reason in the log, never to a crash.
+- Codex reported only a weekly window and `planType` "prolite" today. The
+  reader labels by duration and does not assume two windows.
+- The Debug exe is locked while the app runs. Shipping means closing the app,
+  `dotnet build -c Debug`, relaunch. Verification uses a scratch output.
+- WebView2 runtime absence on another machine: handled by the label and log
+  line; the Repos tab still works.
+- The Theme's amber and red fail colorblind separation when adjacent. The pages
+  use amber `#c48604`, which passes beside the Theme's green and red.
+
+## 7. Plan review log
+
+Astra (gpt-6-astra, high), 2026-10-17 18:17, in
+`docs/2026-10-17-usage-and-tasks-tabs-spec.review/20261017-181714/`.
+
+| # | Finding | Triage | Change |
+|---|---|---|---|
+| 1 | Reload-before-write still loses edits: a stale whole-task upsert overwrites newer fields and can resurrect a deleted task; mtime is not a reliable change detector | Real, blocking | Per-task `rev`, always reload before write, stale and resurrecting writes rejected with the draft kept (2.4, 2.5, tests 9 to 11) |
+| 2 | Task saves are not coordinated with git; a save after `git add -A` misses the sign-out commit; only sign-in triggered a reload | Real, blocking | Busy gate on the page during any workflow; reload and re-send when any workflow ends (2.4, 2.7) |
+| 3 | Credential-safety contract contradicted itself: Codex `error.message` was forwarded unscrubbed | Real, blocking | Fixed messages for known cases, `Scrub.Message` on everything else and on every exception message (2.2, 2.9, tests 14, 17) |
+| 4 | Process and UI contract incomplete: no cancellation on blocked reads, cleanup on every exit path unspecified, `ProcessRunner` unfit (no stdin, merged stderr), store I/O on the UI thread | Real, blocking | `JsonLineProcess` driver contract with one cap token, bounded buffers, kill in `finally`; store I/O on a worker (2.2, 2.4, tests 15, 16) |
+| 5 | Refresh rules had two owners; no immediate first read; page-initiated refresh ignored visibility | Real, medium | Form1 owns scheduling; page only reports `stale`; immediate read on first show (2.2) |
+| A | Verify every machine resolves the same repo; fallback could strand tasks; opening Tasks before the scan finishes | Partly | Path resolved after the first scan; fallback shown as a banner in the page, not only a log line (2.4). The five-machine inventory is Caleb's to confirm at first use on each machine |
+| B | Five disposable clones, concurrent same-task edits through git merge | Declined for this cut | The in-app race is closed by `rev`; a git-level conflict surfaces as a failed push, as for every other file in persistent-memory. Recorded as a known limitation |
+| C | Bridge origin and navigation restrictions, message validation, safe rendering | Real | Added to 2.1 |
+| D | "No secrets" is not established by a grep | Real | Replaced by the injection tests (14, 17) plus the grep as a secondary check |
+
+=== FILE: Usage.cs ===
+using System.Collections.Concurrent;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+
+[assembly: InternalsVisibleTo("InOutButton.Tests")]
+
+namespace InOutButton;
+
+public sealed record UsageMeter(string Key, string Name, int WindowMinutes, double UsedPercent,
+                                DateTimeOffset ResetsAt, string Severity, string? Note);
+
+public sealed record ProviderAction(string Id, string Label);
+
+public sealed record ProviderUsage(string Provider, string? Plan, string State, string? Message,
+                                   string? Detail, IReadOnlyList<UsageMeter> Meters, string? Footnote,
+                                   IReadOnlyList<ProviderAction> Actions, DateTimeOffset? UpdatedAt)
+{
+    internal static ProviderUsage Unavailable(string provider, string? plan, string message, DateTimeOffset now)
+        => new(provider, plan, UsageState.Unavailable, message, null, [], null, [], now);
+}
+
+public sealed record UsageSnapshot(DateTimeOffset UpdatedAt, IReadOnlyList<ProviderUsage> Providers);
+
+internal static class UsageState
+{
+    public const string Ok = "ok";
+    public const string Unavailable = "unavailable";
+}
+
+/// <summary>
+/// what a reader hands the service beyond the page's view: a cooldown to honour,
+/// a log-only note (lengths, never content), and the child pid for the driver tests
+/// </summary>
+internal sealed record ReaderOutcome(ProviderUsage Usage, TimeSpan? Cooldown = null, string? LogNote = null, int? ProcessId = null);
+
+/// <summary>
+/// redacts secret-shaped text from anything that came from outside the app before it
+/// reaches a message, a page, or the log
+/// </summary>
+public static partial class Scrub
+{
+    private const int MaxLength = 200;
+    private const string Redacted = "[redacted]";
+
+    private static readonly Regex[] Secrets = [Bearer(), SkKey(), Jwt(), QueryString(), KeyValue(), Opaque()];
+
+    public static string Message(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return "";
+        }
+
+        var clean = text;
+        foreach (var secret in Secrets)
+        {
+            clean = secret.Replace(clean, Redacted);
+        }
+
+        clean = Whitespace().Replace(clean, " ").Trim();
+        if (clean.Length <= MaxLength)
+        {
+            return clean;
+        }
+
+        // don't split a surrogate pair at the cut
+        var cut = MaxLength - 1;
+        if (char.IsHighSurrogate(clean[cut - 1]))
+        {
+            cut--;
+        }
+
+        return string.Concat(clean.AsSpan(0, cut), "…");
+    }
+
+    // case-insensitive, a little wider than the spec's Bearer
+    [GeneratedRegex(@"Bearer\s+\S+", RegexOptions.IgnoreCase)]
+    private static partial Regex Bearer();
+
+    [GeneratedRegex(@"sk-[A-Za-z0-9_-]{8,}")]
+    private static partial Regex SkKey();
+
+    [GeneratedRegex(@"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")]
+    private static partial Regex Jwt();
+
+    [GeneratedRegex(@"\?\S+")]
+    private static partial Regex QueryString();
+
+    // quotes optional around the key and the value, so json's "token":"..." is caught too.
+    // the prefix covers client_secret and x-api-key, capped at 40 - unbounded it took 30 s on
+    // 20 KB of a-a-a- (2026-10-17). the optional word takes Basic's scheme, whose + / = break the opaque run
+    [GeneratedRegex(@"(?i)[""']?\b([\w-]{0,40}(?:token|key|secret|password|authorization|cookie|session))\b[""']?\s*[=:]\s*[""']?(?:\w+\s+)?[^\s""',}]+")]
+    private static partial Regex KeyValue();
+
+    // safety net for opaque tokens, 24+ of these in a row - also catches a guid or a long file name
+    [GeneratedRegex(@"[A-Za-z0-9_\-]{24,}")]
+    private static partial Regex Opaque();
+
+    [GeneratedRegex(@"\s+")]
+    private static partial Regex Whitespace();
+}
+
+/// <summary>
+/// Claude subscription meters from the oauth usage endpoint, using the login Claude Code
+/// stores on this machine. port of claude-usage-mcp's usage.mjs (parse 100-230, request 453-542)
+/// </summary>
+public static partial class AnthropicUsage
+{
+    internal const string Provider = "Anthropic";
+    private const string UsageUrl = "https://api.anthropic.com/api/oauth/usage";
+    private const int DefaultRetryAfterSeconds = 60;
+    private static readonly TimeSpan TransientCooldown = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(1);
+
+    private const string CredentialsMissing = "Claude Code credentials not found; sign in to Claude Code on this machine";
+    private const string CredentialsUnreadable = "Claude Code credentials could not be read";
+    private const string CredentialsNotJson = "Claude Code credentials file is not valid JSON";
+    private const string NoLogin = "Claude Code credentials hold no login; sign in to Claude Code";
+    private const string Expired = "Claude Code token expired; run any claude command to refresh it";
+    private const string Rejected = "token rejected; run any claude command so Claude Code refreshes it";
+
+    public static string CredentialsPath
+    {
+        get
+        {
+            var dir = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
+            if (string.IsNullOrEmpty(dir))
+            {
+                dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude");
+            }
+
+            return Path.Combine(dir, ".credentials.json");
+        }
+    }
+
+    /// <summary>
+    /// pure. a body that isn't json or has neither limits[] nor five_hour comes back unavailable
+    /// </summary>
+    public static ProviderUsage Parse(string json, string? plan, DateTimeOffset now)
+    {
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(json);
+        }
+        catch (JsonException)
+        {
+            return ProviderUsage.Unavailable(Provider, plan, "usage response was not JSON", now);
+        }
+
+        using (doc)
+        {
+            var root = doc.RootElement;
+            var hasLimits = root.ValueKind == JsonValueKind.Object
+                && root.TryGetProperty("limits", out var limits) && limits.ValueKind == JsonValueKind.Array;
+            if (!hasLimits && !JsonRead.Object(root, "five_hour", out _))
+            {
+                return ProviderUsage.Unavailable(Provider, plan, "usage response changed shape (no limits or five_hour)", now);
+            }
+
+            var meters = hasLimits ? MetersFromLimits(root) : MetersFromWindows(root);
+            if (meters.Count == 0)
+            {
+                return ProviderUsage.Unavailable(Provider, plan, "usage response had no meters this app recognises", now);
+            }
+
+            return new ProviderUsage(Provider, plan, UsageState.Ok, null, null, meters, ExtraUsageFootnote(root), [], now);
+        }
+    }
+
+    public static async Task<ProviderUsage> ReadAsync(HttpClient http, CancellationToken ct)
+        => (await ReadOutcomeAsync(http, ct).ConfigureAwait(false)).Usage;
+
+    // a redirect comes back as a 3xx and fails; no cookies; the 10 s timeout covers the body too
+    internal static HttpClient CreateHttpClient()
+        => new(new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false })
+        {
+            Timeout = TimeSpan.FromSeconds(10),
+            MaxResponseContentBufferSize = 1 << 20,
+        };
+
+    internal static async Task<ReaderOutcome> ReadOutcomeAsync(HttpClient http, CancellationToken ct)
+    {
+        // re-read every call: Claude Code rotates the token under us
+        var login = ReadLogin(out var failure);
+        if (login is null)
+        {
+            return Fail(null, failure!);
+        }
+
+        if (login.ExpiresAtMs is { } expiresAt && expiresAt <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
+        {
+            return Fail(login.Plan, Expired);
+        }
+
+        var retriedTransient = false;
+        var rereadAfterReject = false;
+        while (true)
+        {
+            HttpResponseMessage response;
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, UsageUrl);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", login.Token);
+                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                request.Headers.Add("anthropic-beta", "oauth-2025-04-20");
+                request.Headers.UserAgent.Add(new ProductInfoHeaderValue("InOutButton", AppInfo.Version));
+                response = await http.SendAsync(request, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is HttpRequestException || (ex is TaskCanceledException && !ct.IsCancellationRequested))
+            {
+                // connection failure or the 10 s timeout: one more try
+                if (!retriedTransient)
+                {
+                    retriedTransient = true;
+                    await Task.Delay(RetryDelay, ct).ConfigureAwait(false);
+                    continue;
+                }
+
+                return Fail(login.Plan, ex is TaskCanceledException
+                    ? "usage request timed out after 10 s"
+                    : Scrub.Message($"usage request failed: {ex.Message}"));
+            }
+
+            using (response)
+            {
+                var status = (int)response.StatusCode;
+                var now = DateTimeOffset.UtcNow;
+
+                // never retried; fresh doesn't skip the wait either
+                if (status == 429)
+                {
+                    var seconds = RetryAfterSeconds(response.Headers.RetryAfter, now);
+                    return new ReaderOutcome(
+                        ProviderUsage.Unavailable(Provider, login.Plan, $"rate limited by the usage endpoint; next try in {seconds} s", now),
+                        TimeSpan.FromSeconds(seconds),
+                        "HTTP 429");
+                }
+
+                if (status >= 500)
+                {
+                    if (!retriedTransient)
+                    {
+                        retriedTransient = true;
+                        await Task.Delay(RetryDelay, ct).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    return new ReaderOutcome(
+                        ProviderUsage.Unavailable(Provider, login.Plan, $"usage endpoint failed twice (HTTP {status}); next try in 10 s", now),
+                        TransientCooldown,
+                        $"HTTP {status}");
+                }
+
+                if (status is 401 or 403)
+                {
+                    // the login may have rotated since we read it
+                    if (!rereadAfterReject)
+                    {
+                        rereadAfterReject = true;
+                        var again = ReadLogin(out _);
+                        if (again is not null && again.Token != login.Token)
+                        {
+                            login = again;
+                            continue;
+                        }
+                    }
+
+                    return Fail(login.Plan, Rejected);
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    return Fail(login.Plan, $"usage endpoint answered HTTP {status}");
+                }
+
+                var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                return new ReaderOutcome(Parse(body, login.Plan, now));
+            }
+        }
+    }
+
+    /// <summary>
+    /// "Claude Max 20x" when the tier reads like default_claude_max_20x, else the raw strings
+    /// </summary>
+    internal static string? PlanName(string? subscriptionType, string? rateLimitTier)
+    {
+        if (rateLimitTier is not null && TierPattern().Match(rateLimitTier) is { Success: true } match)
+        {
+            var name = $"Claude {char.ToUpperInvariant(match.Groups[1].Value[0])}{match.Groups[1].Value[1..]}";
+            return match.Groups[2].Success ? $"{name} {match.Groups[2].Value}" : name;
+        }
+
+        var raw = string.Join(" · ", new[] { subscriptionType, rateLimitTier }.Where(s => !string.IsNullOrWhiteSpace(s)));
+        return raw.Length == 0 ? null : Scrub.Message(raw);
+    }
+
+    // seconds or an http date; absent or unreadable means 60 s; floor 1 s, ceiling a day
+    internal static int RetryAfterSeconds(RetryConditionHeaderValue? header, DateTimeOffset now)
+    {
+        double? seconds = header?.Delta?.TotalSeconds ?? (header?.Date - now)?.TotalSeconds;
+        return seconds is { } s ? (int)Math.Clamp(Math.Ceiling(s), 1, 86_400) : DefaultRetryAfterSeconds;
+    }
+
+    private static ReaderOutcome Fail(string? plan, string message)
+        => new(ProviderUsage.Unavailable(Provider, plan, message, DateTimeOffset.UtcNow));
+
+    // a class, not a record: a record's ToString would print the token
+    private sealed class ClaudeLogin
+    {
+        public required string Token { get; init; }
+        public string? Plan { get; init; }
+        public double? ExpiresAtMs { get; init; }
+    }
+
+    // read only, never written; nothing from the file reaches a message
+    private static ClaudeLogin? ReadLogin(out string? failure)
+    {
+        failure = null;
+        string text;
+        try
+        {
+            // ReadAllText drops a utf-8 bom
+            text = File.ReadAllText(CredentialsPath, Encoding.UTF8);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            failure = CredentialsMissing;
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            failure = CredentialsUnreadable;
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            var token = JsonRead.Object(doc.RootElement, "claudeAiOauth", out var oauth) ? JsonRead.String(oauth, "accessToken") : null;
+            if (string.IsNullOrEmpty(token))
+            {
+                failure = NoLogin;
+                return null;
+            }
+
+            return new ClaudeLogin
+            {
+                Token = token,
+                Plan = PlanName(JsonRead.String(oauth, "subscriptionType"), JsonRead.String(oauth, "rateLimitTier")),
+                ExpiresAtMs = JsonRead.Number(oauth, "expiresAt"),
+            };
+        }
+        catch (JsonException)
+        {
+            failure = CredentialsNotJson;
+            return null;
+        }
+    }
+
+    private static List<UsageMeter> MetersFromLimits(JsonElement root)
+    {
+        // allowance for a scoped meter is joined on its index in limits[]
+        var allowances = new Dictionary<int, double>();
+        if (root.TryGetProperty("weekly_scoped_shares", out var shares) && shares.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var share in shares.EnumerateArray())
+            {
+                if (JsonRead.Long(share, "limit_index") is { } index && JsonRead.Number(share, "allowance_percent_of_weekly") is { } allowance)
+                {
+                    allowances[(int)index] = allowance;
+                }
+            }
+        }
+
+        var meters = new List<UsageMeter>();
+        var position = -1;
+        foreach (var limit in root.GetProperty("limits").EnumerateArray())
+        {
+            position++;
+            var kind = JsonRead.String(limit, "kind");
+            var model = ScopedModel(limit);
+            (string Key, string Name, string? Window, int Minutes)? shape = kind switch
+            {
+                "session" => ("session", "Session", "five_hour", 300),
+                "weekly_all" => ("weekly", "Weekly, all models", "seven_day", 10080),
+                "weekly_scoped" => ($"weekly_{Whitespace().Replace(model.ToLowerInvariant(), "_")}", $"Weekly, {model} only", null, 10080),
+                _ => null,
+            };
+            if (shape is not { } meter)
+            {
+                continue;
+            }
+
+            // the window object carries the float; limits[] rounds to an integer
+            var window = meter.Window is not null && JsonRead.Object(root, meter.Window, out var w) ? w : default;
+            var percent = JsonRead.Number(window, "utilization") ?? JsonRead.Number(limit, "percent");
+            var resetsAt = ParseInstant(JsonRead.String(limit, "resets_at") ?? JsonRead.String(window, "resets_at"));
+            if (percent is null || resetsAt is null)
+            {
+                continue;
+            }
+
+            string? note = null;
+            if (kind == "weekly_scoped" && allowances.TryGetValue(position, out var allowance))
+            {
+                note = $"headroom {Percent((100 - percent.Value) * allowance / 100)}% of weekly";
+            }
+
+            meters.Add(new UsageMeter(meter.Key, meter.Name, meter.Minutes, percent.Value, resetsAt.Value,
+                Severity(JsonRead.String(limit, "severity")), note));
+        }
+
+        return meters;
+    }
+
+    // the pre-limits[] shape: one object per window, no severity
+    private static List<UsageMeter> MetersFromWindows(JsonElement root)
+    {
+        var meters = new List<UsageMeter>();
+        foreach (var (windowKey, key, name, minutes) in new[] { ("five_hour", "session", "Session", 300), ("seven_day", "weekly", "Weekly, all models", 10080) })
+        {
+            if (JsonRead.Object(root, windowKey, out var window)
+                && JsonRead.Number(window, "utilization") is { } percent
+                && ParseInstant(JsonRead.String(window, "resets_at")) is { } resetsAt)
+            {
+                meters.Add(new UsageMeter(key, name, minutes, percent, resetsAt, "normal", null));
+            }
+        }
+
+        return meters;
+    }
+
+    private static string ScopedModel(JsonElement limit)
+        => JsonRead.Object(limit, "scope", out var scope) && JsonRead.Object(scope, "model", out var model)
+            ? JsonRead.String(model, "display_name") ?? "scoped"
+            : "scoped";
+
+    private static string? ExtraUsageFootnote(JsonElement root)
+    {
+        if (!JsonRead.Object(root, "extra_usage", out var extra)
+            || !extra.TryGetProperty("is_enabled", out var enabled) || enabled.ValueKind != JsonValueKind.True)
+        {
+            return null;
+        }
+
+        var scale = Math.Pow(10, JsonRead.Long(extra, "decimal_places") ?? 2);
+        var currency = JsonRead.String(extra, "currency") is { Length: > 0 } c ? c : "USD";
+        var usd = currency == "USD";
+        string Money(double? minor) => (usd ? "$" : "") + (minor is { } v ? (v / scale).ToString("0.00", CultureInfo.InvariantCulture) : "?");
+
+        var text = $"Extra usage on · {Money(JsonRead.Number(extra, "used_credits"))} of {Money(JsonRead.Number(extra, "monthly_limit"))}{(usd ? "" : $" {currency}")} used";
+        return extra.TryGetProperty("spend_limit_reached", out var reached) && reached.ValueKind == JsonValueKind.True
+            ? $"{text} · cap reached"
+            : text;
+    }
+
+    private static string Severity(string? value) => value?.ToLowerInvariant() switch
+    {
+        "warning" => "warning",
+        "critical" => "critical",
+        _ => "normal",
+    };
+
+    // rounded to the second, as usage.mjs does
+    private static DateTimeOffset? ParseInstant(string? value)
+    {
+        if (!DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out var instant))
+        {
+            return null;
+        }
+
+        var seconds = Math.Round(instant.ToUnixTimeMilliseconds() / 1000.0, MidpointRounding.AwayFromZero);
+        return DateTimeOffset.FromUnixTimeSeconds((long)seconds);
+    }
+
+    // one decimal, dropped when whole: 49.5, 50
+    private static string Percent(double value)
+    {
+        var rounded = Math.Round(value, 1, MidpointRounding.AwayFromZero);
+        return rounded.ToString(rounded == Math.Floor(rounded) ? "0" : "0.0", CultureInfo.InvariantCulture);
+    }
+
+    [GeneratedRegex(@"(?:^|_)claude_(max|pro|team|enterprise)(?:_(\d+x))?$", RegexOptions.IgnoreCase)]
+    private static partial Regex TierPattern();
+
+    [GeneratedRegex(@"\s+")]
+    private static partial Regex Whitespace();
+}
+
+public sealed record CodexLaunch(string FileName, IReadOnlyList<string> LeadingArgs);
+
+/// <summary>
+/// codex rate-limit windows from `codex app-server` over json-rpc lines on stdio.
+/// the app never reads auth.json or refreshes a token; codex does
+/// </summary>
+public static class CodexUsage
+{
+    internal const string Provider = "OpenAI";
+    internal static readonly TimeSpan DefaultCap = TimeSpan.FromSeconds(20);
+    private static readonly TimeSpan ExitWait = TimeSpan.FromSeconds(5);
+
+    private const string NotFound = "Codex CLI not found on PATH";
+    private const string NotSignedIn = "Codex is not signed in; run codex login";
+    private const string ExitedEarly = "Codex app-server exited early";
+    private const string UnexpectedOutput = "Codex app-server sent unexpected output";
+    private const string CouldNotStart = "Codex app-server could not be started";
+    private const string DiscoveryTimedOut = "Codex discovery timed out";
+
+    // the where.exe find, kept for the session. a miss isn't kept, so a later install is picked up
+    private static CodexLaunch? _discovered;
+
+    private static readonly string InitializeRequest = JsonSerializer.Serialize(new
+    {
+        id = 1,
+        method = "initialize",
+        @params = new { clientInfo = new { name = "InOutButton", version = AppInfo.Version } },
+    });
+
+    private const string InitializedNotice = """{"method":"initialized"}""";
+    private const string RateLimitsRequest = """{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}""";
+
+    /// <summary>
+    /// override first, checked on every call, then the npm install found by where.exe: its native
+    /// exe, else node with codex.js. cancelling ct abandons the where.exe wait
+    /// </summary>
+    public static async Task<CodexLaunch?> FindAsync(string? overridePath, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath))
+        {
+            return new CodexLaunch(overridePath, []);
+        }
+
+        if (Volatile.Read(ref _discovered) is { } known)
+        {
+            return known;
+        }
+
+        ct.ThrowIfCancellationRequested();
+        var (exitCode, output) = await ProcessRunner.CaptureAsync("where.exe", AppContext.BaseDirectory, 10, "codex").WaitAsync(ct).ConfigureAwait(false);
+        var found = FromWhere(exitCode == 0 ? output : null);
+        if (found is not null)
+        {
+            Volatile.Write(ref _discovered, found);
+        }
+
+        return found;
+    }
+
+    private static CodexLaunch? FromWhere(string? output)
+    {
+        var first = output is not null
+            ? ProcessRunner.SplitLines(output).FirstOrDefault(line => Path.IsPathRooted(line) && File.Exists(line))
+            : null;
+        if (first is null)
+        {
+            return null;
+        }
+
+        if (first.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return new CodexLaunch(first, []);
+        }
+
+        // npm puts codex (sh), codex.cmd and codex.ps1 side by side and where.exe lists the
+        // extensionless one first (2026-10-17), so derive from the folder, not the extension
+        var shimDir = Path.GetDirectoryName(first)!;
+        var package = Path.Combine(shimDir, "node_modules", "@openai", "codex");
+        var native = Path.Combine(package, "node_modules", "@openai", "codex-win32-x64", "vendor", "x86_64-pc-windows-msvc", "bin", "codex.exe");
+        if (File.Exists(native))
+        {
+            return new CodexLaunch(native, []);
+        }
+
+        var script = Path.Combine(package, "bin", "codex.js");
+        return File.Exists(script) ? new CodexLaunch("node", [script]) : null;
+    }
+
+    /// <summary>
+    /// codex's own rule: within 5% of 300, 1440 or 10080 minutes, else whole hours
+    /// </summary>
+    public static string WindowLabel(int minutes)
+    {
+        if (Near(minutes, 300))
+        {
+            return "5-hour";
+        }
+
+        if (Near(minutes, 1440))
+        {
+            return "Daily";
+        }
+
+        if (Near(minutes, 10080))
+        {
+            return "Weekly";
+        }
+
+        var hours = Math.Max(1, (int)Math.Round(minutes / 60.0, MidpointRounding.AwayFromZero));
+        return $"{hours}-hour";
+
+        static bool Near(int minutes, int window) => 20L * Math.Abs(minutes - window) <= window;
+    }
+
+    // 80 mirrors the warning threshold Anthropic's api applied on 2026-10-17
+    public static string Severity(double usedPercent, bool reached)
+        => reached || usedPercent >= 100 ? "critical" : usedPercent >= 80 ? "warning" : "normal";
+
+    /// <summary>
+    /// pure. takes the whole json-rpc reply object, result or error
+    /// </summary>
+    public static ProviderUsage Parse(string replyJson, DateTimeOffset now)
+    {
+        JsonDocument doc;
+        try
+        {
+            doc = JsonDocument.Parse(replyJson);
+        }
+        catch (JsonException)
+        {
+            return ProviderUsage.Unavailable(Provider, null, UnexpectedOutput, now);
+        }
+
+        using (doc)
+        {
+            var root = doc.RootElement;
+            if (ReplyError(root) is { } error)
+            {
+                return ProviderUsage.Unavailable(Provider, null, error, now);
+            }
+
+            if (!JsonRead.Object(root, "result", out var result) || !JsonRead.Object(result, "rateLimits", out var limits))
+            {
+                return ProviderUsage.Unavailable(Provider, null, UnexpectedOutput, now);
+            }
+
+            var reached = limits.TryGetProperty("rateLimitReachedType", out var reachedType) && reachedType.ValueKind != JsonValueKind.Null;
+            var meters = new List<UsageMeter>();
+
+            // a null window is just absent; 2026-10-17 reported only a weekly primary
+            foreach (var slot in new[] { "primary", "secondary" })
+            {
+                if (!JsonRead.Object(limits, slot, out var window)
+                    || JsonRead.Number(window, "usedPercent") is not { } used
+                    || JsonRead.Long(window, "windowDurationMins") is not { } minutes || minutes is <= 0 or > int.MaxValue
+                    || JsonRead.Long(window, "resetsAt") is not { } resetsAt || resetsAt is < 0 or > 253_402_300_799)
+                {
+                    continue;
+                }
+
+                var label = WindowLabel((int)minutes);
+                meters.Add(new UsageMeter($"codex_{label.ToLowerInvariant()}", label, (int)minutes, used,
+                    DateTimeOffset.FromUnixTimeSeconds(resetsAt), Severity(used, reached), null));
+            }
+
+            return new ProviderUsage(Provider, JsonRead.String(limits, "planType"), UsageState.Ok, null, null, meters, null, [], now);
+        }
+    }
+
+    public static async Task<ProviderUsage> ReadAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct)
+        => (await ReadOutcomeAsync(launch, cap, ct).ConfigureAwait(false)).Usage;
+
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(string? overridePath, CancellationToken ct)
+        => ReadCoreAsync(overridePath, null, DefaultCap, ct);
+
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct)
+        => ReadCoreAsync(null, launch, cap, ct);
+
+    /// <summary>
+    /// one cap covers discovery (when launch is null) and every read and write; every exit path
+    /// ends in the same finally, which kills the tree. cancelling ct throws; the cap returns "timed out"
+    /// </summary>
+    private static async Task<ReaderOutcome> ReadCoreAsync(string? overridePath, CodexLaunch? launch, TimeSpan cap, CancellationToken ct)
+    {
+        using var capSource = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        capSource.CancelAfter(cap);
+        var token = capSource.Token;
+        JsonLineProcess? process = null;
+
+        ReaderOutcome Done(ProviderUsage usage) => new(
+            usage,
+            LogNote: usage.State == UsageState.Ok || process is null
+                ? null
+                : $"stderr {process.StderrChars} chars, {process.SkippedLines} non-json lines skipped",
+            ProcessId: process?.Id);
+
+        ReaderOutcome Failed(string message) => Done(ProviderUsage.Unavailable(Provider, null, message, DateTimeOffset.UtcNow));
+
+        try
+        {
+            if (launch is null)
+            {
+                try
+                {
+                    launch = await FindAsync(overridePath, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    return Failed(DiscoveryTimedOut);
+                }
+
+                if (launch is null)
+                {
+                    return Failed(NotFound);
+                }
+            }
+
+            token.ThrowIfCancellationRequested();
+            process = JsonLineProcess.Start(launch.FileName, [.. launch.LeadingArgs, "app-server"]);
+            await process.WriteLineAsync(InitializeRequest, token).ConfigureAwait(false);
+            var init = await process.ReadReplyAsync(1, token).ConfigureAwait(false);
+            if (init is null)
+            {
+                return Failed(ExitedEarly);
+            }
+
+            if (ReplyError(init) is { } initError)
+            {
+                return Failed(initError);
+            }
+
+            await process.WriteLineAsync(InitializedNotice, token).ConfigureAwait(false);
+            await process.WriteLineAsync(RateLimitsRequest, token).ConfigureAwait(false);
+            var reply = await process.ReadReplyAsync(2, token).ConfigureAwait(false);
+            if (reply is null)
+            {
+                return Failed(ExitedEarly);
+            }
+
+            var usage = Parse(reply, DateTimeOffset.UtcNow);
+            try
+            {
+                await process.CloseInputAndWaitAsync(ExitWait, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // the answer is in; the finally kills a slow exit
+            }
+
+            return Done(usage);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return Failed($"Codex app-server timed out after {cap.TotalSeconds:0} s");
+        }
+        catch (InvalidDataException)
+        {
+            return Failed(UnexpectedOutput);
+        }
+        catch (IOException)
+        {
+            // stdin pipe closed under a write: the child is gone
+            return Failed(ExitedEarly);
+        }
+        catch (Win32Exception)
+        {
+            // a cached find that no longer starts is found again next read
+            Interlocked.CompareExchange(ref _discovered, null, launch);
+            return Failed(CouldNotStart);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return Failed(Scrub.Message($"Codex read failed: {ex.Message}"));
+        }
+        finally
+        {
+            process?.Dispose();
+        }
+    }
+
+    private static string? ReplyError(string replyJson)
+    {
+        using var doc = JsonDocument.Parse(replyJson);
+        return ReplyError(doc.RootElement);
+    }
+
+    // fixed text for not signed in; anything else is scrubbed and capped at 200
+    private static string? ReplyError(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("error", out var error) || error.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+
+        var message = JsonRead.String(error, "message");
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            return "Codex returned an error";
+        }
+
+        return message.Contains("login", StringComparison.OrdinalIgnoreCase) || message.Contains("auth", StringComparison.OrdinalIgnoreCase) || message.Contains("logged in", StringComparison.OrdinalIgnoreCase) || message.Contains("log in", StringComparison.OrdinalIgnoreCase)
+            ? NotSignedIn
+            : Scrub.Message($"Codex error: {message}");
+    }
+}
+
+/// <summary>
+/// json-rpc lines over a child's stdio: stderr kept to 8 KB, stdout to 256 lines or 1 MB.
+/// sync pipes ignore cancellation, so a cancelled wait abandons the read and Dispose's kill ends it
+/// </summary>
+internal sealed class JsonLineProcess : IDisposable
+{
+    internal const int MaxLines = 256;
+    internal const int MaxChars = 1 << 20;
+    private const int StderrCap = 8 * 1024;
+    private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
+
+    private readonly Process _process;
+    private readonly StringBuilder _stderr = new();
+    private readonly StringBuilder _pending = new();
+    private readonly char[] _chunk = new char[4096];
+    private int _stderrChars;
+    private int _scanFrom;
+    private int _lines;
+    private int _chars;
+    private bool _eof;
+
+    private JsonLineProcess(Process process)
+    {
+        _process = process;
+        Id = process.Id;
+        _ = DrainStderrAsync();
+    }
+
+    public int Id { get; }
+
+    // only lengths ever leave this class; the content stays in the buffer
+    public int StderrChars => Volatile.Read(ref _stderrChars);
+
+    public int SkippedLines { get; private set; }
+
+    public static JsonLineProcess Start(string fileName, IEnumerable<string> arguments)
+    {
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                // no bom on stdin, or the first request line starts with one
+                StandardInputEncoding = Utf8,
+                StandardOutputEncoding = Utf8,
+                StandardErrorEncoding = Utf8,
+            },
+        };
+
+        foreach (var argument in arguments)
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
+
+        try
+        {
+            process.Start();
+        }
+        catch
+        {
+            process.Dispose();
+            throw;
+        }
+
+        return new JsonLineProcess(process);
+    }
+
+    public async Task WriteLineAsync(string json, CancellationToken ct)
+    {
+        var write = WriteCoreAsync(json);
+        try
+        {
+            await write.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            Observe(write);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// the reply object for id as raw text, skipping notifications and non-json lines.
+    /// null when stdout ends first; InvalidDataException past the caps
+    /// </summary>
+    public async Task<string?> ReadReplyAsync(int id, CancellationToken ct)
+    {
+        while (await ReadLineAsync(ct).ConfigureAwait(false) is { } line)
+        {
+            if (IsReply(line, id))
+            {
+                return line;
+            }
+        }
+
+        return null;
+    }
+
+    public async Task CloseInputAndWaitAsync(TimeSpan wait, CancellationToken ct)
+    {
+        try
+        {
+            _process.StandardInput.Close();
+        }
+        catch (IOException)
+        {
+            // already gone
+        }
+
+        try
+        {
+            await _process.WaitForExitAsync(ct).WaitAsync(wait, ct).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // Dispose kills it
+        }
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            if (!_process.HasExited)
+            {
+                _process.Kill(entireProcessTree: true);
+                _process.WaitForExit(2000);
+            }
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or Win32Exception)
+        {
+            // exited between the check and the kill
+        }
+
+        _process.Dispose();
+    }
+
+    private async Task WriteCoreAsync(string json)
+    {
+        // \n, not WriteLine's \r\n
+        await _process.StandardInput.WriteAsync(json + "\n").ConfigureAwait(false);
+        await _process.StandardInput.FlushAsync().ConfigureAwait(false);
+    }
+
+    private async Task<string?> ReadLineAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            for (var i = _scanFrom; i < _pending.Length; i++)
+            {
+                if (_pending[i] == '\n')
+                {
+                    var line = _pending.ToString(0, i).TrimEnd('\r');
+                    _pending.Remove(0, i + 1);
+                    _scanFrom = 0;
+                    return CountLine(line);
+                }
+            }
+
+            _scanFrom = _pending.Length;
+            if (_eof)
+            {
+                if (_pending.Length == 0)
+                {
+                    return null;
+                }
+
+                var rest = _pending.ToString();
+                _pending.Clear();
+                _scanFrom = 0;
+                return CountLine(rest);
+            }
+
+            var read = _process.StandardOutput.ReadAsync(_chunk.AsMemory(), CancellationToken.None).AsTask();
+            int count;
+            try
+            {
+                count = await read.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                Observe(read);
+                throw;
+            }
+
+            if (count == 0)
+            {
+                _eof = true;
+                continue;
+            }
+
+            // counted in chars, a close enough stand-in for bytes
+            _chars += count;
+            if (_chars > MaxChars)
+            {
+                throw new InvalidDataException("stdout over 1 MB");
+            }
+
+            _pending.Append(_chunk, 0, count);
+        }
+    }
+
+    private string CountLine(string line)
+    {
+        if (++_lines > MaxLines)
+        {
+            throw new InvalidDataException("stdout over 256 lines");
+        }
+
+        return line;
+    }
+
+    // a response carries result or error; a server request with the same id carries method
+    private bool IsReply(string line, int id)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(line);
+            var root = doc.RootElement;
+            return root.ValueKind == JsonValueKind.Object
+                && JsonRead.Long(root, "id") == id
+                && !root.TryGetProperty("method", out _)
+                && (root.TryGetProperty("result", out _) || root.TryGetProperty("error", out _));
+        }
+        catch (JsonException)
+        {
+            SkippedLines++;
+            return false;
+        }
+    }
+
+    private async Task DrainStderrAsync()
+    {
+        var buffer = new char[4096];
+        try
+        {
+            int count;
+            while ((count = await _process.StandardError.ReadAsync(buffer.AsMemory()).ConfigureAwait(false)) > 0)
+            {
+                Interlocked.Add(ref _stderrChars, count);
+                var room = StderrCap - _stderr.Length;
+                if (room > 0)
+                {
+                    _stderr.Append(buffer, 0, Math.Min(room, count));
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+        {
+            // pipe closed by Dispose
+        }
+    }
+
+    // a stranded read or write finishes after the kill; its fault must not go unobserved
+    private static void Observe(Task task)
+        => task.ContinueWith(static t => _ = t.Exception, CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+}
+
+public static class GeminiUsage
+{
+    internal const string Provider = "Google";
+
+    // the Gemini CLI stopped serving AI Pro on 2026-06-18; parsing `agy -p /usage` is a follow-up
+    public static ProviderUsage Read()
+    {
+        var detail = AgyOnPath()
+            ? "Antigravity CLI found; reading its usage report is not implemented yet."
+            : "The Gemini CLI stopped serving AI Pro on 2026-06-18. The Antigravity CLI (agy) is not installed.";
+        ProviderAction[] actions = [new("gemini-usage", "Open usage page"), new("antigravity-setup", "Set up Antigravity")];
+        return new ProviderUsage(Provider, null, UsageState.Unavailable, "No local source on this machine.", detail, [], null, actions, DateTimeOffset.UtcNow);
+    }
+
+    private static bool AgyOnPath()
+    {
+        var extensions = (Environment.GetEnvironmentVariable("PATHEXT") ?? ".EXE;.CMD;.BAT").Split(';', StringSplitOptions.RemoveEmptyEntries);
+        var dirs = (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return dirs.Any(dir => extensions.Any(ext => File.Exists(Path.Combine(dir.Trim('"'), "agy" + ext))));
+    }
+}
+
+/// <summary>
+/// cache, cooldown and single flight per provider; providers read in parallel.
+/// call RefreshAsync from the ui thread: log, Updated and BusyChanged fire on the caller's
+/// context. it never throws, and after cancellation nothing fires
+/// </summary>
+public sealed class UsageService
+{
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(60);
+
+    private readonly Action<string> _log;
+    private readonly HttpClient _http = AnthropicUsage.CreateHttpClient();
+    // readers finish on pool threads and AppendLog isn't thread-safe, so lines queue here
+    private readonly ConcurrentQueue<string> _logQueue = new();
+    private readonly ProviderSlot _anthropic;
+    private readonly ProviderSlot _openai;
+    private readonly ProviderSlot _google;
+    private int _busyCount;
+
+    public UsageService(Action<string> log)
+    {
+        _log = log;
+        _anthropic = new ProviderSlot(AnthropicUsage.Provider, _logQueue);
+        _openai = new ProviderSlot(CodexUsage.Provider, _logQueue);
+        _google = new ProviderSlot(GeminiUsage.Provider, _logQueue);
+    }
+
+    public UsageSnapshot? Last { get; private set; }
+
+    public bool Busy => Volatile.Read(ref _busyCount) > 0;
+
+    // success or failure, so a failing provider can't drive a tight loop
+    public DateTimeOffset? LastCompleted { get; private set; }
+
+    public event Action<UsageSnapshot>? Updated;
+
+    public event Action<bool>? BusyChanged;
+
+    /// <summary>
+    /// fresh skips the 60 s cache, never a cooldown. codexExecutableOverride is
+    /// settings.CodexExecutable
+    /// </summary>
+    public async Task RefreshAsync(bool fresh, string? codexExecutableOverride, CancellationToken ct)
+    {
+        if (Interlocked.Increment(ref _busyCount) == 1)
+        {
+            BusyChanged?.Invoke(true);
+        }
+
+        UsageSnapshot? produced = null;
+        try
+        {
+            var providers = await Task.WhenAll(
+                _anthropic.GetAsync(fresh, c => AnthropicUsage.ReadOutcomeAsync(_http, c), ct),
+                _openai.GetAsync(fresh, c => CodexUsage.ReadOutcomeAsync(codexExecutableOverride, c), ct),
+                _google.GetAsync(fresh, _ => Task.FromResult(new ReaderOutcome(GeminiUsage.Read())), ct));
+
+            Last = produced = new UsageSnapshot(DateTimeOffset.UtcNow, providers);
+        }
+        catch (OperationCanceledException)
+        {
+            // form closing
+        }
+        finally
+        {
+            LastCompleted = DateTimeOffset.UtcNow;
+            var idle = Interlocked.Decrement(ref _busyCount) == 0;
+            if (!ct.IsCancellationRequested)
+            {
+                while (_logQueue.TryDequeue(out var line))
+                {
+                    _log(line);
+                }
+
+                if (produced is not null)
+                {
+                    Updated?.Invoke(produced);
+                }
+
+                if (idle)
+                {
+                    BusyChanged?.Invoke(false);
+                }
+            }
+        }
+    }
+
+    private sealed class ProviderSlot(string provider, ConcurrentQueue<string> log)
+    {
+        private readonly object _gate = new();
+        private Task<ProviderUsage>? _pending;
+        private ProviderUsage? _last;
+        private DateTimeOffset _lastAt;
+        private DateTimeOffset _cooldownUntil;
+        private string? _loggedState;
+
+        public Task<ProviderUsage> GetAsync(bool fresh, Func<CancellationToken, Task<ReaderOutcome>> read, CancellationToken ct)
+        {
+            lock (_gate)
+            {
+                if (_pending is not null)
+                {
+                    return _pending;
+                }
+
+                var now = DateTimeOffset.UtcNow;
+                if (_last is not null && (now < _cooldownUntil || (!fresh && now - _lastAt < CacheTtl)))
+                {
+                    return Task.FromResult(_last);
+                }
+
+                // Task.Run so a reader that finishes synchronously can't run under the lock
+                return _pending = Task.Run(() => ReadAndRecordAsync(read, ct), CancellationToken.None);
+            }
+        }
+
+        private async Task<ProviderUsage> ReadAndRecordAsync(Func<CancellationToken, Task<ReaderOutcome>> read, CancellationToken ct)
+        {
+            ReaderOutcome outcome;
+            try
+            {
+                outcome = await read(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                lock (_gate)
+                {
+                    _pending = null;
+                }
+
+                throw;
+            }
+            catch (Exception ex)
+            {
+                outcome = new ReaderOutcome(ProviderUsage.Unavailable(provider, null, Scrub.Message(ex.Message), DateTimeOffset.UtcNow));
+            }
+
+            var usage = outcome.Usage;
+            lock (_gate)
+            {
+                _last = usage;
+                _lastAt = DateTimeOffset.UtcNow;
+                if (outcome.Cooldown is { } wait)
+                {
+                    _cooldownUntil = _lastAt + wait;
+                    log.Enqueue($"usage: {provider} cooling down {wait.TotalSeconds:0} s{(outcome.LogNote is { } why ? $" after {why}" : "")}");
+                }
+
+                // quiet by default: a line on the first result and on each ok/unavailable flip
+                if (usage.State != _loggedState)
+                {
+                    _loggedState = usage.State;
+                    log.Enqueue(usage.State == UsageState.Ok
+                        ? $"usage: {provider} ok, {usage.Meters.Count} meter{(usage.Meters.Count == 1 ? "" : "s")}"
+                        : $"usage: {provider} unavailable: {usage.Message}{(outcome.Cooldown is null && outcome.LogNote is { } note ? $" ({note})" : "")}");
+                }
+
+                _pending = null;
+            }
+
+            return usage;
+        }
+    }
+}
+
+internal static class AppInfo
+{
+    public static readonly string Version = typeof(AppInfo).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+}
+
+/// <summary>
+/// kind-checked reads that return null instead of throwing on a shape change
+/// </summary>
+internal static class JsonRead
+{
+    public static bool Object(JsonElement parent, string name, out JsonElement value)
+    {
+        value = default;
+        return parent.ValueKind == JsonValueKind.Object
+            && parent.TryGetProperty(name, out value)
+            && value.ValueKind == JsonValueKind.Object;
+    }
+
+    public static string? String(JsonElement parent, string name)
+        => parent.ValueKind == JsonValueKind.Object && parent.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    public static double? Number(JsonElement parent, string name)
+        => parent.ValueKind == JsonValueKind.Object && parent.TryGetProperty(name, out var value)
+            && value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out var number) && double.IsFinite(number)
+            ? number
+            : null;
+
+    public static long? Long(JsonElement parent, string name)
+        => parent.ValueKind == JsonValueKind.Object && parent.TryGetProperty(name, out var value)
+            && value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out var number)
+            ? number
+            : null;
+}

@@ -58,7 +58,7 @@ Never a cleaning build beside the running exe; verify with
 
 - Gemini: nothing read yet. The Gemini CLI stopped serving AI Pro on
   2026-06-18. Antigravity CLI 1.4.2 was installed at the end of this session
-  (`%LOCALAPPDATA%gyingy.exe`, on the user PATH); Caleb's browser
+  (`%LOCALAPPDATA%\agy\bin\agy.exe`, on the user PATH); Caleb's browser
   sign-in with his personal account is pending. Next session: run
   `agy -p /usage` once to capture the report's shape, then teach
   `GeminiUsage` to parse it. The running app only sees `agy` on PATH after a

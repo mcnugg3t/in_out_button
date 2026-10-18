@@ -5,66 +5,122 @@
 
   const MIN = 60000;
 
-  // live reads of 2026-10-17 4:43 PM CDT; resets are kept relative to now so the
-  // countdowns read the same on any day: claude in 2 h 17 m, codex in 6 d 23 h 25 m
+  // live reads of 2026-10-17 4:43 PM CDT and the agy report of 2026-10-18. times are kept
+  // relative to the read so the countdowns read the same on any day. ?scenario=stale swaps
+  // in the Anthropic provider as a stale reading from nine hours ago
   function usage() {
     const now = Date.now();
-    const at = mins => new Date(now + mins * MIN).toISOString();
-    const claudeReset = at(137);
+    const iso = ms => new Date(ms).toISOString();
+    const at = mins => iso(now + mins * MIN);
+    // [minutes from the read, percent used] pairs, oldest first, the read itself last
+    const hist = (read, pairs) => pairs.map(([mins, used]) => ({ at: iso(read + mins * MIN), usedPercent: used }));
+    const stale = /(?:^|[?&])scenario=stale(?:&|$)/.test(location.search);
     return {
       type: 'snapshot',
       busy: false,
       snapshot: {
-        updatedAt: new Date(now).toISOString(),
-        providers: [
-          {
-            provider: 'Anthropic',
-            plan: 'Claude Max 20x',
-            state: 'ok',
-            message: null,
-            detail: null,
-            meters: [
-              { key: 'session', name: 'Session', windowMinutes: 300, usedPercent: 34,
-                resetsAt: claudeReset, severity: 'normal', note: null },
-              { key: 'weekly', name: 'Weekly, all models', windowMinutes: 10080, usedPercent: 80,
-                resetsAt: claudeReset, severity: 'warning', note: null },
-              { key: 'weekly_fable', name: 'Weekly, Fable only', windowMinutes: 10080, usedPercent: 70,
-                resetsAt: claudeReset, severity: 'normal', note: 'headroom 15% of weekly' }
-            ],
-            footnote: 'Extra usage on · $0.00 of $200.00 used',
-            actions: [],
-            updatedAt: new Date(now).toISOString()
-          },
-          {
-            provider: 'OpenAI',
-            plan: 'ChatGPT plan via Codex',
-            state: 'ok',
-            message: null,
-            detail: null,
-            meters: [
-              { key: 'codex_weekly', name: 'Weekly', windowMinutes: 10080, usedPercent: 6,
-                resetsAt: at(6 * 1440 + 23 * 60 + 25), severity: 'normal', note: null }
-            ],
-            footnote: null,
-            actions: [],
-            updatedAt: new Date(now).toISOString()
-          },
-          {
-            provider: 'Google',
-            plan: 'Gemini AI Pro',
-            state: 'unavailable',
-            message: 'No local source on this machine.',
-            detail: 'The Gemini CLI stopped serving AI Pro on 2026-06-18. The Antigravity CLI (agy) is not installed.',
-            meters: [],
-            footnote: null,
-            actions: [
-              { id: 'gemini-usage', label: 'Open usage page' },
-              { id: 'antigravity-setup', label: 'Set up Antigravity' }
-            ],
-            updatedAt: new Date(now).toISOString()
-          }
-        ]
+        updatedAt: iso(now),
+        providers: [stale ? anthropicStale(now, iso, hist) : anthropic(now, iso, at, hist), openai(now, iso, at), google(now, iso, at, hist)]
       }
+    };
+  }
+
+  // claude in 2 h 17 m; the weekly ran ahead of even pace early in the week, then slowed
+  function anthropic(now, iso, at, hist) {
+    const claudeReset = at(137);
+    return {
+      provider: 'Anthropic',
+      plan: 'Claude Max 20x',
+      state: 'ok',
+      message: null,
+      detail: null,
+      meters: [
+        { key: 'session', name: 'Session', windowMinutes: 300, usedPercent: 34,
+          resetsAt: claudeReset, severity: 'normal', note: null },
+        { key: 'weekly', name: 'Weekly, all models', windowMinutes: 10080, usedPercent: 80,
+          resetsAt: claudeReset, severity: 'warning', note: null,
+          history: hist(now, [[-9300, 9], [-7400, 30], [-5800, 47], [-4300, 58], [-2900, 64],
+            [-1500, 71], [-480, 77], [0, 80]]) },
+        { key: 'weekly_fable', name: 'Weekly, Fable only', windowMinutes: 10080, usedPercent: 70,
+          resetsAt: claudeReset, severity: 'normal', note: 'headroom 15% of weekly' }
+      ],
+      footnote: 'Extra usage on · $0.00 of $200.00 used',
+      actions: [],
+      updatedAt: iso(now)
+    };
+  }
+
+  // the last good read, nine hours old: its session window has since reset, its weeklies run 3 d 2 h on
+  function anthropicStale(now, iso, hist) {
+    const read = now - 9 * 60 * MIN;
+    const from = mins => iso(read + mins * MIN);
+    return {
+      provider: 'Anthropic',
+      plan: 'Claude Max 20x',
+      state: 'stale',
+      message: 'Claude Code token expired; the refresh ladder did not advance it',
+      detail: null,
+      meters: [
+        { key: 'session', name: 'Session', windowMinutes: 300, usedPercent: 34,
+          resetsAt: from(137), severity: 'normal', note: null, history: [] },
+        { key: 'weekly', name: 'Weekly, all models', windowMinutes: 10080, usedPercent: 48,
+          resetsAt: from(4442), severity: 'normal', note: null,
+          history: hist(read, [[-5000, 7], [-3600, 19], [-2200, 33], [-900, 42], [0, 48]]) },
+        { key: 'weekly_fable', name: 'Weekly, Fable only', windowMinutes: 10080, usedPercent: 41,
+          resetsAt: from(4442), severity: 'normal', note: 'headroom 29.5% of weekly', history: [] }
+      ],
+      footnote: 'Extra usage on · $0.00 of $200.00 used',
+      actions: [{ id: 'claude-refresh', label: 'Refresh via Claude Code' }],
+      updatedAt: iso(read)
+    };
+  }
+
+  // codex in 6 d 23 h 25 m; weekly only, so the page shows the 5-hour ghost
+  function openai(now, iso, at) {
+    return {
+      provider: 'OpenAI',
+      plan: 'ChatGPT plan via Codex',
+      state: 'ok',
+      message: null,
+      detail: null,
+      meters: [
+        { key: 'codex_weekly', name: 'Weekly', windowMinutes: 10080, usedPercent: 6,
+          resetsAt: at(6 * 1440 + 23 * 60 + 25), severity: 'normal', note: null }
+      ],
+      footnote: null,
+      actions: [],
+      updatedAt: iso(now)
+    };
+  }
+
+  // the five buckets of tests/fixtures/agy-usage-2026-10-18.json in report order. an idle
+  // bucket resets one window from now; argon keeps the fixture's 1.01% and its reset 3.5 min
+  // short of a week. gemini last ran 7 h ago, claude and gpt over the last 85 min
+  function google(now, iso, at, hist) {
+    return {
+      provider: 'Google',
+      plan: 'Antigravity CLI',
+      state: 'ok',
+      message: null,
+      detail: null,
+      meters: [
+        { key: 'gemini-weekly', name: 'Gemini Models', windowMinutes: 10080, usedPercent: 37,
+          resetsAt: at(10080 - 3120), severity: 'normal', note: null,
+          history: hist(now, [[-2400, 8], [-1320, 19], [-420, 37], [0, 37]]) },
+        { key: 'gemini-5h', name: 'Gemini Models', windowMinutes: 300, usedPercent: 0,
+          resetsAt: at(300), severity: 'normal', note: null, history: hist(now, [[0, 0]]) },
+        { key: '3p-weekly', name: 'Claude and GPT models', windowMinutes: 10080, usedPercent: 9,
+          resetsAt: at(10080 - 100), severity: 'normal', note: null,
+          history: hist(now, [[-85, 3], [-40, 6], [0, 9]]) },
+        { key: '3p-5h', name: 'Claude and GPT models', windowMinutes: 300, usedPercent: 62,
+          resetsAt: at(300 - 100), severity: 'normal', note: null,
+          history: hist(now, [[-85, 18], [-40, 45], [0, 62]]) },
+        { key: 'gemini-argon-wtu-weekly', name: 'Gemini 4 Argon', windowMinutes: 10080, usedPercent: 1.01,
+          resetsAt: at(10080 - 3.5), severity: 'normal', note: null, history: hist(now, [[0, 1.01]]) }
+      ],
+      footnote: null,
+      actions: [],
+      updatedAt: iso(now)
     };
   }
 

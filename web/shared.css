@@ -26,6 +26,11 @@
   --fail-text: #b91c1c;
   --fail-track: #f9d3d3;
   --fail-soft: #fdecec;
+  /* 10% fills under the burn chart's path; muted is the stale reading's wash */
+  --accent-wash: rgba(37, 99, 235, 0.10);
+  --warn-wash: rgba(196, 134, 4, 0.10);
+  --fail-wash: rgba(220, 38, 38, 0.10);
+  --muted-wash: rgba(120, 128, 140, 0.12);
   --log-bg: #0f172a;        /* LogBg */
   --log-fg: #cbd5e1;        /* LogFg */
   --chip: #edf1f7;
@@ -51,6 +56,7 @@
     --ok: #0e9f6e;
     --warn: #c48604; --warn-track: #3f3015; --warn-soft: #3a2a0f; --warn-ink: #fbbf24;
     --fail: #dc2626; --fail-text: #fca5a5; --fail-track: #4a1d24; --fail-soft: #3d1519;
+    --accent-wash: rgba(79, 140, 255, 0.16); --warn-wash: rgba(196, 134, 4, 0.16); --fail-wash: rgba(220, 38, 38, 0.16); --muted-wash: rgba(134, 147, 168, 0.16);
     --log-bg: #0a1020; --log-fg: #cbd5e1;
     --chip: #212d4a; --btn: #1a2540; --focus: #7fb0ff; --glyph-idle: #7f8ba3;
     --fuse: #55667f; --fuse-track: #24324e; --scrim: rgba(2, 6, 23, 0.6);
@@ -67,6 +73,7 @@
   --ok: #0e9f6e;
   --warn: #c48604; --warn-track: #3f3015; --warn-soft: #3a2a0f; --warn-ink: #fbbf24;
   --fail: #dc2626; --fail-text: #fca5a5; --fail-track: #4a1d24; --fail-soft: #3d1519;
+  --accent-wash: rgba(79, 140, 255, 0.16); --warn-wash: rgba(196, 134, 4, 0.16); --fail-wash: rgba(220, 38, 38, 0.16); --muted-wash: rgba(134, 147, 168, 0.16);
   --log-bg: #0a1020; --log-fg: #cbd5e1;
   --chip: #212d4a; --btn: #1a2540; --focus: #7fb0ff; --glyph-idle: #7f8ba3;
   --fuse: #55667f; --fuse-track: #24324e; --scrim: rgba(2, 6, 23, 0.6);

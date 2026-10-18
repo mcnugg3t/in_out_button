@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using Microsoft.Win32;
 
@@ -39,15 +41,46 @@ public sealed class Form1 : Form
     private NumericUpDown _rcloneTimeoutBox = null!;
     private NumericUpDown _activeDaysBox = null!;
     private ToolStripStatusLabel _statusLabel = null!;
+    private TabControl _tabs = null!;
+    private TabPage _usagePage = null!;
+    private TabPage _tasksPage = null!;
+    private WebHost _usageHost = null!;
+    private WebHost _tasksHost = null!;
 
     private bool _rcloneAvailable;
+    private bool _busy;
+
+    // usage tab: Form1 owns the refresh policy, the page never schedules a read (spec 2.2)
+    private readonly UsageService _usage;
+    private readonly System.Windows.Forms.Timer _usageTimer = new() { Interval = 60_000 };
+    private readonly CancellationTokenSource _usageCts = new();
+    private bool _usageStarted;
+    private bool _usageShown;
+
+    // tasks tab: the store waits for the first scan, which finds persistent-memory (spec 2.4)
+    private const string TasksSyncingMessage = "Repositories are syncing; try again in a moment.";
+    private TaskStore? _taskStore;
+    private bool _tasksFallback;
+    private bool _tasksShown;
+    private string? _lastTasksError;
 
     public Form1()
     {
         _settings = SettingsStore.Load();
         _roots.AddRange(_settings.SearchRoots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase));
+        _usage = new UsageService(AppendLog);
 
         BuildUi();
+        _usage.Updated += snapshot => _usageHost.Post(new { type = "snapshot", snapshot, busy = _usage.Busy });
+        _usage.BusyChanged += busy =>
+        {
+            if (busy)
+            {
+                _usageHost.Post(new { type = "snapshot", busy = true });
+            }
+        };
+        _usageTimer.Tick += (_, _) => OnUsageTimerTick();
+
         Load += (_, _) =>
         {
             _startupCheckBox.Checked = StartupManager.IsEnabled();
@@ -55,7 +88,22 @@ public sealed class Form1 : Form
             UpdateRootsHeader();
             _ = InitRcloneAsync();
             _ = ScanReposAsync();
+            _usageTimer.Start();
         };
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // nothing from a usage read reports into a closing form
+        _usageTimer.Stop();
+        _usageCts.Cancel();
+        base.OnFormClosing(e);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        _usageTimer.Dispose();
+        base.OnFormClosed(e);
     }
 
     // ---- theme ------------------------------------------------------------
@@ -168,6 +216,8 @@ public sealed class Form1 : Form
     {
         Text = "In / Out Button";
         MinimumSize = new Size(1060, 700);
+        // the tab strip costs about 50 px; opening this tall keeps the repos tab's old launch layout
+        Size = new Size(1060, 750);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 9.75F);
         BackColor = Theme.WindowBg;
@@ -245,11 +295,28 @@ public sealed class Form1 : Form
         topButtons.SetColumnSpan(_pushDataAllButton, 2);
         main.Controls.Add(topButtons, 1, 0);
 
+        // middle: tabs. title, buttons and log sit outside them, visible on every tab
+        _tabs = new TabControl { Dock = DockStyle.Fill };
+        var reposPage = CreateTabPage("Repos");
+        _usagePage = CreateTabPage("AI usage");
+        _tasksPage = CreateTabPage("Tasks");
+        _tabs.TabPages.AddRange([reposPage, _usagePage, _tasksPage]);
+        _tabs.SelectedIndexChanged += async (_, _) => await OnTabSelectedAsync();
+        main.Controls.Add(_tabs, 0, 1);
+        main.SetColumnSpan(_tabs, 2);
+
+        // repos tab: the old middle row, same 300 px / fill split
+        var reposLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
+        reposLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
+        reposLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        reposLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        reposPage.Controls.Add(reposLayout);
+
         // left column: folders card over rclone card
         var leftPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2, Margin = new Padding(3, 3, 8, 3) };
         leftPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         leftPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 268));
-        main.Controls.Add(leftPanel, 0, 1);
+        reposLayout.Controls.Add(leftPanel, 0, 0);
 
         leftPanel.Controls.Add(BuildRootsCard(), 0, 0);
         leftPanel.Controls.Add(BuildRcloneCard(), 0, 1);
@@ -258,10 +325,18 @@ public sealed class Form1 : Form
         var rightPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 2 };
         rightPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
         rightPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        main.Controls.Add(rightPanel, 1, 1);
+        reposLayout.Controls.Add(rightPanel, 1, 0);
 
         rightPanel.Controls.Add(BuildSelectedToolbar(), 0, 0);
         rightPanel.Controls.Add(BuildRepoGridCard(), 0, 1);
+
+        // web tabs start on first selection
+        _usageHost = new WebHost("usage.html", AppendLog);
+        _usageHost.MessageReceived += OnUsageMessage;
+        _usagePage.Controls.Add(_usageHost);
+        _tasksHost = new WebHost("tasks.html", AppendLog);
+        _tasksHost.MessageReceived += message => _ = OnTasksMessageAsync(message);
+        _tasksPage.Controls.Add(_tasksHost);
 
         // bottom: log
         var logCard = new Panel { Dock = DockStyle.Fill, BackColor = Theme.LogBg, Padding = new Padding(10, 8, 10, 8), Margin = new Padding(3, 8, 3, 3) };
@@ -285,6 +360,13 @@ public sealed class Form1 : Form
         status.Items.Add(_statusLabel);
         Controls.Add(status);
     }
+
+    private static TabPage CreateTabPage(string text) => new(text)
+    {
+        BackColor = Theme.WindowBg,
+        UseVisualStyleBackColor = false,
+        Padding = new Padding(6),
+    };
 
     private Control BuildRootsCard()
     {
@@ -660,6 +742,8 @@ public sealed class Form1 : Form
         }
         finally
         {
+            // before SetBusy(false), whose reload should read the new path
+            ResolveTasksStore();
             SetBusy(false);
         }
     }
@@ -1039,6 +1123,298 @@ public sealed class Form1 : Form
             : await RcloneRunner.RclonePushAsync(repo.Path, config, _settings, _settings.RcloneTimeoutSeconds);
     }
 
+    // ---- web tabs ---------------------------------------------------------
+
+    // runs from an async void handler, so nothing may escape
+    private async Task OnTabSelectedAsync()
+    {
+        try
+        {
+            if (_tabs.SelectedTab == _usagePage && !_usageStarted)
+            {
+                _usageStarted = true;
+                if (await _usageHost.EnsureAsync())
+                {
+                    _usageShown = true;
+                    await ReadUsageAsync(fresh: false);
+                }
+            }
+            else if (_tabs.SelectedTab == _tasksPage)
+            {
+                if (!_tasksShown)
+                {
+                    // set first: the page's ready, which loads the board, can beat this await
+                    _tasksShown = true;
+                    await _tasksHost.EnsureAsync();
+                }
+                else if (_taskStore is { } store && await Task.Run(() => store.ChangedSinceLoad()))
+                {
+                    await PostTasksStateAsync();
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"web: {Scrub.Message(ex.Message)}");
+        }
+    }
+
+    // a minimized window hides the tab too
+    private bool UsageVisible => _tabs.SelectedTab == _usagePage && WindowState != FormWindowState.Minimized;
+
+    // never throws; after form close it does nothing
+    private Task ReadUsageAsync(bool fresh) => _usageCts.IsCancellationRequested
+        ? Task.CompletedTask
+        : _usage.RefreshAsync(fresh, _settings.CodexExecutable, _usageCts.Token);
+
+    private void OnUsageTimerTick()
+    {
+        if (!_usageShown || !UsageVisible || _usage.Busy)
+        {
+            return;
+        }
+
+        var interval = TimeSpan.FromMinutes(Math.Max(1, _settings.UsageRefreshMinutes));
+        if (_usage.LastCompleted is { } last && DateTimeOffset.UtcNow - last < interval)
+        {
+            return;
+        }
+
+        _ = ReadUsageAsync(fresh: false);
+    }
+
+    private void OnUsageMessage(JsonElement message)
+    {
+        switch (message.GetProperty("type").GetString())
+        {
+            case "ready":
+                _usageHost.Post(new { type = "snapshot", snapshot = _usage.Last, busy = _usage.Busy });
+                break;
+            case "refresh":
+                // fresh skips the cache, never a cooldown
+                _ = ReadUsageAsync(fresh: true);
+                break;
+            case "stale":
+                if (_usageShown && UsageVisible)
+                {
+                    _ = ReadUsageAsync(fresh: false);
+                }
+                break;
+            case "action":
+                OpenUsageAction(message.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String ? id.GetString() : null);
+                break;
+            default:
+                _usageHost.NoteIgnored();
+                break;
+        }
+    }
+
+    // the page names an action and C# owns the url, so the page never supplies one
+    private void OpenUsageAction(string? id)
+    {
+        var url = id switch
+        {
+            "gemini-usage" => "https://gemini.google.com/",
+            "antigravity-setup" => "https://antigravity.google/docs/install/",
+            _ => null,
+        };
+        if (url is null)
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"usage: could not open {url}: {Scrub.Message(ex.Message)}");
+        }
+    }
+
+    // after every scan: roots can change which persistent-memory clone is found
+    private void ResolveTasksStore()
+    {
+        try
+        {
+            var path = TaskPaths.Resolve(_settings.TasksFile, _repos, out var fallback);
+            if (_taskStore is not null && string.Equals(_taskStore.Path, path, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _taskStore = new TaskStore(path);
+            _tasksFallback = fallback;
+            _lastTasksError = null;
+            AppendLog(fallback
+                ? $"tasks: persistent-memory not found; saving to {path}, which will not follow you to other machines"
+                : $"tasks: {path}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"tasks: could not resolve the tasks file: {Scrub.Message(ex.Message)}");
+        }
+    }
+
+    private async Task OnTasksMessageAsync(JsonElement message)
+    {
+        try
+        {
+            switch (message.GetProperty("type").GetString())
+            {
+                case "ready":
+                    _tasksHost.Post(new { type = "busy", busy = _busy });
+                    await PostTasksStateAsync();
+                    break;
+                case "upsert":
+                    await UpsertTaskAsync(message);
+                    break;
+                case "delete":
+                    await DeleteTaskAsync(message);
+                    break;
+                default:
+                    _tasksHost.NoteIgnored();
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"tasks: {Scrub.Message(ex.Message)}");
+        }
+    }
+
+    private async Task UpsertTaskAsync(JsonElement message)
+    {
+        if (!message.TryGetProperty("task", out var element) || element.ValueKind != JsonValueKind.Object)
+        {
+            _tasksHost.NoteIgnored();
+            return;
+        }
+
+        var id = element.TryGetProperty("id", out var idElement) && idElement.ValueKind == JsonValueKind.String ? idElement.GetString() : null;
+        if (_busy || _taskStore is not { } store)
+        {
+            PostTaskRejected(id, TasksSyncingMessage);
+            await PostTasksStateAsync();
+            return;
+        }
+
+        TaskItem? task;
+        string? unreadable = null;
+        try
+        {
+            task = element.Deserialize<TaskItem>(TaskStore.JsonOptions);
+        }
+        catch (Exception ex) when (ex is JsonException or NotSupportedException or InvalidOperationException)
+        {
+            task = null;
+            unreadable = ex.Message;
+        }
+
+        var result = task is null
+            ? new TaskStoreResult(false, false, $"The page sent a task this app could not read: {unreadable}", new TaskDocument())
+            : await RunStoreAsync(() => store.Upsert(task, DateTimeOffset.UtcNow));
+        ReportTaskMutation(id, result);
+        await PostTasksStateAsync();
+    }
+
+    private async Task DeleteTaskAsync(JsonElement message)
+    {
+        if (!message.TryGetProperty("id", out var idElement) || idElement.ValueKind != JsonValueKind.String
+            || !message.TryGetProperty("rev", out var revElement) || revElement.ValueKind != JsonValueKind.Number
+            || !revElement.TryGetInt32(out var rev))
+        {
+            _tasksHost.NoteIgnored();
+            return;
+        }
+
+        var id = idElement.GetString()!;
+        if (_busy || _taskStore is not { } store)
+        {
+            PostTaskRejected(id, TasksSyncingMessage);
+            await PostTasksStateAsync();
+            return;
+        }
+
+        ReportTaskMutation(id, await RunStoreAsync(() => store.Delete(id, rev)));
+        await PostTasksStateAsync();
+    }
+
+    // a rejection is routine and goes only to the page; an error is logged too
+    private void ReportTaskMutation(string? id, TaskStoreResult result)
+    {
+        if (result.Ok)
+        {
+            return;
+        }
+
+        var text = Scrub.Message(result.Message);
+        PostTaskRejected(id, text);
+        if (!result.Rejected)
+        {
+            AppendLog($"tasks: {text}");
+            _lastTasksError = text;
+        }
+    }
+
+    private void PostTaskRejected(string? id, string message)
+    {
+        _tasksHost.Post(new { type = "rejected", id = string.IsNullOrEmpty(id) ? null : id, message }, TaskStore.JsonOptions);
+    }
+
+    // full state every time: the page renders only what C# sends (spec 2.5)
+    private async Task PostTasksStateAsync()
+    {
+        if (!_tasksShown || _taskStore is not { } store)
+        {
+            return;
+        }
+
+        var result = await RunStoreAsync(store.Load);
+        if (store != _taskStore)
+        {
+            // a rescan moved the file meanwhile; its own reload follows
+            return;
+        }
+
+        string? error = null;
+        if (!result.Ok)
+        {
+            // a bad file shows as an error, never an empty board that a save would write over
+            error = Scrub.Message(result.Message);
+            if (error != _lastTasksError)
+            {
+                AppendLog($"tasks: {error}");
+            }
+        }
+
+        _lastTasksError = error;
+        _tasksHost.Post(new
+        {
+            type = "state",
+            today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            file = store.Path,
+            fallback = _tasksFallback,
+            repos = _repos.Select(repo => repo.Name).Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToList(),
+            tasks = result.Ok ? result.Document.Tasks : new List<TaskItem>(),
+            error,
+        }, TaskStore.JsonOptions);
+    }
+
+    // store calls are synchronous file i/o, kept off the ui thread
+    private static async Task<TaskStoreResult> RunStoreAsync(Func<TaskStoreResult> call)
+    {
+        try
+        {
+            return await Task.Run(call);
+        }
+        catch (Exception ex)
+        {
+            return new TaskStoreResult(false, false, ex.Message, new TaskDocument());
+        }
+    }
+
     // ---- shared ui plumbing -----------------------------------------------
 
     private void SetBusy(bool busy, string? status = null)
@@ -1058,6 +1434,24 @@ public sealed class Form1 : Form
         if (!string.IsNullOrWhiteSpace(status))
         {
             _statusLabel.Text = status;
+        }
+
+        // tasks lock while git runs, then reload: a pull or discard may have changed the file (spec 2.4)
+        _busy = busy;
+        if (_tasksShown)
+        {
+            _tasksHost.Post(new { type = "busy", busy });
+        }
+
+        if (!busy)
+        {
+            _ = PostTasksStateAsync();
+
+            // sign-in may have refreshed the claude token
+            if (_usageShown)
+            {
+                _ = ReadUsageAsync(fresh: false);
+            }
         }
     }
 
@@ -1236,6 +1630,10 @@ public sealed class AppSettings
 
     public int RcloneActiveDays { get; set; } = 14;         // commit-recency window for "active"
     public bool RcloneActiveOnly { get; set; } = true;      // gate batch data sync to active repos
+
+    public int UsageRefreshMinutes { get; set; } = 5;       // timer read age while the usage tab shows
+    public string? CodexExecutable { get; set; }            // override; discovered when null
+    public string? TasksFile { get; set; }                  // override; derived when null
 }
 
 public static class SettingsStore

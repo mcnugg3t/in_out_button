@@ -1,0 +1,743 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'">
+<title>Tasks</title>
+<link rel="stylesheet" href="shared.css">
+<style>
+@media (prefers-reduced-motion: no-preference) {
+  .task, .btn, .add, .foot, .seg button, .glyph { transition: background-color 0.12s ease; }
+  .foot svg { transition: transform 0.12s ease; }
+}
+.sync { color: var(--accent-text); font-size: 12px; font-weight: 600; }
+.file { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
+
+.b-body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 10px 14px; }
+.waiting { margin: auto; color: var(--muted); }
+.error-box { margin: auto; max-width: 560px; display: flex; flex-direction: column; align-items: center; gap: 12px; text-align: center; }
+.error-box .e1 { font-weight: 600; color: var(--fail-text); }
+.error-box .e2 { color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* filter row */
+.b-filter { flex: none; display: flex; align-items: center; gap: 12px; }
+.seg { display: inline-flex; overflow: hidden; background: var(--card); border: 1px solid var(--border); border-radius: 4px; }
+.seg button { height: 26px; padding: 0 12px; border: 0; border-right: 1px solid var(--border); background: transparent; cursor: pointer; }
+.seg button:last-child { border-right: 0; }
+.seg button:hover { background: var(--hover); }
+.seg button:focus-visible { outline-offset: -2px; }
+.seg button[aria-pressed="true"] { background: var(--selection); color: var(--accent-text); font-weight: 600; }
+.search { position: relative; display: block; margin-left: auto; width: 240px; }
+.search .i { position: absolute; left: 9px; top: 8px; color: var(--muted); pointer-events: none; }
+.ctl { display: block; width: 100%; height: 28px; padding: 0 8px; color: var(--fg); background: var(--field); border: 1px solid var(--border); border-radius: 4px; }
+.ctl:hover:not(:disabled) { border-color: var(--muted); }
+.ctl:disabled { opacity: 0.6; }
+.search .ctl { padding-left: 27px; }
+textarea.ctl { height: auto; padding: 5px 8px; line-height: 17px; resize: vertical; }
+
+/* three lanes */
+.b-lanes { flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.lane { display: flex; flex-direction: column; min-height: 0; border-radius: 6px; }
+.lane.drop { background: var(--selection); box-shadow: inset 0 0 0 1px var(--accent); }
+.lane-head { flex: none; display: flex; align-items: center; gap: 7px; padding: 2px 2px 8px; margin-bottom: 6px; font-weight: 600; border-bottom: 1px solid var(--border); }
+.n { color: var(--muted); font-weight: 400; }
+.lane-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 2px; }
+.empty { padding: 6px 4px; color: var(--muted); font-size: 12px; }
+
+/* task card */
+.task { display: grid; grid-template-columns: 16px minmax(0, 1fr); column-gap: 8px; padding: 9px 10px; cursor: grab; }
+.task:hover { background: var(--hover); }
+.task.dragging { opacity: 0.5; }
+body.busy .task { cursor: default; }
+.glyph { width: 16px; height: 16px; margin-top: 1px; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
+.glyph svg { display: block; width: 16px; height: 16px; }
+.glyph:disabled { cursor: default; }
+.g-idle { fill: none; stroke: var(--glyph-idle); stroke-width: 1.5; }
+.g-ring { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+.g-half { fill: var(--accent); }
+.g-done { fill: var(--ok); }
+.g-check { fill: none; stroke: var(--on-accent); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.title { display: block; width: 100%; padding: 0; border: 0; background: none; text-align: left; cursor: pointer; font-size: 13px; line-height: 18px; overflow-wrap: anywhere; }
+.title:hover { text-decoration: underline; }
+.done .title { text-decoration: line-through; color: var(--muted); }
+.repo { margin-top: 2px; font-size: 11.5px; line-height: 16px; color: var(--muted); overflow-wrap: anywhere; }
+.meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+.meta > span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.due.over { padding: 0 6px; border-radius: 4px; line-height: 18px; font-weight: 600; color: var(--fail-text); background: var(--fail-soft); }
+.due.today { color: var(--accent-text); font-weight: 600; }
+.done .due.today { color: var(--muted); font-weight: 400; }
+.prio { color: var(--fg); }
+.done .prio { color: var(--muted); }
+.flag { width: 12px; height: 12px; flex: none; }
+.flag path { stroke: currentColor; stroke-width: 1.2; stroke-linejoin: round; stroke-linecap: round; }
+.flag .fl { fill: currentColor; }
+.flag .pole { fill: none; }
+.flag.urgent { color: var(--fail); }
+.flag.important { color: var(--warn); }
+.add { flex: none; display: flex; align-items: center; gap: 6px; width: 100%; height: 30px; padding: 0 8px; border: 0; border-radius: 4px; background: transparent; color: var(--accent-text); cursor: pointer; text-align: left; }
+.add:hover:not(:disabled) { background: var(--hover); }
+.add:disabled { opacity: 0.55; cursor: default; }
+.add-input { flex: none; height: 30px; }
+.foot { flex: none; display: flex; align-items: center; gap: 6px; width: 100%; height: 30px; padding: 0 8px; border: 0; border-top: 1px solid var(--border); background: transparent; color: var(--muted); cursor: pointer; text-align: left; }
+.foot:hover { background: var(--hover); color: var(--fg); }
+.foot[aria-expanded="true"] svg { transform: rotate(90deg); }
+
+/* edit dialog */
+dialog { width: min(480px, calc(100vw - 32px)); max-height: calc(100vh - 32px); padding: 0; color: var(--fg); background: var(--card); border: 1px solid var(--border); border-radius: 6px; }
+dialog::backdrop { background: var(--scrim); }
+.dlg-form { display: flex; flex-direction: column; max-height: calc(100vh - 34px); }
+.dlg-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 12px 14px 8px; }
+.dlg-head h2 { flex: 1; margin: 0; font-size: 14px; font-weight: 600; }
+.dlg-scroll { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 2px 14px 14px; }
+.dlg-note { color: var(--accent-text); font-size: 12px; font-weight: 600; }
+.dlg-msg { padding: 7px 10px; font-size: 12.5px; color: var(--fail-text); background: var(--fail-soft); border: 1px solid var(--fail); border-radius: 4px; }
+fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: 10px; }
+.fld { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.lbl { font-size: 11.5px; color: var(--muted); }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.dd { position: relative; display: block; }
+.dd select { appearance: none; -webkit-appearance: none; padding-right: 24px; cursor: pointer; }
+.dd::after { content: ""; position: absolute; right: 10px; top: 50%; width: 6px; height: 6px; margin-top: -5px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg); pointer-events: none; }
+.ctl.mono { font-size: 12px; }
+.cl { display: flex; flex-direction: column; }
+.cl-row { display: flex; align-items: center; gap: 4px; border-radius: 4px; }
+.cl-row:hover { background: var(--hover); }
+.cl-row label { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; min-height: 24px; padding: 0 4px; cursor: pointer; font-size: 12.5px; }
+.cl-row label span { overflow-wrap: anywhere; }
+.cl-row input { flex: none; width: 14px; height: 14px; margin: 0; accent-color: var(--accent); }
+.cl-row input:checked + span { text-decoration: line-through; color: var(--muted); }
+.cl-add { display: flex; gap: 6px; margin-top: 4px; }
+.dlg-foot { flex: none; display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
+.confirm { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--fail-text); font-weight: 600; }
+</style>
+</head>
+<body data-page="tasks">
+<header class="ph">
+  <span class="tab">Tasks</span>
+  <span class="sync" id="sync" role="status" hidden>Syncing repositories…</span>
+  <span class="file" id="file"></span>
+</header>
+
+<main class="b-body">
+  <div class="banner warn" id="fallback" role="status" hidden>
+    <span class="txt">Saving to a local file because persistent-memory was not found; these tasks will not follow you to other machines</span>
+  </div>
+  <div class="banner fail" id="banner" role="alert" hidden>
+    <span class="txt" id="banner-text"></span>
+    <button class="icon-btn" id="banner-x" type="button" aria-label="Dismiss" title="Dismiss"><svg class="i" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>
+  </div>
+
+  <p class="waiting" id="waiting">Waiting for the repository scan</p>
+
+  <div class="error-box" id="error" hidden>
+    <p class="e1">The tasks file could not be read</p>
+    <p class="e2" id="error-text"></p>
+    <button class="btn" id="reload" type="button">Reload</button>
+  </div>
+
+  <div class="b-filter" id="filter" hidden>
+    <div class="seg" role="group" aria-label="Filter">
+      <button type="button" data-f="all" aria-pressed="true">All</button>
+      <button type="button" data-f="week" aria-pressed="false">Due this week</button>
+      <button type="button" data-f="over" aria-pressed="false">Overdue</button>
+    </div>
+    <label class="search"><svg class="i" viewBox="0 0 12 12" aria-hidden="true"><circle cx="5.2" cy="5.2" r="3.5"/><path d="M7.8 7.8l2.7 2.7"/></svg><input class="ctl" id="search" type="search" placeholder="Search tasks" aria-label="Search tasks"></label>
+  </div>
+
+  <div class="b-lanes" id="lanes" hidden></div>
+</main>
+
+<datalist id="repo-list"></datalist>
+
+<dialog id="dlg" aria-labelledby="dlg-h">
+  <form class="dlg-form" id="dlg-form" method="dialog" novalidate>
+    <div class="dlg-head">
+      <h2 id="dlg-h">Edit task</h2>
+      <button class="icon-btn" id="dlg-x" type="button" aria-label="Close" title="Close"><svg class="i" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6"/></svg></button>
+    </div>
+    <div class="dlg-scroll">
+      <p class="dlg-note" id="dlg-busy" role="status" hidden>Syncing repositories… editing resumes when it finishes</p>
+      <p class="dlg-msg" id="dlg-msg" role="alert" hidden></p>
+      <fieldset id="dlg-fs">
+        <label class="fld"><span class="lbl">Title</span><input class="ctl" id="f-title" type="text" autocomplete="off"></label>
+        <div class="row2">
+          <label class="fld"><span class="lbl">Bucket</span><span class="dd"><select class="ctl" id="f-bucket">
+            <option value="projects">Projects</option><option value="admin">Admin</option><option value="misc">Misc</option>
+          </select></span></label>
+          <label class="fld"><span class="lbl">Progress</span><span class="dd"><select class="ctl" id="f-progress">
+            <option value="notStarted">Not started</option><option value="inProgress">In progress</option><option value="complete">Complete</option>
+          </select></span></label>
+        </div>
+        <div class="row2">
+          <label class="fld"><span class="lbl">Due date</span><input class="ctl" id="f-due" type="date"></label>
+          <label class="fld"><span class="lbl">Priority</span><span class="dd"><select class="ctl" id="f-priority">
+            <option value="normal">Normal</option><option value="important">Important</option><option value="urgent">Urgent</option>
+          </select></span></label>
+        </div>
+        <label class="fld"><span class="lbl">Repo</span><input class="ctl mono" id="f-repo" type="text" list="repo-list" autocomplete="off" spellcheck="false"></label>
+        <div class="fld">
+          <span class="lbl">Checklist <span id="cl-n"></span></span>
+          <div class="cl" id="cl"></div>
+          <div class="cl-add">
+            <input class="ctl" id="cl-new" type="text" placeholder="Add an item" aria-label="New checklist item" autocomplete="off">
+            <button class="btn" id="cl-add" type="button">Add</button>
+          </div>
+        </div>
+        <label class="fld"><span class="lbl">Notes</span><textarea class="ctl" id="f-notes" rows="4"></textarea></label>
+      </fieldset>
+    </div>
+    <div class="dlg-foot">
+      <span id="del-zone"><button class="btn danger" id="dlg-del" type="button">Delete</button></span>
+      <span class="confirm" id="confirm" hidden>Delete this task?
+        <button class="btn danger solid" id="confirm-yes" type="button">Delete</button>
+        <button class="btn" id="confirm-no" type="button">Keep</button>
+      </span>
+      <span class="grow"></span>
+      <button class="btn" id="dlg-cancel" type="button">Cancel</button>
+      <button class="btn primary" id="dlg-save" type="submit">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="bridge.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  const BUCKETS = [['projects', 'Projects'], ['admin', 'Admin'], ['misc', 'Misc']];
+  const PROGRESS = ['notStarted', 'inProgress', 'complete'];
+  const PROGRESS_NAME = { notStarted: 'Not started', inProgress: 'In progress', complete: 'Complete' };
+  const PRIORITY_NAME = { important: 'Important', urgent: 'Urgent' };
+  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const SVGNS = 'http://www.w3.org/2000/svg';
+  const $ = id => document.getElementById(id);
+
+  // page state; C# owns the tasks, the page owns only view state and the open draft
+  const S = {
+    loaded: false, today: '', file: '', fallback: false, repos: [], tasks: [], error: null,
+    busy: false, filter: 'all', q: '', openDone: {}, adding: null, addText: '', banner: null
+  };
+  let D = null;
+  let dragId = null;
+  let rendering = false;
+
+  // dom helpers; every data string goes through textContent or a property
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function svg(cls, viewBox, parts) {
+    const s = document.createElementNS(SVGNS, 'svg');
+    s.setAttribute('viewBox', viewBox);
+    s.setAttribute('aria-hidden', 'true');
+    if (cls) s.setAttribute('class', cls);
+    parts.forEach(([tag, attrs]) => {
+      const n = document.createElementNS(SVGNS, tag);
+      Object.keys(attrs).forEach(k => n.setAttribute(k, attrs[k]));
+      s.appendChild(n);
+    });
+    return s;
+  }
+  const ICON = {
+    plus: [['path', { d: 'M6 2v8M2 6h8' }]],
+    cal: [['rect', { x: 1.5, y: 2.5, width: 9, height: 8, rx: 1.5 }], ['path', { d: 'M1.5 5.2h9M4 1.3v2.2M8 1.3v2.2' }]],
+    chk: [['rect', { x: 1.5, y: 1.5, width: 9, height: 9, rx: 2 }], ['path', { d: 'M3.8 6.1l1.6 1.6 2.9-3' }]],
+    chev: [['path', { d: 'M4.5 3l3 3-3 3' }]],
+    x: [['path', { d: 'M3 3l6 6M9 3l-6 6' }]]
+  };
+  const icon = name => svg('i', '0 0 12 12', ICON[name]);
+  const GLYPH = {
+    notStarted: [['circle', { class: 'g-idle', cx: 8, cy: 8, r: 6.25 }]],
+    inProgress: [['circle', { class: 'g-ring', cx: 8, cy: 8, r: 6.25 }], ['path', { class: 'g-half', d: 'M8 1.75a6.25 6.25 0 0 1 0 12.5z' }]],
+    complete: [['circle', { class: 'g-done', cx: 8, cy: 8, r: 7 }], ['path', { class: 'g-check', d: 'M4.9 8.3l2 2 4.2-4.4' }]]
+  };
+  const flag = pr => svg('flag ' + pr, '0 0 12 12',
+    [['path', { class: 'pole', d: 'M2.5 11V1.5' }], ['path', { class: 'fl', d: 'M2.5 2h6.6L7.6 4.5 9.1 7H2.5z' }]]);
+
+  // dates are local yyyy-mm-dd strings, compared as text
+  const pad = n => String(n).padStart(2, '0');
+  const isDate = s => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  function localToday() {
+    const d = new Date();
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  }
+  function addDays(iso, n) {
+    const [y, m, d] = iso.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+  }
+  function fmt(iso) {
+    const [, m, d] = iso.split('-').map(Number);
+    return MON[m - 1] + ' ' + d;
+  }
+
+  const clone = o => JSON.parse(JSON.stringify(o));
+  const find = id => S.tasks.find(t => t.id === id) || null;
+  const isDone = t => t.progress === 'complete';
+  const dueKey = t => (isDate(t.due) ? t.due : '9999-99-99');
+  function byDue(a, b) {
+    const x = dueKey(a), y = dueKey(b);
+    if (x !== y) return x < y ? -1 : 1;
+    return String(a.created || '').localeCompare(String(b.created || '')) || String(a.id).localeCompare(String(b.id));
+  }
+
+  // filters from spec 2.5: this week includes overdue, both skip completed
+  function matches(t) {
+    if (S.q) {
+      const hay = [t.title, t.repo, t.notes].filter(v => typeof v === 'string').join('\n').toLowerCase();
+      if (!hay.includes(S.q)) return false;
+    }
+    if (S.filter === 'week') return !isDone(t) && isDate(t.due) && t.due <= addDays(S.today, 6);
+    if (S.filter === 'over') return !isDone(t) && isDate(t.due) && t.due < S.today;
+    return true;
+  }
+
+  function dueInfo(t) {
+    if (!isDate(t.due)) return null;
+    if (!isDone(t) && t.due < S.today) return { cls: 'over', txt: 'Overdue · ' + fmt(t.due) };
+    if (t.due === S.today) return { cls: 'today', txt: 'Today' };
+    return { cls: '', txt: fmt(t.due) };
+  }
+
+  function send(msg) {
+    if (S.busy) return false;
+    Bridge.send(msg);
+    return true;
+  }
+  const upsert = task => send({ type: 'upsert', task });
+
+  // board
+  function card(t, bucket) {
+    const done = isDone(t);
+    const c = el('div', 'card task' + (done ? ' done' : ''));
+    c.draggable = !S.busy;
+    const prog = GLYPH[t.progress] ? t.progress : 'notStarted';
+
+    const g = el('button', 'glyph');
+    g.type = 'button';
+    g.disabled = S.busy;
+    g.title = PROGRESS_NAME[prog] + ' · click to change';
+    g.setAttribute('aria-label', PROGRESS_NAME[prog] + ', change progress');
+    g.dataset.fk = 'g:' + t.id;
+    g.appendChild(svg(null, '0 0 16 16', GLYPH[prog]));
+    g.addEventListener('click', () => {
+      const next = PROGRESS[(PROGRESS.indexOf(prog) + 1) % PROGRESS.length];
+      upsert(Object.assign(clone(t), { progress: next }));
+    });
+
+    const body = el('div', 'body');
+    const title = el('button', 'title', t.title || '(untitled)');
+    title.type = 'button';
+    title.dataset.fk = 't:' + t.id;
+    title.addEventListener('click', () => openDialog(t.id));
+    body.appendChild(title);
+    if (bucket === 'projects' && t.repo) body.appendChild(el('div', 'repo mono', t.repo));
+
+    const meta = el('div', 'meta');
+    const d = dueInfo(t);
+    if (d) {
+      const s = el('span', 'due ' + d.cls);
+      s.append(icon('cal'), document.createTextNode(d.txt));
+      meta.appendChild(s);
+    }
+    if (PRIORITY_NAME[t.priority]) {
+      const p = el('span', 'prio');
+      p.append(flag(t.priority), document.createTextNode(PRIORITY_NAME[t.priority]));
+      meta.appendChild(p);
+    }
+    const items = Array.isArray(t.checklist) ? t.checklist.filter(i => i && typeof i === 'object') : [];
+    if (items.length) {
+      const n = items.filter(i => i.done).length;
+      const k = el('span');
+      k.title = 'Checklist: ' + n + ' of ' + items.length + ' done';
+      k.append(icon('chk'), document.createTextNode(n + '/' + items.length));
+      meta.appendChild(k);
+    }
+    if (meta.childNodes.length) body.appendChild(meta);
+    c.append(g, body);
+
+    c.addEventListener('dragstart', e => {
+      if (S.busy) { e.preventDefault(); return; }
+      dragId = t.id;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', t.title || '');
+      c.classList.add('dragging');
+    });
+    c.addEventListener('dragend', endDrag);
+    return c;
+  }
+
+  function endDrag() {
+    dragId = null;
+    document.querySelectorAll('.lane.drop, .task.dragging').forEach(n => n.classList.remove('drop', 'dragging'));
+  }
+
+  function addButton(key, name) {
+    const b = el('button', 'add');
+    b.type = 'button';
+    b.disabled = S.busy;
+    b.dataset.fk = 'a:' + key;
+    b.append(icon('plus'), document.createTextNode('Add task'));
+    b.addEventListener('click', () => {
+      S.adding = key;
+      S.addText = '';
+      const inp = addInput(key, name);
+      b.replaceWith(inp);
+      inp.focus();
+    });
+    return b;
+  }
+
+  function addInput(key, name) {
+    const inp = el('input', 'ctl add-input');
+    inp.type = 'text';
+    inp.placeholder = 'Task title, then Enter';
+    inp.setAttribute('aria-label', 'New ' + name + ' task');
+    inp.autocomplete = 'off';
+    inp.value = S.addText;
+    inp.disabled = S.busy;
+    inp.dataset.fk = 'i:' + key;
+    // swap back in place so a click elsewhere is not lost to a re-render
+    const close = refocus => {
+      if (S.adding === key) { S.adding = null; S.addText = ''; }
+      const b = addButton(key, name);
+      inp.replaceWith(b);
+      if (refocus) b.focus();
+    };
+    inp.addEventListener('input', () => { S.addText = inp.value; });
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        const title = inp.value.trim();
+        if (!title) return;
+        if (upsert({ rev: 0, title, bucket: key, progress: 'notStarted', priority: 'normal', checklist: [] })) {
+          S.addText = '';
+          inp.value = '';
+        }
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        close(true);
+      }
+    });
+    inp.addEventListener('blur', () => {
+      if (!rendering && inp.isConnected && !inp.value.trim()) close(false);
+    });
+    return inp;
+  }
+
+  function lane(key, name) {
+    const all = S.tasks.filter(t => t.bucket === key && matches(t));
+    const open = all.filter(t => t.progress === 'inProgress').sort(byDue)
+      .concat(all.filter(t => t.progress !== 'inProgress' && !isDone(t)).sort(byDue));
+    const done = all.filter(isDone).sort(byDue);
+
+    const sec = el('section', 'lane');
+    sec.setAttribute('aria-label', name);
+    const head = el('div', 'lane-head', name);
+    head.appendChild(el('span', 'n', String(all.length)));
+    const list = el('div', 'lane-list');
+
+    open.forEach(t => list.appendChild(card(t, key)));
+    if (!open.length) {
+      list.appendChild(el('div', 'empty', S.filter === 'all' && !S.q ? 'No open tasks' : 'No matching tasks'));
+    }
+    list.appendChild(S.adding === key ? addInput(key, name) : addButton(key, name));
+
+    if (done.length) {
+      const ex = !!S.openDone[key];
+      const foot = el('button', 'foot');
+      foot.type = 'button';
+      foot.dataset.fk = 'f:' + key;
+      foot.setAttribute('aria-expanded', String(ex));
+      foot.append(icon('chev'), document.createTextNode('Completed (' + done.length + ')'));
+      foot.addEventListener('click', () => {
+        S.openDone[key] = !S.openDone[key];
+        renderBoard();
+      });
+      list.appendChild(foot);
+      if (ex) done.forEach(t => list.appendChild(card(t, key)));
+    }
+    sec.append(head, list);
+
+    // drop target: another lane changes the bucket
+    const canDrop = () => {
+      const t = dragId && find(dragId);
+      return t && !S.busy && t.bucket !== key ? t : null;
+    };
+    sec.addEventListener('dragover', e => {
+      if (!canDrop()) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      sec.classList.add('drop');
+    });
+    sec.addEventListener('dragleave', e => {
+      if (!sec.contains(e.relatedTarget)) sec.classList.remove('drop');
+    });
+    sec.addEventListener('drop', e => {
+      const t = canDrop();
+      endDrag();
+      if (!t) return;
+      e.preventDefault();
+      upsert(Object.assign(clone(t), { bucket: key }));
+    });
+    return sec;
+  }
+
+  function focusFk(key) {
+    if (!key) return;
+    const n = Array.from(document.querySelectorAll('#lanes [data-fk]')).find(x => x.dataset.fk === key);
+    if (n && !n.disabled) n.focus();
+  }
+
+  function renderBoard() {
+    const active = document.activeElement;
+    const fk = active && $('lanes').contains(active) ? active.dataset.fk : null;
+    rendering = true;
+    const lanes = $('lanes');
+    lanes.textContent = '';
+    BUCKETS.forEach(([key, name]) => lanes.appendChild(lane(key, name)));
+    rendering = false;
+    focusFk(fk);
+  }
+
+  function renderBanner() {
+    $('banner').hidden = !S.banner;
+    $('banner-text').textContent = S.banner || '';
+  }
+
+  function render() {
+    document.body.classList.toggle('busy', S.busy);
+    $('sync').hidden = !S.busy;
+    $('file').textContent = S.file;
+    $('file').title = S.file;
+    $('fallback').hidden = !S.fallback;
+    renderBanner();
+
+    $('waiting').hidden = S.loaded;
+    const failed = S.loaded && S.error != null;
+    $('error').hidden = !failed;
+    $('error-text').textContent = failed ? S.error : '';
+    $('filter').hidden = !S.loaded || failed;
+    $('lanes').hidden = !S.loaded || failed;
+    if (!S.loaded || failed) return;
+
+    const dl = $('repo-list');
+    dl.textContent = '';
+    S.repos.forEach(r => {
+      const o = document.createElement('option');
+      o.value = r;
+      dl.appendChild(o);
+    });
+    renderBoard();
+  }
+
+  // edit dialog
+  const dlg = $('dlg');
+  const F = {
+    title: $('f-title'), bucket: $('f-bucket'), progress: $('f-progress'), due: $('f-due'),
+    priority: $('f-priority'), repo: $('f-repo'), notes: $('f-notes')
+  };
+
+  function showMsg(text) {
+    $('dlg-msg').hidden = !text;
+    $('dlg-msg').textContent = text || '';
+  }
+  function showConfirm(on) {
+    $('del-zone').hidden = on;
+    $('confirm').hidden = !on;
+  }
+  function syncDialog() {
+    if (!D) return;
+    const lock = S.busy || !!D.pending;
+    $('dlg-fs').disabled = lock;
+    $('dlg-save').disabled = lock;
+    $('dlg-del').disabled = lock;
+    $('confirm-yes').disabled = lock;
+    $('dlg-save').textContent = D.pending === 'save' ? 'Saving…' : 'Save';
+    $('confirm-yes').textContent = D.pending === 'delete' ? 'Deleting…' : 'Delete';
+    $('dlg-busy').hidden = !S.busy;
+  }
+  function renderChecklist() {
+    const box = $('cl');
+    box.textContent = '';
+    D.items.forEach((it, i) => {
+      const row = el('div', 'cl-row');
+      const lab = el('label');
+      const cb = el('input');
+      cb.type = 'checkbox';
+      cb.checked = it.done;
+      cb.addEventListener('change', () => { it.done = cb.checked; countChecklist(); });
+      lab.append(cb, el('span', null, it.text));
+      const rm = el('button', 'icon-btn');
+      rm.type = 'button';
+      rm.title = 'Remove';
+      rm.setAttribute('aria-label', 'Remove ' + it.text);
+      rm.appendChild(icon('x'));
+      rm.addEventListener('click', () => {
+        D.items.splice(i, 1);
+        renderChecklist();
+        $('cl-new').focus();
+      });
+      row.append(lab, rm);
+      box.appendChild(row);
+    });
+    countChecklist();
+  }
+  function countChecklist() {
+    const n = D.items.filter(i => i.done).length;
+    $('cl-n').textContent = D.items.length ? n + '/' + D.items.length : '';
+  }
+  function addItem() {
+    const inp = $('cl-new');
+    const text = inp.value.trim();
+    if (!D || !text) return;
+    D.items.push({ text, done: false });
+    inp.value = '';
+    renderChecklist();
+    inp.focus();
+  }
+
+  function openDialog(id) {
+    const t = find(id);
+    if (!t) return;
+    D = {
+      id, base: clone(t), pending: null, sent: null,
+      items: (Array.isArray(t.checklist) ? t.checklist : [])
+        .filter(i => i && typeof i === 'object').map(i => ({ text: String(i.text || ''), done: !!i.done }))
+    };
+    F.title.value = t.title || '';
+    F.bucket.value = t.bucket;
+    F.progress.value = GLYPH[t.progress] ? t.progress : 'notStarted';
+    F.due.value = isDate(t.due) ? t.due : '';
+    F.priority.value = PRIORITY_NAME[t.priority] ? t.priority : 'normal';
+    F.repo.value = t.repo || '';
+    F.notes.value = t.notes || '';
+    $('cl-new').value = '';
+    showMsg('');
+    showConfirm(false);
+    renderChecklist();
+    syncDialog();
+    dlg.showModal();
+    F.title.focus();
+  }
+
+  function closeDialog() {
+    if (!D) return;
+    const id = D.id;
+    D = null;
+    if (dlg.open) dlg.close();
+    focusFk('t:' + id);
+  }
+
+  // the rev sent back is the one the draft started from, so a newer disk edit is rejected
+  function save() {
+    if (!D || S.busy || D.pending) return;
+    const title = F.title.value.trim();
+    if (!title) { showMsg('Title is required.'); F.title.focus(); return; }
+    const task = Object.assign(clone(D.base), {
+      title,
+      bucket: F.bucket.value,
+      progress: F.progress.value,
+      due: isDate(F.due.value) ? F.due.value : null,
+      priority: F.priority.value,
+      repo: F.repo.value.trim() || null,
+      notes: F.notes.value,
+      checklist: D.items.map(i => ({ text: i.text, done: i.done })),
+      rev: D.base.rev
+    });
+    showMsg('');
+    if (!upsert(task)) return;
+    D.pending = 'save';
+    D.sent = task;
+    syncDialog();
+  }
+
+  function confirmDelete() {
+    if (!D || S.busy || D.pending) return;
+    if (!send({ type: 'delete', id: D.id, rev: D.base.rev })) return;
+    D.pending = 'delete';
+    syncDialog();
+  }
+
+  // a save counts as accepted when the task comes back newer and equal to the draft
+  const shape = t => JSON.stringify([
+    t.title || '', t.bucket, t.progress, isDate(t.due) ? t.due : null, t.priority || 'normal', t.repo || null,
+    t.notes || '', (Array.isArray(t.checklist) ? t.checklist : []).map(i => [String(i.text || ''), !!i.done])
+  ]);
+  function reconcileDialog() {
+    if (!D || !D.pending) return;
+    const t = find(D.id);
+    if (D.pending === 'save' && t && t.rev > D.sent.rev && shape(t) === shape(D.sent)) { closeDialog(); return; }
+    if (D.pending === 'delete' && !t) { closeDialog(); return; }
+    D.pending = null;
+    syncDialog();
+  }
+
+  $('dlg-form').addEventListener('submit', e => { e.preventDefault(); save(); });
+  dlg.addEventListener('cancel', e => { e.preventDefault(); closeDialog(); });
+  $('dlg-x').addEventListener('click', closeDialog);
+  $('dlg-cancel').addEventListener('click', closeDialog);
+  $('dlg-del').addEventListener('click', () => { showConfirm(true); $('confirm-no').focus(); });
+  $('confirm-no').addEventListener('click', () => { showConfirm(false); $('dlg-del').focus(); });
+  $('confirm-yes').addEventListener('click', confirmDelete);
+  $('cl-add').addEventListener('click', addItem);
+  $('cl-new').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); addItem(); }
+  });
+
+  // header, filter, banners
+  document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+    S.filter = b.dataset.f;
+    document.querySelectorAll('.seg button').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
+    renderBoard();
+  }));
+  $('search').addEventListener('input', e => {
+    S.q = e.target.value.trim().toLowerCase();
+    renderBoard();
+  });
+  $('banner-x').addEventListener('click', () => { S.banner = null; renderBanner(); });
+  $('reload').addEventListener('click', () => Bridge.send({ type: 'ready' }));
+
+  Bridge.on(msg => {
+    switch (msg.type) {
+      case 'state':
+        S.loaded = true;
+        S.today = isDate(msg.today) ? msg.today : localToday();
+        S.file = typeof msg.file === 'string' ? msg.file : '';
+        S.fallback = msg.fallback === true;
+        S.repos = Array.isArray(msg.repos) ? msg.repos.filter(r => typeof r === 'string') : [];
+        S.tasks = Array.isArray(msg.tasks)
+          ? msg.tasks.filter(t => t && typeof t === 'object' && typeof t.id === 'string') : [];
+        S.error = msg.error == null ? null : String(msg.error);
+        render();
+        reconcileDialog();
+        break;
+      case 'busy':
+        S.busy = msg.busy === true;
+        render();
+        syncDialog();
+        break;
+      case 'rejected': {
+        const text = typeof msg.message === 'string' && msg.message ? msg.message : 'The change was not saved.';
+        if (D && typeof msg.id === 'string' && msg.id === D.id) {
+          D.pending = null;
+          showMsg(text);
+          syncDialog();
+        } else {
+          S.banner = text;
+          renderBanner();
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  });
+
+  Bridge.send({ type: 'ready' });
+})();
+</script>
+</body>
+</html>

@@ -49,6 +49,15 @@ profiles and default/custom Codex homes. The full Sign in action and remote
 machines have not been exercised for this setup change; those would perform
 repository and dataset synchronization beyond the installer checks.
 
+## AI usage and Tasks tabs
+
+The middle of the window has three tabs: **Repos** (the folders, rclone, and repo grid above), **AI usage**, and **Tasks**. The title, the Sign in / Sign out buttons, and the log stay visible on every tab. The two new tabs are local HTML pages from `web\` shown in WebView2 (Microsoft's embedded Edge browser control) and need the Evergreen WebView2 runtime; without it each tab shows a message and the Repos tab works as before. Design and contracts: [docs/2026-10-17-usage-and-tasks-tabs-spec.md](docs/2026-10-17-usage-and-tasks-tabs-spec.md).
+
+- **AI usage** reads the Claude Code login's usage meters, Codex's rate-limit windows through `codex app-server`, and shows an empty state for Google. It reads on first open, every `UsageRefreshMinutes` while the tab is showing, after each batch action, and on **Refresh**.
+- **Tasks** is a three-lane board (Projects, Admin, Misc) saved to `persistent-memory\tasks\tasks.json`, so sign-out commits it with everything else. When no persistent-memory clone is found the board saves to `%APPDATA%\InOutButton\tasks.json` and says so in a banner. Editing is locked while a batch action runs, and the board reloads when it ends.
+
+Settings for these tabs have no controls; edit `settings.json` by hand: `UsageRefreshMinutes` (default 5), `CodexExecutable` (path override; found on `PATH` when unset), and `TasksFile` (path override).
+
 ## Dataset sync (rclone)
 
 Repos can opt in to syncing large, gitignored folders (datasets, model weights, etc.) to a cloud remote. This layers onto the existing buttons:

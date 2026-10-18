@@ -99,7 +99,8 @@ ProviderAction(string Id, string Label)
 
 **Anthropic reader** (specification: `persistent-memory/agent-cooperation/
 claude-usage-mcp/src/usage.mjs`, lines 100-230 for parsing and 453-542 for the
-request; fixture `tests/fixtures/usage-2026-10-13.json` beside it):
+request; its fixture is copied to this repo as
+`tests/fixtures/anthropic-usage-2026-10-13.json`):
 
 - Credentials: `%CLAUDE_CONFIG_DIR%\.credentials.json` if the variable is set,
   else `~\.claude\.credentials.json`. Read as UTF-8, strip a BOM, take
@@ -210,14 +211,16 @@ cooldown starts. Nothing on routine refreshes.
 C# to page: `{type:"snapshot", snapshot:<UsageSnapshot>, busy:false}` after
 every read, and `{type:"snapshot", busy:true}` while one is in flight so the
 Refresh button can disable. Page to C#: `{type:"ready"}`, `{type:"refresh"}`,
-`{type:"action", id}`.
+`{type:"stale"}`, `{type:"action", id}`.
 
 The page renders from the snapshot and re-derives "resets in" and the fuse
 position every 30 s from `resetsAt` and the clock, so the countdown stays
 right between reads. Same-day resets show the time ("7:00 PM"); other days add
 the weekday ("Fri 4:08 PM"). When a window has passed its reset without a new
-read, the label reads "reset at 7:00 PM · refreshing" and the page posts
-`{type:"refresh"}` once.
+read, the label reads "reset at 7:00 PM · waiting for refresh" and the page
+posts `{type:"stale"}` once per meter per snapshot and at most once per 60 s;
+Form1 decides whether that becomes a read (section 2.2). (Corrected
+2026-10-17 after the web builder found this paragraph contradicting 2.2.)
 
 ### 2.4 Tasks data layer
 
@@ -479,6 +482,12 @@ Expected values come from captured data, not from the code under test.
 
 ## 5. Out of scope for this cut
 
+- **Burn pace tiles for the usage tab.** Caleb's preferred view is candidate C
+  (burn pace tiles), with A (rings and fuses) second; A was already built when
+  he said so (2026-10-17), so A ships now and C is the first follow-up. It is a
+  page-only change: `web/usage.html` renders the same snapshot, so C can
+  replace A or sit behind a view toggle in the page header without touching
+  C#. The candidate markup is in `docs/design/2026-10-17-candidates/`.
 - Parsing `agy -p /usage` for Gemini.
 - A dark theme for the WinForms chrome.
 - Task ordering by hand, assignees, attachments, recurring tasks.

@@ -50,7 +50,8 @@
     };
   }
 
-  // the last good read, nine hours old: its session window has since reset, its weeklies run 3 d 2 h on
+  // the last good read, nine hours old. its session window has since reset, so the page
+  // draws it as a finished ghost; its weeklies run 3 d 2 h on
   function anthropicStale(now, iso, hist) {
     const read = now - 9 * 60 * MIN;
     const from = mins => iso(read + mins * MIN);
@@ -58,7 +59,7 @@
       provider: 'Anthropic',
       plan: 'Claude Max 20x',
       state: 'stale',
-      message: 'Claude Code token expired; the refresh ladder did not advance it',
+      message: 'Claude Code token expired; the refresh ladder did not replace it',
       detail: null,
       meters: [
         { key: 'session', name: 'Session', windowMinutes: 300, usedPercent: 34,

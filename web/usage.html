@@ -66,7 +66,7 @@ body.busy .pb { opacity: 0.5; }
 .c-tile.passed .c-chart { opacity: 0.55; }
 .clab { fill: var(--muted); font-size: 11px; }
 .c-ghost { position: relative; margin-top: auto; }
-.c-ghost p { position: absolute; inset: 0 0 14px; display: flex; align-items: center; justify-content: center; font-size: 12px; color: var(--muted); }
+.c-ghost p { position: absolute; inset: 0 0 14px; display: flex; align-items: center; justify-content: center; padding: 0 18px; text-align: center; font-size: 12px; line-height: 1.4; color: var(--muted); }
 
 /* unavailable provider: one card across the row */
 .c-off { grid-column: 1 / -1; display: flex; min-height: 132px; padding: 14px 16px; }
@@ -114,6 +114,7 @@ body.busy .pb { opacity: 0.5; }
   let clocks = [];
   let ghosts = [];
   let ages = [];
+  let finished = [];
   const staleSent = new Set();
   let lastStaleAt = 0;
 
@@ -170,7 +171,9 @@ body.busy .pb { opacity: 0.5; }
     return min + '-minute window';
   }
 
-  // valid points oldest first; the host already sorts them, this guards an odd post
+  // valid points sorted oldest first, whatever order the host sent; a null or missing
+  // history is no history. with fx in burn() clamping every x to 0..1, a point the host
+  // should not have sent cannot draw outside the plot box or run backwards
   function history(m) {
     if (!Array.isArray(m.history)) return [];
     return m.history
@@ -334,8 +337,8 @@ body.busy .pb { opacity: 0.5; }
 
     const name = p.provider || 'Provider';
     clocks.push({
-      m, box, leftWord, countdown, chart, sev, stale, guide: first, hist: history(m),
-      readAt: Date.parse(p.updatedAt), live: p.state === 'ok',
+      p, m, box, leftWord, countdown, chart, sev, stale, guide: first, hist: history(m),
+      readAt: Date.parse(p.updatedAt), live: p.state === 'ok', label: name + ' ' + (m.name || ''),
       who: name + ' ' + (m.name || '') + ', ' + (m.severity || 'normal') + (stale ? ', stale reading' : ''),
       id: name + '|' + (m.key || m.name)
     });
@@ -351,6 +354,24 @@ body.busy .pb { opacity: 0.5; }
     wrap.append(chart, el('p', null, 'No 5-hour window reported'));
     box.append(top, wrap);
     ghosts.push(chart);
+    return box;
+  }
+
+  // a stale meter past its reset is a finished window: its percent, chip, pace and path
+  // describe a window that no longer exists, so only its name and length stay
+  function finishedTile(k) {
+    const box = el('div', 'card c-tile c-ghost-t tm stale');
+    box.tabIndex = 0;
+    const win = windowLabel(num(k.m.windowMinutes));
+    const top = el('div', 'c-top');
+    top.append(el('span', 'm-name', k.m.name || k.m.key || 'Meter'), el('span', 'c-win', win));
+    const wrap = el('div', 'c-ghost');
+    const chart = el('div', 'c-chart');
+    const text = el('p');
+    wrap.append(chart, text);
+    box.append(top, wrap);
+    ghosts.push(chart);
+    finished.push({ box, text, win, label: k.label, t: Date.parse(k.m.resetsAt) });
     return box;
   }
 
@@ -375,6 +396,7 @@ body.busy .pb { opacity: 0.5; }
     clocks = [];
     ghosts = [];
     ages = [];
+    finished = [];
     board.textContent = '';
     const providers = snap && Array.isArray(snap.providers) ? snap.providers.filter(p => p && typeof p === 'object') : [];
     if (!providers.length) {
@@ -393,9 +415,10 @@ body.busy .pb { opacity: 0.5; }
   // re-derive countdowns, the now position, the flat tail and the tooltips from the clock
   function tick() {
     const nowMs = Date.now(), now = new Date(nowMs);
-    const passed = [];
+    const passed = [], done = [];
     clocks.forEach(k => {
       const t = Date.parse(k.m.resetsAt);
+      if (k.stale && t <= nowMs) { done.push(k); return; }
       const used = num(k.m.usedPercent);
       const lines = [pct(used) + '% used · ' + pct(clamp(100 - used, 0, 100)) + '% left'];
       let over = false;
@@ -427,7 +450,24 @@ body.busy .pb { opacity: 0.5; }
       k.box.setAttribute('aria-label', k.who + ': ' + lines.join('. '));
       drawChart(k, nowMs);
     });
+    // finished stale windows turn into ghosts, here rather than in render so one that
+    // resets while on screen turns too; the even-pace label moves to the provider's next tile
+    if (done.length) {
+      clocks = clocks.filter(k => done.indexOf(k) < 0);
+      done.forEach(k => {
+        if (cur === k.box) hideTip();
+        k.box.replaceWith(finishedTile(k));
+        const next = k.guide && clocks.find(c => c.p === k.p);
+        if (next && !next.guide) { next.guide = true; drawChart(next, nowMs); }
+      });
+    }
     ghosts.forEach(drawGhost);
+    finished.forEach(f => {
+      const line = 'window reset at ' + when(new Date(f.t), now) + ' since the last read · waiting for a live read';
+      f.text.textContent = line;
+      f.box.tipLines = [f.win, line];
+      f.box.setAttribute('aria-label', f.label + ': ' + f.box.tipLines.join('. '));
+    });
     ages.forEach(a => {
       a.node.textContent = 'last read ' + (isNaN(a.at) ? 'at an unknown time' : span(nowMs - a.at, true) + ' ago')
         + (a.message ? ' · ' + a.message : '');

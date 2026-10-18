@@ -68,6 +68,12 @@ Never a cleaning build beside the running exe; verify with
 - The scrubber's 24-character opaque-run rule also redacts GUIDs and long file
   names inside exception messages. Accepted.
 - TabControl styling is WinForms default. The form opens at 1060x750.
+- The first usage read runs as soon as the tab is first shown. On a
+  saturated machine (100% CPU at the 2026-10-17 deploy, with the repo scan
+  still probing) both readers hit their caps and showed "timed out"; the
+  next scheduled read five minutes later recovered both without a click.
+  Improvement: delay the first read until the scan has finished, or retry
+  once after 30 s when every provider timed out.
 
 ## Settings added
 

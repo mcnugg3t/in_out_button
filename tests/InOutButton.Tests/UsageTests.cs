@@ -395,16 +395,23 @@ public class UsageTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => CodexUsage.ReadOutcomeAsync((string?)null, cancelled.Token));
     }
 
+    // spec 9: the empty state moved to the not-found path. a bare name that isn't on PATH fails to start
+    // with win32 error 2, which is agy not being there
     [Fact]
-    public void GeminiIsAnEmptyStateWithTwoActions()
+    public async Task GeminiNotFoundIsAnEmptyStateWithTwoActions()
     {
-        var usage = GeminiUsage.Read();
+        var launch = new AgyLaunch("agy-not-installed-" + Guid.NewGuid().ToString("N")[..8], []);
 
+        var outcome = await GeminiUsage.ReadOutcomeAsync(launch, TimeSpan.FromSeconds(10), CancellationToken.None);
+
+        var usage = outcome.Usage;
         Assert.Equal("Google", usage.Provider);
         Assert.Equal("unavailable", usage.State);
         Assert.Equal("No local source on this machine.", usage.Message);
         Assert.NotNull(usage.Detail);
         Assert.Equal(["gemini-usage", "antigravity-setup"], usage.Actions.Select(a => a.Id));
+        // not a failure, so no backoff: installing agy shows up on the next read
+        Assert.Null(outcome.Cooldown);
     }
 
     private static bool IsAlive(int pid, string name)

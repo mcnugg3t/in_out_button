@@ -125,10 +125,14 @@ public sealed class UsageStoreTests : IDisposable
         var store = NewStore();
         store.RecordOk(Reading(Reset.AddSeconds(-1), Meter(40.0, Reset)));                     // old window, a second before its reset
         store.RecordOk(Reading(Reset.AddHours(1), Meter(1.0, next)));
-        store.RecordOk(Reading(Reset.AddHours(2), Meter(2.0, next.AddMinutes(2))));            // reset jitter at the 2 min edge counts
-        store.RecordOk(Reading(Reset.AddHours(3), Meter(3.0, next.AddSeconds(-121))));         // 2 min 1 s off does not
+        store.RecordOk(Reading(Reset.AddHours(2), Meter(2.0, next.AddSeconds(1))));            // one second off is another window (G4)
+        store.RecordOk(Reading(Reset.AddHours(3), Meter(3.0, next)));                          // exact is this one
+        store.RecordOk(Reading(Reset.AddHours(4), Meter(4.0, next.AddMilliseconds(400))));     // rounds to the same second
 
-        Assert.Equal([new UsagePoint(Reset.AddHours(1), 1.0), new UsagePoint(Reset.AddHours(2), 2.0)], HistoryOf(store, next));
+        Assert.Equal(
+            [new UsagePoint(Reset.AddHours(1), 1.0), new UsagePoint(Reset.AddHours(3), 3.0), new UsagePoint(Reset.AddHours(4), 4.0)],
+            HistoryOf(store, next));
+        Assert.Equal([new UsagePoint(Reset.AddHours(2), 2.0)], HistoryOf(store, next.AddSeconds(1)));
         Assert.Equal([new UsagePoint(Reset.AddSeconds(-1), 40.0)], HistoryOf(store, Reset));
     }
 

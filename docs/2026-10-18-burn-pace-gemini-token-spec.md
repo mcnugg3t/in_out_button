@@ -276,8 +276,13 @@ driver does.
 
 ### 5.4 Bounds, cost, and side effects
 
-- Duration: two steps of at most 60 s each, so the ladder holds the
-  Anthropic read for at most 120 s; the other providers are not held.
+- Duration: the two steps are waited for at most 60 s and 90 s, so the
+  ladder holds the Anthropic read for at most 150 s. The other providers'
+  reads run in parallel and are not held, but the snapshot posts when all
+  three readers have finished, so their tiles wait with it; the page shows
+  the seeded or previous tiles with busy on meanwhile. The usual cost is
+  about 15 s (3 s for step 1, 12 s for step 2 when it is needed).
+  Posting per provider as each finishes is a known improvement.
 - Count: once per `expiresAt` value per app process when automatic. A
   token expires once per eight hours, so three automatic runs a day is the
   ceiling for an app that runs all day; a relaunch allows one more for the

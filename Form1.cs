@@ -69,7 +69,12 @@ public sealed class Form1 : Form
     {
         _settings = SettingsStore.Load();
         _roots.AddRange(_settings.SearchRoots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase));
-        _usage = new UsageService(AppendLog);
+        // read once at startup, before the service seeds from it. the log box doesn't exist yet,
+        // so its lines wait for Load; the service then re-points the store's log at its own queue
+        var storeLines = new List<string>();
+        var usageStore = new UsageStore(UsageStore.DefaultPath) { Log = storeLines.Add };
+        usageStore.Load();
+        _usage = new UsageService(usageStore, AppendLog);
 
         BuildUi();
         _usage.Updated += snapshot => _usageHost.Post(new { type = "snapshot", snapshot, busy = _usage.Busy });
@@ -84,6 +89,7 @@ public sealed class Form1 : Form
 
         Load += (_, _) =>
         {
+            storeLines.ForEach(AppendLog);
             _startupCheckBox.Checked = StartupManager.IsEnabled();
             _rootBinding.ResetBindings(false);
             UpdateRootsHeader();
@@ -1167,7 +1173,12 @@ public sealed class Form1 : Form
                 if (await _usageHost.EnsureAsync())
                 {
                     _usageShown = true;
-                    await ReadUsageAsync(fresh: false);
+                    // a scan or workflow is running: SetBusy(false) reads once the machine is quieter.
+                    // a read during the 2026-10-17 deploy scan hit both readers' caps
+                    if (!_busy)
+                    {
+                        await ReadUsageAsync(fresh: false);
+                    }
                 }
             }
             else if (_tabs.SelectedTab == _tasksPage)
@@ -1193,10 +1204,13 @@ public sealed class Form1 : Form
     // a minimized window hides the tab too
     private bool UsageVisible => _tabs.SelectedTab == _usagePage && WindowState != FormWindowState.Minimized;
 
-    // never throws; after form close it does nothing
-    private Task ReadUsageAsync(bool fresh) => _usageCts.IsCancellationRequested
+    // never throws; after form close it does nothing. forceClaudeRefresh only from the claude-refresh action
+    private Task ReadUsageAsync(bool fresh, bool forceClaudeRefresh = false) => _usageCts.IsCancellationRequested
         ? Task.CompletedTask
-        : _usage.RefreshAsync(fresh, _settings.CodexExecutable, _usageCts.Token);
+        : _usage.RefreshAsync(fresh, UsageOptionsFor(forceClaudeRefresh), _usageCts.Token);
+
+    private UsageOptions UsageOptionsFor(bool forceClaudeRefresh) => new(
+        _settings.CodexExecutable, _settings.ClaudeExecutable, _settings.AgyExecutable, _settings.ClaudeRefreshAuto, forceClaudeRefresh);
 
     private void OnUsageTimerTick()
     {
@@ -1222,7 +1236,7 @@ public sealed class Form1 : Form
                 _usageHost.Post(new { type = "snapshot", snapshot = _usage.Last, busy = _usage.Busy });
                 break;
             case "refresh":
-                // fresh skips the cache, never a cooldown
+                // fresh skips the cache and a soft cooldown, never a hard one
                 _ = ReadUsageAsync(fresh: true);
                 break;
             case "stale":
@@ -1232,7 +1246,17 @@ public sealed class Form1 : Form
                 }
                 break;
             case "action":
-                OpenUsageAction(message.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String ? id.GetString() : null);
+                var actionId = message.TryGetProperty("id", out var id) && id.ValueKind == JsonValueKind.String ? id.GetString() : null;
+                if (actionId == AnthropicUsage.RefreshAction.Id)
+                {
+                    // the ladder runs inside the anthropic read, so Busy covers it and its message is the one shown (spec 5.1)
+                    _ = ReadUsageAsync(fresh: true, forceClaudeRefresh: true);
+                }
+                else
+                {
+                    OpenUsageAction(actionId);
+                }
+
                 break;
             default:
                 _usageHost.NoteIgnored();
@@ -1709,6 +1733,9 @@ public sealed class AppSettings
 
     public int UsageRefreshMinutes { get; set; } = 5;       // timer read age while the usage tab shows
     public string? CodexExecutable { get; set; }            // override; discovered when null
+    public string? ClaudeExecutable { get; set; }           // override; discovered when null
+    public string? AgyExecutable { get; set; }              // override; discovered when null
+    public bool ClaudeRefreshAuto { get; set; } = true;     // run the refresh ladder without a click
     public string? TasksFile { get; set; }                  // override; derived when null
 }
 

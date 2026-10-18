@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -35,13 +36,30 @@ internal static class UsageState
 {
     public const string Ok = "ok";
     public const string Unavailable = "unavailable";
+    // the last ok reading's meters, shown because the live read failed (spec 3.1)
+    public const string Stale = "stale";
+}
+
+/// <summary>
+/// built from settings for each refresh. ForceClaudeRefresh is true only for the
+/// claude-refresh action
+/// </summary>
+public sealed record UsageOptions(string? CodexExecutable, string? ClaudeExecutable, string? AgyExecutable,
+                                  bool ClaudeRefreshAuto, bool ForceClaudeRefresh);
+
+// hard is a server's Retry-After and holds even a fresh read; soft is the app's own backoff, which fresh skips
+internal enum CooldownKind
+{
+    Soft,
+    Hard,
 }
 
 /// <summary>
 /// what a reader hands the service beyond the page's view: a cooldown to honour,
 /// a log-only note (lengths, never content), and the child pid for the driver tests
 /// </summary>
-internal sealed record ReaderOutcome(ProviderUsage Usage, TimeSpan? Cooldown = null, string? LogNote = null, int? ProcessId = null);
+internal sealed record ReaderOutcome(ProviderUsage Usage, TimeSpan? Cooldown = null, string? LogNote = null, int? ProcessId = null,
+                                     CooldownKind CooldownKind = CooldownKind.Soft);
 
 /// <summary>
 /// redacts secret-shaped text from anything that came from outside the app before it
@@ -128,6 +146,13 @@ public static partial class AnthropicUsage
     private const string NoLogin = "Claude Code credentials hold no login; sign in to Claude Code";
     private const string Expired = "Claude Code token expired; run any claude command to refresh it";
     private const string Rejected = "token rejected; run any claude command so Claude Code refreshes it";
+    private const string ClaudeNotFound = "Claude Code (claude) not found; set ClaudeExecutable";
+    private const string ClaudeCouldNotStart = "Claude Code (claude) could not be started";
+
+    internal static readonly ProviderAction RefreshAction = new("claude-refresh", "Refresh via Claude Code");
+
+    // one per process: the once-per-token guard and the 30 min floor live here
+    internal static readonly ClaudeRefreshLadder DefaultLadder = new(ClaudeCli.RunStepAsync);
 
     public static string CredentialsPath
     {
@@ -178,8 +203,10 @@ public static partial class AnthropicUsage
         }
     }
 
+    // no ladder: a bare read never starts claude
     public static async Task<ProviderUsage> ReadAsync(HttpClient http, CancellationToken ct)
-        => (await ReadOutcomeAsync(http, ct).ConfigureAwait(false)).Usage;
+        => (await ReadOutcomeAsync(http, new UsageOptions(null, null, null, ClaudeRefreshAuto: false, ForceClaudeRefresh: false), null, ct)
+            .ConfigureAwait(false)).Usage;
 
     // a redirect comes back as a 3xx and fails; no cookies; the 10 s timeout covers the body too
     internal static HttpClient CreateHttpClient()
@@ -189,18 +216,36 @@ public static partial class AnthropicUsage
             MaxResponseContentBufferSize = 1 << 20,
         };
 
-    internal static async Task<ReaderOutcome> ReadOutcomeAsync(HttpClient http, CancellationToken ct)
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(HttpClient http, UsageOptions options, Action<string>? log, CancellationToken ct)
+        => ReadOutcomeAsync(http, CredentialsPath, DefaultLadder, options, log, ct);
+
+    /// <summary>
+    /// an expired or rejected token runs the refresh ladder inside this read (spec 5.1), so the
+    /// message shown is the ladder's. tests pass their own credentials path and ladder
+    /// </summary>
+    internal static async Task<ReaderOutcome> ReadOutcomeAsync(HttpClient http, string credentialsPath, ClaudeRefreshLadder ladder,
+                                                               UsageOptions options, Action<string>? log, CancellationToken ct)
     {
         // re-read every call: Claude Code rotates the token under us
-        var login = ReadLogin(out var failure);
+        var login = ReadLogin(credentialsPath, out var failure);
         if (login is null)
         {
             return Fail(null, failure!);
         }
 
+        // one ladder per read, so a replaced token that is then rejected can't loop
+        var ladderRan = false;
         if (login.ExpiresAtMs is { } expiresAt && expiresAt <= DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())
         {
-            return Fail(login.Plan, Expired);
+            ladderRan = true;
+            var (replaced, refused) = await RunLadderAsync(ladder, login, credentialsPath, rejected: false, options, log, ct).ConfigureAwait(false);
+            if (replaced is null)
+            {
+                return refused!;
+            }
+
+            // a new token is a reason to try, not proof - the usage request decides (spec 5.4)
+            login = replaced;
         }
 
         var retriedTransient = false;
@@ -237,14 +282,15 @@ public static partial class AnthropicUsage
                 var status = (int)response.StatusCode;
                 var now = DateTimeOffset.UtcNow;
 
-                // never retried; fresh doesn't skip the wait either
+                // never retried; a hard cooldown, so fresh doesn't skip the wait either
                 if (status == 429)
                 {
                     var seconds = RetryAfterSeconds(response.Headers.RetryAfter, now);
                     return new ReaderOutcome(
                         ProviderUsage.Unavailable(Provider, login.Plan, $"rate limited by the usage endpoint; next try in {seconds} s", now),
                         TimeSpan.FromSeconds(seconds),
-                        "HTTP 429");
+                        "HTTP 429",
+                        CooldownKind: CooldownKind.Hard);
                 }
 
                 if (status >= 500)
@@ -268,7 +314,7 @@ public static partial class AnthropicUsage
                     if (!rereadAfterReject)
                     {
                         rereadAfterReject = true;
-                        var again = ReadLogin(out _);
+                        var again = ReadLogin(credentialsPath, out _);
                         if (again is not null && again.Token != login.Token)
                         {
                             login = again;
@@ -276,7 +322,20 @@ public static partial class AnthropicUsage
                         }
                     }
 
-                    return Fail(login.Plan, Rejected);
+                    if (!ladderRan)
+                    {
+                        ladderRan = true;
+                        var (replaced, refused) = await RunLadderAsync(ladder, login, credentialsPath, rejected: true, options, log, ct).ConfigureAwait(false);
+                        if (replaced is null)
+                        {
+                            return refused!;
+                        }
+
+                        login = replaced;
+                        continue;
+                    }
+
+                    return Refreshable(login.Plan, Rejected);
                 }
 
                 if (!response.IsSuccessStatusCode)
@@ -315,6 +374,78 @@ public static partial class AnthropicUsage
     private static ReaderOutcome Fail(string? plan, string message)
         => new(ProviderUsage.Unavailable(Provider, plan, message, DateTimeOffset.UtcNow));
 
+    // expired and rejected outcomes carry the button that runs the ladder by hand (spec 3.3)
+    private static ReaderOutcome Refreshable(string? plan, string message)
+        => new(new ProviderUsage(Provider, plan, UsageState.Unavailable, message, null, [], null, [RefreshAction], DateTimeOffset.UtcNow));
+
+    /// <summary>
+    /// the refresh ladder (spec 5.2): asks Claude Code to refresh its own login a step at a time and
+    /// stops once the token string changes. the new login, or the outcome to report
+    /// </summary>
+    private static async Task<(ClaudeLogin? Replaced, ReaderOutcome? Refused)> RunLadderAsync(
+        ClaudeRefreshLadder ladder, ClaudeLogin trigger, string credentialsPath, bool rejected, UsageOptions options,
+        Action<string>? log, CancellationToken ct)
+    {
+        var word = rejected ? "rejected" : "expired";
+        await ladder.Flight.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            // a run that finished while this one waited may have replaced it already
+            if (ReadLogin(credentialsPath, out _) is { } current && current.Token != trigger.Token)
+            {
+                return (current, null);
+            }
+
+            // keyed on the token string, not expiresAt, which can be absent (spec 5.1, G2)
+            var ranForToken = ladder.HasRunFor(trigger.Token);
+            if (!options.ForceClaudeRefresh && (!options.ClaudeRefreshAuto || ranForToken))
+            {
+                return (null, Refreshable(trigger.Plan, ranForToken ? NotReplaced(word) : rejected ? Rejected : Expired));
+            }
+
+            // a forced click inside the floor still gets this live read, just no ladder
+            var now = ladder.Now();
+            if (ladder.LastRun is { } last && now - last < ClaudeRefreshLadder.Floor)
+            {
+                var minutes = Math.Max(1, (int)(now - last).TotalMinutes);
+                return (null, Refreshable(trigger.Plan, $"Claude Code token {word}; refresh ladder ran {minutes} min ago; try again later"));
+            }
+
+            foreach (var step in ClaudeCli.Steps)
+            {
+                var result = await ladder.RunStep(step, options.ClaudeExecutable, ct).ConfigureAwait(false);
+                if (result.Status is StepStatus.NotFound or StepStatus.CouldNotStart)
+                {
+                    return (null, Refreshable(trigger.Plan, result.Status == StepStatus.NotFound ? ClaudeNotFound : ClaudeCouldNotStart));
+                }
+
+                // counted once a step has started, so a missing claude spends no run
+                ladder.MarkRun(trigger.Token, now);
+                log?.Invoke(ClaudeCli.Describe(step, result));
+
+                // the token string is the test: a 401 with a future expiresAt is only cured by a new token
+                if (ReadLogin(credentialsPath, out _) is { } after && after.Token != trigger.Token)
+                {
+                    log?.Invoke($"token refresh: {ClaudeCli.Name(step)} replaced the token (expiresAt {DescribeExpiry(after.ExpiresAtMs)})");
+                    return (after, null);
+                }
+            }
+
+            return (null, Refreshable(trigger.Plan, NotReplaced(word)));
+        }
+        finally
+        {
+            ladder.Flight.Release();
+        }
+    }
+
+    private static string NotReplaced(string word) => $"Claude Code token {word}; the refresh ladder did not replace it";
+
+    private static string DescribeExpiry(double? ms)
+        => ms is { } value && value is >= 0 and <= 253_402_300_799_999
+            ? DateTimeOffset.FromUnixTimeMilliseconds((long)value).ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)
+            : "none";
+
     // a class, not a record: a record's ToString would print the token
     private sealed class ClaudeLogin
     {
@@ -324,14 +455,14 @@ public static partial class AnthropicUsage
     }
 
     // read only, never written; nothing from the file reaches a message
-    private static ClaudeLogin? ReadLogin(out string? failure)
+    private static ClaudeLogin? ReadLogin(string credentialsPath, out string? failure)
     {
         failure = null;
         string text;
         try
         {
             // ReadAllText drops a utf-8 bom
-            text = File.ReadAllText(CredentialsPath, Encoding.UTF8);
+            text = File.ReadAllText(credentialsPath, Encoding.UTF8);
         }
         catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
         {
@@ -496,6 +627,265 @@ public static partial class AnthropicUsage
 
     [GeneratedRegex(@"\s+")]
     private static partial Regex Whitespace();
+}
+
+internal enum ClaudeStep
+{
+    AuthStatus,
+    Prompt,
+}
+
+internal enum StepStatus
+{
+    Exited,
+    StillRunning,
+    NotFound,
+    CouldNotStart,
+}
+
+// lengths only: a step's output is never kept or shown
+internal sealed record StepResult(StepStatus Status, int? ExitCode = null, TimeSpan Duration = default, int StdoutChars = 0, int StderrChars = 0);
+
+internal delegate Task<StepResult> ClaudeStepRunner(ClaudeStep step, string? executableOverride, CancellationToken ct);
+
+/// <summary>
+/// the refresh ladder's state for one process: the tokens it has run for, when it last ran, and
+/// its single flight. tests build their own with fake steps and a clock
+/// </summary>
+internal sealed class ClaudeRefreshLadder(ClaudeStepRunner runStep, Func<DateTimeOffset>? clock = null)
+{
+    // bounds repeated clicks and how many abandoned steps can exist (spec 5.1, 5.2)
+    internal static readonly TimeSpan Floor = TimeSpan.FromMinutes(30);
+
+    // sha-256 of each token, so the set never holds a usable one
+    private readonly HashSet<string> _ranFor = new(StringComparer.Ordinal);
+
+    public ClaudeStepRunner RunStep { get; } = runStep;
+
+    // held for a whole run; LastRun and the token set are touched only under it
+    public SemaphoreSlim Flight { get; } = new(1, 1);
+
+    public DateTimeOffset? LastRun { get; private set; }
+
+    public DateTimeOffset Now() => clock?.Invoke() ?? DateTimeOffset.UtcNow;
+
+    public bool HasRunFor(string token) => _ranFor.Contains(Hash(token));
+
+    public void MarkRun(string token, DateTimeOffset at)
+    {
+        _ranFor.Add(Hash(token));
+        LastRun = at;
+    }
+
+    private static string Hash(string token) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+}
+
+/// <summary>
+/// one ladder step, waited on for a bounded time and never killed: killing Claude Code between taking
+/// a rotated refresh token and saving it could strand the login (spec 5.2, G6). no job object, whose close kills too
+/// </summary>
+internal static class ClaudeCli
+{
+    internal static readonly ClaudeStep[] Steps = [ClaudeStep.AuthStatus, ClaudeStep.Prompt];
+    private static readonly TimeSpan DrainWait = TimeSpan.FromSeconds(5);
+
+    // the where.exe find, kept for the session. a miss isn't kept, so a later install is picked up
+    private static string? _discovered;
+
+    public static string Name(ClaudeStep step) => step == ClaudeStep.AuthStatus ? "claude auth status" : "claude -p";
+
+    internal static TimeSpan Deadline(ClaudeStep step) => TimeSpan.FromSeconds(step == ClaudeStep.AuthStatus ? 60 : 90);
+
+    // --setting-sources "" loads no settings so no hook runs; --strict-mcp-config without --mcp-config
+    // starts no mcp server. never --bare: it skips the oauth login this is here to refresh.
+    // measured 2026-10-18: 11.8 s, one haiku turn, about 1,000 input tokens
+    internal static IReadOnlyList<string> Arguments(ClaudeStep step) => step == ClaudeStep.AuthStatus
+        ? ["auth", "status"]
+        : ["-p", "Reply with the single word OK.", "--model", "haiku", "--max-turns", "1", "--tools", "",
+           "--strict-mcp-config", "--no-session-persistence", "--setting-sources", "", "--output-format", "json",
+           "--system-prompt", "You reply with one word."];
+
+    public static string Describe(ClaudeStep step, StepResult result)
+    {
+        var how = result.Status == StepStatus.StillRunning
+            ? $"step still running after {Deadline(step).TotalSeconds:0} s, left to finish"
+            : $"exit {result.ExitCode}";
+        return string.Create(CultureInfo.InvariantCulture,
+            $"token refresh: {Name(step)} {how}, {result.Duration.TotalSeconds:0.0} s, stdout {result.StdoutChars} chars, stderr {result.StderrChars} chars");
+    }
+
+    /// <summary>
+    /// the override when it resolves, else where.exe's first hit that does. cancelling ct abandons the wait
+    /// </summary>
+    public static async Task<string?> FindAsync(string? overridePath, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath) && Resolve(overridePath) is { } chosen)
+        {
+            return chosen;
+        }
+
+        if (Volatile.Read(ref _discovered) is { } known)
+        {
+            return known;
+        }
+
+        ct.ThrowIfCancellationRequested();
+        var (exitCode, output) = await ProcessRunner.CaptureAsync("where.exe", AppContext.BaseDirectory, 10, "claude").WaitAsync(ct).ConfigureAwait(false);
+        var found = exitCode == 0
+            ? ProcessRunner.SplitLines(output).Where(line => Path.IsPathRooted(line) && File.Exists(line)).Select(Resolve).FirstOrDefault(exe => exe is not null)
+            : null;
+        if (found is not null)
+        {
+            Volatile.Write(ref _discovered, found);
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// an exe as is; an npm shim (claude, claude.cmd) to the native exe it runs, which
+    /// UseShellExecute = false can start; else null, so no cmd.exe is ever involved (spec 5.3)
+    /// </summary>
+    internal static string? Resolve(string hit)
+    {
+        if (hit.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return hit;
+        }
+
+        var native = Path.Combine(Path.GetDirectoryName(hit) ?? "", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
+        return File.Exists(native) ? native : null;
+    }
+
+    public static async Task<StepResult> RunStepAsync(ClaudeStep step, string? overridePath, CancellationToken ct)
+    {
+        var exe = await FindAsync(overridePath, ct).ConfigureAwait(false);
+        if (exe is null)
+        {
+            return new StepResult(StepStatus.NotFound);
+        }
+
+        // the settings folder: no project CLAUDE.md, no git repo
+        Directory.CreateDirectory(SettingsStore.SettingsDirectory);
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = exe,
+                WorkingDirectory = SettingsStore.SettingsDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            },
+        };
+
+        foreach (var argument in Arguments(step))
+        {
+            process.StartInfo.ArgumentList.Add(argument);
+        }
+
+        var clock = Stopwatch.StartNew();
+        try
+        {
+            process.Start();
+        }
+        catch (Win32Exception)
+        {
+            process.Dispose();
+            // a cached find that no longer starts is found again next time
+            Interlocked.CompareExchange(ref _discovered, null, exe);
+            return new StepResult(StepStatus.CouldNotStart);
+        }
+
+        // claude -p appends piped stdin to the prompt and would wait for its end
+        try
+        {
+            process.StandardInput.Close();
+        }
+        catch (IOException)
+        {
+            // already gone
+        }
+
+        var stdout = new CharCounter(process.StandardOutput);
+        var stderr = new CharCounter(process.StandardError);
+        var exited = process.WaitForExitAsync(CancellationToken.None);
+        if (await Task.WhenAny(exited, Task.Delay(Deadline(step), ct)).ConfigureAwait(false) != exited)
+        {
+            // left to finish: the drains keep its pipes from filling, and the Process goes once it exits
+            _ = DisposeOnExitAsync(process, exited, stdout.Done, stderr.Done);
+            ct.ThrowIfCancellationRequested();
+            return new StepResult(StepStatus.StillRunning, null, clock.Elapsed, stdout.Chars, stderr.Chars);
+        }
+
+        var exitCode = process.ExitCode;
+        try
+        {
+            // a grandchild holding a pipe open mustn't hold the ladder
+            await Task.WhenAll(stdout.Done, stderr.Done).WaitAsync(DrainWait, ct).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // lengths so far
+        }
+        finally
+        {
+            process.Dispose();
+        }
+
+        return new StepResult(StepStatus.Exited, exitCode, clock.Elapsed, stdout.Chars, stderr.Chars);
+    }
+
+    private static async Task DisposeOnExitAsync(Process process, Task exited, Task stdout, Task stderr)
+    {
+        try
+        {
+            await exited.ConfigureAwait(false);
+            await Task.WhenAll(stdout, stderr).WaitAsync(DrainWait).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            // a pipe still open; Dispose closes our end
+        }
+        finally
+        {
+            process.Dispose();
+        }
+    }
+
+    // counts and discards, so nothing a step prints is ever kept
+    private sealed class CharCounter
+    {
+        private int _chars;
+
+        public CharCounter(StreamReader reader)
+        {
+            Done = DrainAsync(reader);
+        }
+
+        public Task Done { get; }
+
+        public int Chars => Volatile.Read(ref _chars);
+
+        private async Task DrainAsync(StreamReader reader)
+        {
+            var buffer = new char[4096];
+            try
+            {
+                int count;
+                while ((count = await reader.ReadAsync(buffer.AsMemory()).ConfigureAwait(false)) > 0)
+                {
+                    Interlocked.Add(ref _chars, count);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+            {
+                // pipe closed by Dispose
+            }
+        }
+    }
 }
 
 public sealed record CodexLaunch(string FileName, IReadOnlyList<string> LeadingArgs);
@@ -670,17 +1060,18 @@ public static class CodexUsage
     public static async Task<ProviderUsage> ReadAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct)
         => (await ReadOutcomeAsync(launch, cap, ct).ConfigureAwait(false)).Usage;
 
-    internal static Task<ReaderOutcome> ReadOutcomeAsync(string? overridePath, CancellationToken ct)
-        => ReadCoreAsync(overridePath, null, DefaultCap, ct);
+    // log takes the child-job failure line; the service passes its queue
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(string? overridePath, CancellationToken ct, Action<string>? log = null)
+        => ReadCoreAsync(overridePath, null, DefaultCap, log, ct);
 
-    internal static Task<ReaderOutcome> ReadOutcomeAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct)
-        => ReadCoreAsync(null, launch, cap, ct);
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct, Action<string>? log = null)
+        => ReadCoreAsync(null, launch, cap, log, ct);
 
     /// <summary>
     /// one cap covers discovery (when launch is null) and every read and write; every exit path
     /// ends in the same finally, which kills the tree. cancelling ct throws; the cap returns "timed out"
     /// </summary>
-    private static async Task<ReaderOutcome> ReadCoreAsync(string? overridePath, CodexLaunch? launch, TimeSpan cap, CancellationToken ct)
+    private static async Task<ReaderOutcome> ReadCoreAsync(string? overridePath, CodexLaunch? launch, TimeSpan cap, Action<string>? log, CancellationToken ct)
     {
         using var capSource = CancellationTokenSource.CreateLinkedTokenSource(ct);
         capSource.CancelAfter(cap);
@@ -716,7 +1107,7 @@ public static class CodexUsage
             }
 
             token.ThrowIfCancellationRequested();
-            process = JsonLineProcess.Start(launch.FileName, [.. launch.LeadingArgs, "app-server"]);
+            process = JsonLineProcess.Start(launch.FileName, [.. launch.LeadingArgs, "app-server"], log);
             await process.WriteLineAsync(InitializeRequest, token).ConfigureAwait(false);
             var init = await process.ReadReplyAsync(1, token).ConfigureAwait(false);
             if (init is null)
@@ -805,8 +1196,8 @@ public static class CodexUsage
 }
 
 /// <summary>
-/// json-rpc lines over a child's stdio: stderr kept to 8 KB, stdout to 256 lines or 1 MB.
-/// sync pipes ignore cancellation, so a cancelled wait abandons the read and Dispose's kill ends it
+/// json-rpc lines, or one whole reply, over a child's stdio: stderr kept to 8 KB, stdout to 256 lines
+/// or 1 MB. sync pipes ignore cancellation, so a cancelled wait abandons the read and Dispose's kill ends it
 /// </summary>
 internal sealed class JsonLineProcess : IDisposable
 {
@@ -815,7 +1206,11 @@ internal sealed class JsonLineProcess : IDisposable
     private const int StderrCap = 8 * 1024;
     private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
 
+    private static int _assignFailureLogged;
+
     private readonly Process _process;
+    private readonly ChildJob? _job;
+    private readonly Task _stderrDrain;
     private readonly StringBuilder _stderr = new();
     private readonly StringBuilder _pending = new();
     private readonly char[] _chunk = new char[4096];
@@ -825,11 +1220,12 @@ internal sealed class JsonLineProcess : IDisposable
     private int _chars;
     private bool _eof;
 
-    private JsonLineProcess(Process process)
+    private JsonLineProcess(Process process, ChildJob? job)
     {
         _process = process;
+        _job = job;
         Id = process.Id;
-        _ = DrainStderrAsync();
+        _stderrDrain = DrainStderrAsync();
     }
 
     public int Id { get; }
@@ -839,7 +1235,13 @@ internal sealed class JsonLineProcess : IDisposable
 
     public int SkippedLines { get; private set; }
 
-    public static JsonLineProcess Start(string fileName, IEnumerable<string> arguments)
+    public int ExitCode => _process.ExitCode;
+
+    /// <summary>
+    /// the child runs in a kill-on-close job, so Dispose also ends a grandchild whose parent has
+    /// exited (spec 6.1). when windows refuses the job it runs without one, as before
+    /// </summary>
+    public static JsonLineProcess Start(string fileName, IEnumerable<string> arguments, Action<string>? log = null)
     {
         var process = new Process
         {
@@ -873,7 +1275,20 @@ internal sealed class JsonLineProcess : IDisposable
             throw;
         }
 
-        return new JsonLineProcess(process);
+        // right after Start: only what the child starts from here on lands in the job
+        var job = ChildJob.TryCreate(log);
+        if (job is not null && !job.TryAssign(process))
+        {
+            if (log is not null && Interlocked.Exchange(ref _assignFailureLogged, 1) == 0)
+            {
+                log($"child job: could not assign {Path.GetFileName(fileName)} (win32 error {job.LastError}); it runs without a job");
+            }
+
+            job.Dispose();
+            job = null;
+        }
+
+        return new JsonLineProcess(process, job);
     }
 
     public async Task WriteLineAsync(string json, CancellationToken ct)
@@ -907,7 +1322,60 @@ internal sealed class JsonLineProcess : IDisposable
         return null;
     }
 
-    public async Task CloseInputAndWaitAsync(TimeSpan wait, CancellationToken ct)
+    /// <summary>
+    /// all of stdout as text, for a child that answers once and exits. InvalidDataException past 1 MB
+    /// </summary>
+    public async Task<string> ReadAllAsync(CancellationToken ct)
+    {
+        var text = new StringBuilder();
+        while (true)
+        {
+            var read = _process.StandardOutput.ReadAsync(_chunk.AsMemory(), CancellationToken.None).AsTask();
+            int count;
+            try
+            {
+                count = await read.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                Observe(read);
+                throw;
+            }
+
+            if (count == 0)
+            {
+                return text.ToString();
+            }
+
+            _chars += count;
+            if (_chars > MaxChars)
+            {
+                throw new InvalidDataException("stdout over 1 MB");
+            }
+
+            text.Append(_chunk, 0, count);
+        }
+    }
+
+    /// <summary>
+    /// the child's exit and the end of its stderr, so StderrContains has seen all it will
+    /// </summary>
+    public async Task WaitForExitAsync(CancellationToken ct)
+    {
+        await _process.WaitForExitAsync(ct).ConfigureAwait(false);
+        await _stderrDrain.WaitAsync(ct).ConfigureAwait(false);
+    }
+
+    // a fixed marker against the kept 8 KB; the text itself never leaves this class
+    public bool StderrContains(string marker)
+    {
+        lock (_stderr)
+        {
+            return _stderr.ToString().Contains(marker, StringComparison.Ordinal);
+        }
+    }
+
+    public void CloseInput()
     {
         try
         {
@@ -917,6 +1385,11 @@ internal sealed class JsonLineProcess : IDisposable
         {
             // already gone
         }
+    }
+
+    public async Task CloseInputAndWaitAsync(TimeSpan wait, CancellationToken ct)
+    {
+        CloseInput();
 
         try
         {
@@ -944,6 +1417,8 @@ internal sealed class JsonLineProcess : IDisposable
         }
 
         _process.Dispose();
+        // closing the job kills whatever the child left running
+        _job?.Dispose();
     }
 
     private async Task WriteCoreAsync(string json)
@@ -1049,10 +1524,13 @@ internal sealed class JsonLineProcess : IDisposable
             while ((count = await _process.StandardError.ReadAsync(buffer.AsMemory()).ConfigureAwait(false)) > 0)
             {
                 Interlocked.Add(ref _stderrChars, count);
-                var room = StderrCap - _stderr.Length;
-                if (room > 0)
+                lock (_stderr)
                 {
-                    _stderr.Append(buffer, 0, Math.Min(room, count));
+                    var room = StderrCap - _stderr.Length;
+                    if (room > 0)
+                    {
+                        _stderr.Append(buffer, 0, Math.Min(room, count));
+                    }
                 }
             }
         }
@@ -1068,27 +1546,316 @@ internal sealed class JsonLineProcess : IDisposable
             TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 }
 
+public sealed record AgyLaunch(string FileName, IReadOnlyList<string> LeadingArgs);
+
+/// <summary>
+/// Google meters from the Antigravity CLI's `agy -p /usage` report (spec 6). only the cli talks to
+/// Google; the app never sees agy's token
+/// </summary>
 public static class GeminiUsage
 {
     internal const string Provider = "Google";
+    internal static readonly TimeSpan DefaultCap = TimeSpan.FromSeconds(25);
+    private static readonly TimeSpan ShortBackoff = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan LongBackoff = TimeSpan.FromMinutes(60);
+    private const string Plan = "Antigravity CLI";
 
-    // the Gemini CLI stopped serving AI Pro on 2026-06-18; parsing `agy -p /usage` is a follow-up
-    public static ProviderUsage Read()
+    private const string NotFound = "No local source on this machine.";
+    private const string NotInstalled = "The Gemini CLI stopped serving AI Pro on 2026-06-18. The Antigravity CLI (agy) is not installed.";
+    private const string CouldNotStart = "Antigravity CLI (agy) could not be started";
+    private const string PrintTimedOut = "Antigravity CLI timed out after 20 s";
+    private const string DidNotReport = "Antigravity CLI did not report usage; run agy in a terminal to check its sign-in";
+    private const string ShapeChanged = "usage report changed shape (no buckets)";
+
+    // agy's own --print-timeout exits 0 with status SUCCESS and no command.data, and writes
+    // "[agy] print timeout after 20s ..." to stderr (2026-10-18). the only thing ever matched in stderr
+    private const string PrintTimeoutMarker = "print timeout";
+
+    // the where.exe find, kept for the session. a miss isn't kept, so a later install is picked up
+    private static AgyLaunch? _discovered;
+    private static int _failures;
+
+    // overwritten on every run; holds the account email and trace ids, no token. never read back
+    internal static string LogPath { get; } = Path.Combine(SettingsStore.SettingsDirectory, "agy-usage.log");
+
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(string? overridePath, CancellationToken ct)
+        => ReadCoreAsync(overridePath, null, DefaultCap, null, ct);
+
+    // log takes skipped buckets and the child-job failure line; the service passes its queue
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(string? overridePath, Action<string>? log, CancellationToken ct)
+        => ReadCoreAsync(overridePath, null, DefaultCap, log, ct);
+
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(AgyLaunch launch, TimeSpan cap, CancellationToken ct, Action<string>? log = null)
+        => ReadCoreAsync(null, launch, cap, log, ct);
+
+    /// <summary>
+    /// override first, checked on every call, then where.exe's first exe. cancelling ct abandons the wait
+    /// </summary>
+    public static async Task<AgyLaunch?> FindAsync(string? overridePath, CancellationToken ct)
     {
-        var detail = AgyOnPath()
-            ? "Antigravity CLI found; reading its usage report is not implemented yet."
-            : "The Gemini CLI stopped serving AI Pro on 2026-06-18. The Antigravity CLI (agy) is not installed.";
-        ProviderAction[] actions = [new("gemini-usage", "Open usage page"), new("antigravity-setup", "Set up Antigravity")];
-        return new ProviderUsage(Provider, null, UsageState.Unavailable, "No local source on this machine.", detail, [], null, actions, DateTimeOffset.UtcNow);
+        if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath))
+        {
+            return new AgyLaunch(overridePath, []);
+        }
+
+        if (Volatile.Read(ref _discovered) is { } known)
+        {
+            return known;
+        }
+
+        ct.ThrowIfCancellationRequested();
+        var (exitCode, output) = await ProcessRunner.CaptureAsync("where.exe", AppContext.BaseDirectory, 10, "agy").WaitAsync(ct).ConfigureAwait(false);
+        // an exe only: anything else would need cmd.exe
+        var hit = exitCode == 0
+            ? ProcessRunner.SplitLines(output).FirstOrDefault(line => Path.IsPathRooted(line) && line.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && File.Exists(line))
+            : null;
+        var found = hit is null ? null : new AgyLaunch(hit, []);
+        if (found is not null)
+        {
+            Volatile.Write(ref _discovered, found);
+        }
+
+        return found;
     }
 
-    private static bool AgyOnPath()
+    // 10 min, then 60 from the third failure in a row (spec 6.1)
+    internal static TimeSpan Backoff(int consecutiveFailures) => consecutiveFailures >= 3 ? LongBackoff : ShortBackoff;
+
+    /// <summary>
+    /// one run's stdout and exit code to a usage, before the stderr marker is considered. detail is
+    /// the scrubbed first 200 chars of stdout when it isn't json, else of response
+    /// </summary>
+    internal static ProviderUsage Interpret(string stdout, int exitCode, DateTimeOffset now, Action<string>? log = null)
     {
-        var extensions = (Environment.GetEnvironmentVariable("PATHEXT") ?? ".EXE;.CMD;.BAT").Split(';', StringSplitOptions.RemoveEmptyEntries);
-        var dirs = (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return dirs.Any(dir => extensions.Any(ext => File.Exists(Path.Combine(dir.Trim('"'), "agy" + ext))));
+        JsonDocument? doc = null;
+        try
+        {
+            doc = JsonDocument.Parse(stdout);
+        }
+        catch (JsonException)
+        {
+            // not json
+        }
+
+        using (doc)
+        {
+            if (doc is null || doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return Failure(DidNotReport, Clip(stdout), now);
+            }
+
+            if (exitCode != 0 || JsonRead.String(doc.RootElement, "status") != "SUCCESS")
+            {
+                return Failure(DidNotReport, Clip(JsonRead.String(doc.RootElement, "response")), now);
+            }
+        }
+
+        return Parse(stdout, now, log);
+    }
+
+    /// <summary>
+    /// the whole envelope in; each command.data.groups[].buckets[] entry becomes a meter (spec 6.2).
+    /// response text is never read. any exception is the shape-change failure, never a crash
+    /// </summary>
+    internal static ProviderUsage Parse(string replyJson, DateTimeOffset now, Action<string>? log = null)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(replyJson);
+            var meters = new List<UsageMeter>();
+            if (JsonRead.Object(doc.RootElement, "command", out var command)
+                && JsonRead.Object(command, "data", out var data)
+                && data.TryGetProperty("groups", out var groups) && groups.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var group in groups.EnumerateArray())
+                {
+                    if (group.ValueKind != JsonValueKind.Object
+                        || !group.TryGetProperty("buckets", out var buckets) || buckets.ValueKind != JsonValueKind.Array)
+                    {
+                        continue;
+                    }
+
+                    var groupName = JsonRead.String(group, "name");
+                    foreach (var bucket in buckets.EnumerateArray())
+                    {
+                        if (Meter(bucket, groupName, meters, log) is { } meter)
+                        {
+                            meters.Add(meter);
+                        }
+                    }
+                }
+            }
+
+            return meters.Count == 0
+                ? Failure(ShapeChanged, null, now)
+                : new ProviderUsage(Provider, Plan, UsageState.Ok, null, null, meters, null, [], now);
+        }
+        catch (Exception)
+        {
+            return Failure(ShapeChanged, null, now);
+        }
+    }
+
+    // null skips the bucket with one log line; ids, the window identity, are kept verbatim
+    private static UsageMeter? Meter(JsonElement bucket, string? groupName, List<UsageMeter> kept, Action<string>? log)
+    {
+        var id = JsonRead.String(bucket, "id");
+        if (string.IsNullOrEmpty(id))
+        {
+            log?.Invoke("usage: Google skipped a bucket with no id");
+            return null;
+        }
+
+        void Skip(string why) => log?.Invoke($"usage: Google skipped bucket {Scrub.Message(id)}: {why}");
+
+        if (kept.Any(meter => meter.Key == id))
+        {
+            Skip("repeated id, the first kept");
+            return null;
+        }
+
+        var window = JsonRead.String(bucket, "window");
+        int? minutes = window switch
+        {
+            "weekly" => 10080,
+            "5h" => 300,
+            _ => null,
+        };
+        if (minutes is null)
+        {
+            Skip($"window {Scrub.Message(window ?? "missing")} unknown");
+            return null;
+        }
+
+        if (JsonRead.Number(bucket, "remaining_fraction") is not { } remaining)
+        {
+            Skip("remaining_fraction missing or not a number");
+            return null;
+        }
+
+        if (!DateTimeOffset.TryParse(JsonRead.String(bucket, "reset_time"), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var resetsAt))
+        {
+            Skip("reset_time unreadable");
+            return null;
+        }
+
+        var used = Math.Clamp(Math.Round((1 - remaining) * 100, 1, MidpointRounding.AwayFromZero), 0, 100);
+        // to the second, so the store's window identity can't split on a fraction
+        var reset = DateTimeOffset.FromUnixTimeSeconds((long)Math.Round(resetsAt.ToUnixTimeMilliseconds() / 1000.0, MidpointRounding.AwayFromZero));
+        return new UsageMeter(id, Scrub.Message(groupName ?? id), minutes.Value, used, reset, CodexUsage.Severity(used, reached: false), null);
+    }
+
+    /// <summary>
+    /// one cap covers discovery (when launch is null), the run, and its exit; every exit path ends in
+    /// the same finally, whose Dispose closes the job. cancelling ct throws; the cap returns "timed out"
+    /// </summary>
+    private static async Task<ReaderOutcome> ReadCoreAsync(string? overridePath, AgyLaunch? launch, TimeSpan cap, Action<string>? log, CancellationToken ct)
+    {
+        using var capSource = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        capSource.CancelAfter(cap);
+        var token = capSource.Token;
+        JsonLineProcess? process = null;
+        string? stdout = null;
+
+        // every failure here backs off, parse failures included (spec 6.2)
+        ReaderOutcome Failed(string message, string? detail = null) => new(
+            Failure(message, detail, DateTimeOffset.UtcNow),
+            Backoff(Interlocked.Increment(ref _failures)),
+            process is null ? null : $"stdout {stdout?.Length ?? 0} chars, stderr {process.StderrChars} chars",
+            process?.Id);
+
+        string TimedOut() => $"Antigravity CLI timed out after {cap.TotalSeconds:0} s";
+
+        try
+        {
+            if (launch is null)
+            {
+                try
+                {
+                    launch = await FindAsync(overridePath, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    return Failed(TimedOut());
+                }
+
+                if (launch is null)
+                {
+                    return NotFoundOutcome();
+                }
+            }
+
+            token.ThrowIfCancellationRequested();
+            Directory.CreateDirectory(SettingsStore.SettingsDirectory);
+            // never --disable-slash-commands: /usage would go to the model as a prompt and spend five calls
+            process = JsonLineProcess.Start(launch.FileName,
+                [.. launch.LeadingArgs, "-p", "/usage", "--output-format", "json", "--print-timeout", "20s", "--log-file", LogPath], log);
+            process.CloseInput();
+            stdout = await process.ReadAllAsync(token).ConfigureAwait(false);
+            await process.WaitForExitAsync(token).ConfigureAwait(false);
+
+            var usage = Interpret(stdout, process.ExitCode, DateTimeOffset.UtcNow, log);
+            if (usage.State == UsageState.Ok)
+            {
+                Interlocked.Exchange(ref _failures, 0);
+                return new ReaderOutcome(usage, ProcessId: process.Id);
+            }
+
+            // agy's print timeout otherwise reads as a shape change (G3)
+            return process.StderrContains(PrintTimeoutMarker) ? Failed(PrintTimedOut) : Failed(usage.Message!, usage.Detail);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return Failed(TimedOut());
+        }
+        catch (InvalidDataException)
+        {
+            // over 1 MB is not one json object either
+            return Failed(DidNotReport);
+        }
+        catch (Win32Exception ex)
+        {
+            // a cached find that no longer starts is found again next read
+            Interlocked.CompareExchange(ref _discovered, null, launch);
+            // file or folder not found: agy isn't there, which is the empty state, not a failure
+            return ex.NativeErrorCode is 2 or 3 ? NotFoundOutcome() : Failed(CouldNotStart);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return Failed(Scrub.Message($"Antigravity read failed: {ex.Message}"));
+        }
+        finally
+        {
+            process?.Dispose();
+        }
+    }
+
+    private static ReaderOutcome NotFoundOutcome()
+    {
+        ProviderAction[] actions = [new("gemini-usage", "Open usage page"), new("antigravity-setup", "Set up Antigravity")];
+        return new ReaderOutcome(new ProviderUsage(Provider, null, UsageState.Unavailable, NotFound, NotInstalled, [], null, actions, DateTimeOffset.UtcNow));
+    }
+
+    private static ProviderUsage Failure(string message, string? detail, DateTimeOffset now)
+        => new(Provider, null, UsageState.Unavailable, message, detail, [], null, [], now);
+
+    // the first 200 chars, scrubbed; null when nothing is left
+    private static string? Clip(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        var clean = Scrub.Message(text.Length > 200 ? text[..200] : text);
+        return clean.Length == 0 ? null : clean;
     }
 }
+
+internal delegate Task<ReaderOutcome> UsageReader(UsageOptions options, Action<string> log, CancellationToken ct);
+
+// the three readers the service calls; tests swap in fakes
+internal sealed record UsageReaders(UsageReader Anthropic, UsageReader OpenAI, UsageReader Google);
 
 /// <summary>
 /// cache, cooldown and single flight per provider; providers read in parallel.
@@ -1097,9 +1864,13 @@ public static class GeminiUsage
 /// </summary>
 public sealed class UsageService
 {
+    internal const string NotReadYet = "not read yet since the app started";
+    internal static readonly TimeSpan StaleWindow = TimeSpan.FromDays(7);
     private static readonly TimeSpan CacheTtl = TimeSpan.FromSeconds(60);
 
     private readonly Action<string> _log;
+    private readonly UsageStore _store;
+    private readonly UsageReaders _readers;
     private readonly HttpClient _http = AnthropicUsage.CreateHttpClient();
     // readers finish on pool threads and AppendLog isn't thread-safe, so lines queue here
     private readonly ConcurrentQueue<string> _logQueue = new();
@@ -1108,12 +1879,28 @@ public sealed class UsageService
     private readonly ProviderSlot _google;
     private int _busyCount;
 
-    public UsageService(Action<string> log)
+    public UsageService(UsageStore store, Action<string> log)
+        : this(store, log, null)
+    {
+    }
+
+    /// <summary>
+    /// takes a loaded store and re-points its log at this queue: its saves run under its lock on pool
+    /// threads. Last starts as the stored readings, stale
+    /// </summary>
+    internal UsageService(UsageStore store, Action<string> log, UsageReaders? readers)
     {
         _log = log;
-        _anthropic = new ProviderSlot(AnthropicUsage.Provider, _logQueue);
-        _openai = new ProviderSlot(CodexUsage.Provider, _logQueue);
-        _google = new ProviderSlot(GeminiUsage.Provider, _logQueue);
+        _store = store;
+        store.Log = _logQueue.Enqueue;
+        _readers = readers ?? new UsageReaders(
+            (options, line, ct) => AnthropicUsage.ReadOutcomeAsync(_http, options, line, ct),
+            (options, line, ct) => CodexUsage.ReadOutcomeAsync(options.CodexExecutable, ct, line),
+            (options, line, ct) => GeminiUsage.ReadOutcomeAsync(options.AgyExecutable, line, ct));
+        _anthropic = new ProviderSlot(AnthropicUsage.Provider, store, _logQueue);
+        _openai = new ProviderSlot(CodexUsage.Provider, store, _logQueue);
+        _google = new ProviderSlot(GeminiUsage.Provider, store, _logQueue);
+        Last = Seed(DateTimeOffset.UtcNow);
     }
 
     public UsageSnapshot? Last { get; private set; }
@@ -1128,10 +1915,9 @@ public sealed class UsageService
     public event Action<bool>? BusyChanged;
 
     /// <summary>
-    /// fresh skips the 60 s cache, never a cooldown. codexExecutableOverride is
-    /// settings.CodexExecutable
+    /// fresh skips the 60 s cache and a soft cooldown, never a hard one
     /// </summary>
-    public async Task RefreshAsync(bool fresh, string? codexExecutableOverride, CancellationToken ct)
+    public async Task RefreshAsync(bool fresh, UsageOptions options, CancellationToken ct)
     {
         if (Interlocked.Increment(ref _busyCount) == 1)
         {
@@ -1142,11 +1928,12 @@ public sealed class UsageService
         try
         {
             var providers = await Task.WhenAll(
-                _anthropic.GetAsync(fresh, c => AnthropicUsage.ReadOutcomeAsync(_http, c), ct),
-                _openai.GetAsync(fresh, c => CodexUsage.ReadOutcomeAsync(codexExecutableOverride, c), ct),
-                _google.GetAsync(fresh, _ => Task.FromResult(new ReaderOutcome(GeminiUsage.Read())), ct));
+                _anthropic.GetAsync(fresh, c => _readers.Anthropic(options, _logQueue.Enqueue, c), ct),
+                _openai.GetAsync(fresh, c => _readers.OpenAI(options, _logQueue.Enqueue, c), ct),
+                _google.GetAsync(fresh, c => _readers.Google(options, _logQueue.Enqueue, c), ct));
 
-            Last = produced = new UsageSnapshot(DateTimeOffset.UtcNow, providers);
+            // through the store on every post, so history is a list, never null
+            Last = produced = new UsageSnapshot(DateTimeOffset.UtcNow, providers.Select(_store.WithHistory).ToList());
         }
         catch (OperationCanceledException)
         {
@@ -1176,13 +1963,30 @@ public sealed class UsageService
         }
     }
 
-    private sealed class ProviderSlot(string provider, ConcurrentQueue<string> log)
+    // last night's numbers within a second of opening the tab, dated, with no actions (spec 8)
+    private UsageSnapshot? Seed(DateTimeOffset now)
+    {
+        var seeded = new List<ProviderUsage>();
+        foreach (var provider in new[] { AnthropicUsage.Provider, CodexUsage.Provider, GeminiUsage.Provider })
+        {
+            if (_store.LastOk(provider, StaleWindow, now) is { } stored)
+            {
+                seeded.Add(_store.WithHistory(stored with { State = UsageState.Stale, Message = NotReadYet, Detail = null, Actions = [] }));
+            }
+        }
+
+        // dated by the newest reading, not now: nothing has been read yet
+        return seeded.Count == 0 ? null : new UsageSnapshot(seeded.Max(usage => usage.UpdatedAt!.Value), seeded);
+    }
+
+    private sealed class ProviderSlot(string provider, UsageStore store, ConcurrentQueue<string> log)
     {
         private readonly object _gate = new();
         private Task<ProviderUsage>? _pending;
         private ProviderUsage? _last;
         private DateTimeOffset _lastAt;
-        private DateTimeOffset _cooldownUntil;
+        private DateTimeOffset _hardUntil;
+        private DateTimeOffset _softUntil;
         private string? _loggedState;
 
         public Task<ProviderUsage> GetAsync(bool fresh, Func<CancellationToken, Task<ReaderOutcome>> read, CancellationToken ct)
@@ -1195,7 +1999,7 @@ public sealed class UsageService
                 }
 
                 var now = DateTimeOffset.UtcNow;
-                if (_last is not null && (now < _cooldownUntil || (!fresh && now - _lastAt < CacheTtl)))
+                if (_last is not null && (now < _hardUntil || (!fresh && (now < _softUntil || now - _lastAt < CacheTtl))))
                 {
                     return Task.FromResult(_last);
                 }
@@ -1226,30 +2030,82 @@ public sealed class UsageService
                 outcome = new ReaderOutcome(ProviderUsage.Unavailable(provider, null, Scrub.Message(ex.Message), DateTimeOffset.UtcNow));
             }
 
-            var usage = outcome.Usage;
+            // outside the gate: the store has its own lock and writes a file
+            var usage = Settle(outcome.Usage);
             lock (_gate)
             {
                 _last = usage;
                 _lastAt = DateTimeOffset.UtcNow;
+                // each live read replaces both, so a fresh success clears a soft backoff
+                _hardUntil = _softUntil = DateTimeOffset.MinValue;
                 if (outcome.Cooldown is { } wait)
                 {
-                    _cooldownUntil = _lastAt + wait;
+                    if (outcome.CooldownKind == CooldownKind.Hard)
+                    {
+                        _hardUntil = _lastAt + wait;
+                    }
+                    else
+                    {
+                        _softUntil = _lastAt + wait;
+                    }
+
                     log.Enqueue($"usage: {provider} cooling down {wait.TotalSeconds:0} s{(outcome.LogNote is { } why ? $" after {why}" : "")}");
                 }
 
-                // quiet by default: a line on the first result and on each ok/unavailable flip
+                // quiet by default: a line on the first result and on each ok, unavailable or stale flip
                 if (usage.State != _loggedState)
                 {
                     _loggedState = usage.State;
-                    log.Enqueue(usage.State == UsageState.Ok
-                        ? $"usage: {provider} ok, {usage.Meters.Count} meter{(usage.Meters.Count == 1 ? "" : "s")}"
-                        : $"usage: {provider} unavailable: {usage.Message}{(outcome.Cooldown is null && outcome.LogNote is { } note ? $" ({note})" : "")}");
+                    log.Enqueue(Describe(usage, outcome));
                 }
 
                 _pending = null;
             }
 
             return usage;
+        }
+
+        /// <summary>
+        /// a live ok reading goes to the store, a null plan taking the stored one. a failure with an
+        /// ok reading under 7 days old becomes stale: stored meters, plan, footnote and time, the
+        /// failure's message, detail and actions
+        /// </summary>
+        private ProviderUsage Settle(ProviderUsage live)
+        {
+            var stored = store.LastOk(provider, StaleWindow, DateTimeOffset.UtcNow);
+            if (live.State == UsageState.Ok)
+            {
+                // the tray app's rewrite nulls subscriptionType; keep the caption between its rewrites (spec 5.5)
+                if (live.Plan is null && stored?.Plan is { } plan)
+                {
+                    live = live with { Plan = plan };
+                }
+
+                store.RecordOk(live);
+                return live;
+            }
+
+            return stored is null
+                ? live
+                : stored with
+                {
+                    State = UsageState.Stale,
+                    Plan = live.Plan ?? stored.Plan,
+                    Message = live.Message,
+                    Detail = live.Detail,
+                    Actions = live.Actions,
+                };
+        }
+
+        private string Describe(ProviderUsage usage, ReaderOutcome outcome)
+        {
+            var note = outcome.Cooldown is null && outcome.LogNote is { } text ? $" ({text})" : "";
+            return usage.State switch
+            {
+                UsageState.Ok => $"usage: {provider} ok, {usage.Meters.Count} meter{(usage.Meters.Count == 1 ? "" : "s")}",
+                UsageState.Stale => $"usage: {provider} stale, showing the reading of {usage.UpdatedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)}: {usage.Message}{note}",
+                _ => $"usage: {provider} unavailable: {usage.Message}{note}",
+            };
         }
     }
 }

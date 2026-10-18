@@ -15,8 +15,8 @@ public sealed class UsageStore
     // seven days at five minutes is 2,016
     private const int MaxPoints = 3000;
     private static readonly long RetentionMs = (long)TimeSpan.FromDays(8).TotalMilliseconds;
-    // a point belongs to the meter's window when its stored reset is this close to the meter's
-    private static readonly long WindowToleranceMs = (long)TimeSpan.FromMinutes(2).TotalMilliseconds;
+    // the last whole second a DateTimeOffset holds, so a rounded reset still reads back
+    private const long MaxSecondMs = 253_402_300_799_000;
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web)
     {
@@ -159,7 +159,7 @@ public sealed class UsageStore
 
                 // the reset time is the window identity: a point taken a second before the reset
                 // carries the old window's reset and stays out of the new one
-                var point = new Point(atMs, meter.UsedPercent, meter.ResetsAt.ToUnixTimeMilliseconds());
+                var point = new Point(atMs, meter.UsedPercent, WholeSecondMs(meter.ResetsAt));
                 var index = series.BinarySearch(point, ByTime);
                 // same instant is a cache hit, not a new observation. same value at a new time is kept
                 if (index < 0)
@@ -214,12 +214,18 @@ public sealed class UsageStore
             return [];
         }
 
-        var resetsAtMs = meter.ResetsAt.ToUnixTimeMilliseconds();
+        // exact to the second, no tolerance: an idle agy bucket's reset moves with each read, and two
+        // idle reads a minute apart must not merge (spec 4, G4). older files may hold unrounded ms
+        var resetsAtMs = WholeSecondMs(meter.ResetsAt);
         return series
-            .Where(point => Math.Abs(point.ResetsAtMs - resetsAtMs) <= WindowToleranceMs)
+            .Where(point => WholeSecondMs(point.ResetsAtMs) == resetsAtMs)
             .Select(point => new UsagePoint(DateTimeOffset.FromUnixTimeMilliseconds(point.AtMs), point.UsedPercent))
             .ToList();
     }
+
+    private static long WholeSecondMs(DateTimeOffset instant) => WholeSecondMs(instant.ToUnixTimeMilliseconds());
+
+    private static long WholeSecondMs(long ms) => Math.Min((long)Math.Round(ms / 1000.0, MidpointRounding.AwayFromZero) * 1000, MaxSecondMs);
 
     // temp file beside the target, then a rename - a failed write leaves the old file whole
     private void Save()

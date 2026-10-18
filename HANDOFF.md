@@ -56,10 +56,15 @@ Never a cleaning build beside the running exe; verify with
 
 ## Known limitations and debt
 
-- Gemini: nothing local to read. The Gemini CLI stopped serving AI Pro on
-  2026-06-18; Antigravity's `agy -p /usage` is the follow-up once `agy` is
-  installed; the unofficial Antigravity endpoint is off the table (Google
-  suspended accounts for third-party use in March 2026).
+- Gemini: nothing read yet. The Gemini CLI stopped serving AI Pro on
+  2026-06-18. Antigravity CLI 1.4.2 was installed at the end of this session
+  (`%LOCALAPPDATA%gyingy.exe`, on the user PATH); Caleb's browser
+  sign-in with his personal account is pending. Next session: run
+  `agy -p /usage` once to capture the report's shape, then teach
+  `GeminiUsage` to parse it. The running app only sees `agy` on PATH after a
+  relaunch, when its tile will say "Antigravity CLI found; reading its usage
+  report is not implemented yet". The unofficial Antigravity endpoint stays
+  off the table (Google suspended accounts for third-party use in March 2026).
 - Codex reported only a weekly window and `planType` "prolite" today; the
   reader labels by duration and assumes nothing.
 - Anthropic error paths have no fake-server tests.

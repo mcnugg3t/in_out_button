@@ -1,7 +1,7 @@
 # Handoff: In / Out Button
 
 Written 2026-10-17 at the end of the session that added the AI usage and
-Tasks tabs. Post-review commit: the `post-review:` commit of 2026-10-17 (`git log --grep "post-review: AI usage"`). Read with the spec,
+Tasks tabs. Post-review commit: `9a8ca7e`. Read with the spec,
 `docs/2026-10-17-usage-and-tasks-tabs-spec.md`, which is the design record,
 and this file, which is the state.
 
@@ -37,7 +37,7 @@ zero warnings.
 
 Windows launches `bin\Debug\net8.0-windows\InOutButton.exe` at login. See the
 closing message of the session, or `git log`, for whether the in-place rebuild
-happened; if the running app predates the `post-review:` commit of 2026-10-17 (`git log --grep "post-review: AI usage"`), ship by closing
+happened; if the running app predates `9a8ca7e`, ship by closing
 the window (no tray icon), `dotnet build -c Debug` in the repo, relaunch.
 Never a cleaning build beside the running exe; verify with
 `dotnet build --artifacts-path <scratch>`.

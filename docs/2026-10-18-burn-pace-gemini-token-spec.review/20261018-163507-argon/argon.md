@@ -1,0 +1,43 @@
+(1) The five most confident objections
+
+1. Stale providers keep rendering depleted meters up to 7 days after the window has already reset.
+Why it matters: Section 3.1 marks a failed provider `stale` if the store holds an `ok` reading from the last 7 days, and Section 7.5 evaluates `<left>% left as of <time>`, severity, and burn pace at the reading's timestamp while still counting `to reset` from now. Once `now >= meter.ResetsAt`, that quota window is over and has reset to 100% left.
+If unaddressed: Every morning when Anthropic fails (or during any multi-day outage), a 5-hour session meter whose reset passed hours or days ago still displays last night's low remaining percentage, warning/critical wash, and "Above even pace" verdict alongside "reset at <time> · waiting for refresh", misrepresenting a completed window as still active and depleted.
+
+2. Running the refresh ladder on HTTP 401/403 (`Rejected`) relies on `expiresAt` advancing, which fails when the token is not expired or double-fires after a refresh.
+Why it matters: Section 5.1 triggers the ladder on `Expired` or `Rejected` (401/403), and Section 5.2 stops only if `expiresAt` advances. If `/api/oauth/usage` returns 401/403 while `expiresAt` is still in the future (e.g., revoked token, scope change, or WAF 403), `claude auth status` sees an unexpired timestamp and does nothing, and `claude -p` either spends Haiku tokens without refreshing `.credentials.json` or fails. Conversely, if an `Expired` token (`E1`) is refreshed to `E2` and the subsequent usage request returns 403, `E2` is a new `expiresAt`, allowing the automatic ladder to run a second time. `ExpiresAtMs` is also nullable (`double?`), leaving no key for comparison or deduplication when absent.
+If unaddressed: A 403 with a future `expiresAt` burns a Haiku call, leaves `expiresAt` unchanged, and falsely reports "Claude Code token expired; the refresh ladder did not advance it". Every click on `claude-refresh` burns another Haiku call.
+
+3. `agy --print-timeout 20s` masks timeouts as schema changes, and the 10-minute cooldown silently blocks manual refreshes.
+Why it matters: Section 6.1 passes `--print-timeout 20s` under a 25 s process cap, and Section 6.2 notes that `--print-timeout` makes `agy` exit 0 with `status: "SUCCESS"` and no `command.data`, landing on "usage report changed shape (no buckets)" and setting a 10-minute cooldown. In `UsageService` (`Usage.cs` line 2354), `fresh: true` never bypasses `_cooldownUntil`.
+If unaddressed: Any `agy` timeout between 20 s and 25 s is misreported as a breaking JSON shape change instead of a timeout. Worse, when `agy` fails and instructs the user to "run agy in a terminal to check its sign-in", signing in and clicking Refresh in the app does nothing for 10 minutes.
+
+4. The 2-minute window-identity tolerance (`|point.resetsAt - meter.ResetsAt| <= 2 min`) merges moving-reset idle reads and produces negative `elapsedAt` coordinates.
+Why it matters: Section 4 assumes each idle Antigravity read is its own one-point window because `reset_time` moves (`now + window`). However, live reads happen under 2 minutes apart whenever the user clicks Refresh or a workflow ends (`SetBusy(false)`) after the 60 s cache TTL.
+If unaddressed: Consecutive idle reads (or an idle read followed within 2 minutes by the first active read) satisfy `|point.resetsAt - meter.ResetsAt| <= 2 min` and get grouped into the latest window. Because the new window's origin (`meter.ResetsAt - WindowMinutes`) is later than the earlier point's timestamp, `elapsedAt(point.at)` is negative (`x < 0`), drawing outside the plot box instead of a dot at the origin.
+
+5. Manual `claude-refresh` and startup `stale` hydration conflict with `UsageService` state transitions.
+Why it matters: In Section 8, `claude-refresh` calls `RefreshClaudeTokenAsync` and then `ReadUsageAsync(fresh: true)`. If the manual ladder fails to advance `expiresAt` (or `claude` is missing) and `ClaudeRefreshAuto` is false (or the once-per-`expiresAt` guard already tripped), the subsequent `ReadUsageAsync(fresh: true)` skips the ladder and overwrites the ladder's specific failure message with the pre-ladder message, while also spawning unnecessary fresh Codex and Antigravity processes. Also, hydrating `_usage.Last` as `stale` from `UsageStore.last` at startup (Section 8) uses stored `ok` records that have `Message = null` and `Actions = []`.
+If unaddressed: Manual refresh loses ladder error messages, does not set `Busy` during the 120 s ladder, and shows blank failure reasons on startup `stale` captions when `SetBusy` defers the first read.
+
+(2) Assumptions to verify before building
+
+- Whether `claude -p` blocks when stdin is redirected and left open. `JsonLineProcess.Start` redirects stdin, and Section 5.2 omits "stdin closed" (unlike 6.1). Verify by running Step 2 with redirected open stdin.
+- Whether `claude auth status` refreshes an expired token, and whether killing `claude.exe` at the 60 s cap mid-refresh can lose a rotated single-use `refreshToken` before `.credentials.json` is renamed. Verify against a copied `.credentials.json` in a test `CLAUDE_CONFIG_DIR`.
+- Whether `agy -p /usage` with a expired Google login opens a browser tab on every 10-minute cooldown (6 tabs/hour unattended). Verify by running `agy -p /usage` while logged out.
+- What `where.exe agy` and `where.exe claude` return when `claude.exe` is absent. `UseShellExecute = false` cannot start an extensionless npm shim.
+
+(3) Missing or untestable acceptance criteria
+
+- Test 12 (job-object grandchild kill) has a race: `Process.Start` starts the child unsuspended before `AssignProcessToJobObject` runs; a fast child that spawns a grandchild and exits immediately can beat job assignment and fail `AssignProcessToJobObject` with `ERROR_ACCESS_DENIED`.
+- No criterion for how `stale` tiles display meters whose `ResetsAt` has already passed, or for restoring `Plan` from the store when `ClaudeUsage` overwrites `subscriptionType` and `rateLimitTier` with null on an `ok` read.
+- No criterion clamping `elapsedAt` to `[0, 1]` and enforcing non-decreasing `x` across history points.
+- No test that concurrent `RefreshAsync` callers sharing `_pending` append only one point to `UsageStore`, or that `ProviderSlot` logs `stale` distinctly from `unavailable` (`Usage.cs` line 2397).
+
+(4) First thing to probe to break this
+
+Simulate an `agy` hang of 21 seconds (hitting `--print-timeout 20s` before the 25 s cap): observe the false "usage report changed shape (no buckets)" error, then click Refresh and observe that the 10-minute cooldown ignores the manual refresh. Next, return HTTP 403 from `/api/oauth/usage` while `.credentials.json` has a future `expiresAt` and click `claude-refresh`.
+
+(5) Checked and cleared
+
+I lack `Form1.cs`, `ProcessRunner`, `web/usage.html`, and `agy-usage-2026-10-18.json`, which were not in the file. Within the provided files, I checked for and did not find: direct writes to `.credentials.json`; unscrubbed `agy` stdout/error text reaching the UI (`Scrub.Message` wraps `Detail`); transcript or MCP side effects in Step 2 (`--no-session-persistence` and `--strict-mcp-config` block both); or silent corruption on unknown `UsageStore` schema versions (`.bak` rename preserves the file).

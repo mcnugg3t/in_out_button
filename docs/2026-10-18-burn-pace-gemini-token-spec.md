@@ -168,11 +168,14 @@ One file, `%APPDATA%\InOutButton\usage-store.json`, owned by a new
   five minutes is 2,016). Points are not deduplicated: a repeated value at a
   new time is a real observation that the meter did not move.
 - Window membership is by identity, not by time range: a point belongs to
-  the current window when `|point.resetsAt - meter.ResetsAt| <= 2 min`. A
-  point taken in the previous window, even one second before the reset,
+  the current window when `point.resetsAt == meter.ResetsAt` to the second.
+  A point taken in the previous window, even one second before the reset,
   carries the old reset time and is excluded. An idle Antigravity bucket
   reports a moving reset time, so each idle read is its own one-point
-  window, which draws as a dot at the origin.
+  window, which draws as a dot at the origin; two idle reads a minute apart
+  must not merge, which is why there is no tolerance. A provider whose
+  reset time jitters within a window would fragment its own history and
+  degrade to the single-reading chart; that is the accepted failure.
 - All store access runs under one lock: load, append, filter, save. The
   readers finish in parallel, so appends serialize here.
 - Written after every read that changed it, atomically (temp file in the
@@ -193,19 +196,40 @@ One file, `%APPDATA%\InOutButton\usage-store.json`, owned by a new
 
 ### 5.1 Trigger
 
-The ladder runs when `AnthropicUsage` would report `Expired` (local
-`expiresAt` check) or `Rejected` (401 or 403 with an unchanged token). It
-runs at most once per distinct `expiresAt` value when started automatically
-(`ClaudeRefreshAuto`), and whenever the user clicks `claude-refresh`. It
-never runs concurrently with itself (single flight, like the readers).
+The ladder is part of the Anthropic read, not a separate flow: inside
+`ReadOutcomeAsync`, when the reader would report `Expired` (local
+`expiresAt` check) or `Rejected` (401 or 403 with an unchanged token), it
+runs the ladder, re-reads the file, and either goes on to the live read
+with the new token or fails with the ladder's own message. So a manual
+`claude-refresh` is one `RefreshAsync(fresh: true, options with
+ForceClaudeRefresh = true)`: `Busy` covers the ladder, and the message the
+page shows is the ladder's, never the pre-ladder one.
+
+When started automatically (`ClaudeRefreshAuto`) it runs at most once per
+distinct `accessToken` value per app process, and never within 30 minutes
+of its previous automatic run. The token string is the key, not
+`expiresAt`, because `expiresAt` can be absent and because a refreshed
+token that is then rejected would otherwise re-arm the ladder. The forced
+path ignores the once-per-token guard but keeps the 30-minute floor
+against repeated clicks (a click inside the floor reads live without the
+ladder and says so in the message). The ladder never runs concurrently
+with itself.
 
 ### 5.2 Steps
 
 Each step is a child process started with `ArgumentList`, no shell, no
-window, capped at 60 s with a process-tree kill in `finally`, stdout and
-stderr drained to bounded buffers whose content is never surfaced (only
-lengths are logged), working directory `%APPDATA%\InOutButton` (no project
-`CLAUDE.md`, no git).
+window, stdin closed at once (`claude -p` appends piped stdin to the
+prompt and would wait for its end), stdout and stderr drained to bounded
+buffers whose content is never surfaced (only lengths are logged), working
+directory `%APPDATA%\InOutButton` (no project `CLAUDE.md`, no git). The
+ladder waits at most 60 s for step 1 and 90 s for step 2. A step that is
+still running at its deadline is not killed: killing Claude Code between
+receiving a rotated refresh token and writing the file could strand the
+login. The ladder stops waiting, logs "step still running after N s, left
+to finish", and reports as if the step had not advanced the token; the
+next read picks up whatever the step eventually wrote. `--max-turns 1`
+and the API's own timeouts bound such a process in practice, and the
+30-minute floor bounds how many could exist.
 
 1. `claude auth status`. No model call.
 2. `claude -p "Reply with the single word OK." --model haiku --max-turns 1
@@ -222,15 +246,18 @@ transcript under `~/.claude/projects`, credentials file untouched.
 `--bare` is not used: it skips hooks too, but it never reads OAuth
 credentials and so cannot refresh them.
 
-After each step the reader re-reads `.credentials.json`. If `expiresAt` is
-later than the value that triggered the ladder, the ladder stops, logs
-`token refresh: <step> advanced expiresAt to <time>`, and the reader
-proceeds to the live HTTP read with the new token. If neither step moves
-it, the reader reports `Expired` (or `Rejected`) with the message
-"Claude Code token expired; the refresh ladder did not advance it", the
-`claude-refresh` action, and the log keeps each step's exit code, duration,
-and output lengths. Step 2 is skipped when `claude` is not found; the
-message then says "Claude Code (claude) not found; set ClaudeExecutable".
+After each step the reader re-reads `.credentials.json`. If the
+`accessToken` string differs from the one that triggered the ladder, the
+ladder stops, logs `token refresh: <step> replaced the token (expiresAt
+<time>)`, and the reader proceeds to the live HTTP read with the new
+token. The token string is the test, not `expiresAt`: a 401 with a future
+`expiresAt` (revoked token, scope change) is only cured by a new token.
+If neither step replaces it, the reader reports the message "Claude Code
+token expired; the refresh ladder did not replace it" (or "… rejected …"),
+the `claude-refresh` action, and the log keeps each step's exit code,
+duration, and output lengths. When `claude` is not found the whole ladder
+is skipped; the message then says "Claude Code (claude) not found; set
+ClaudeExecutable".
 
 The log line is the experiment: it records which step is enough. If the
 first morning's log shows step 1 advancing the token, step 2 becomes dead
@@ -238,11 +265,14 @@ code to delete.
 
 ### 5.3 Finding `claude`
 
-`ClaudeExecutable` when set; else `where.exe claude`. When the hit is the npm
-shim (an extensionless file or `.cmd`), prefer
-`<shim folder>\node_modules\@anthropic-ai\claude-code\bin\claude.exe` when it
-exists, so no `cmd.exe` is involved. A hit is cached; a miss is not; a cached
-hit that fails to start is discarded, as the Codex driver does.
+`ClaudeExecutable` when set; else `where.exe claude`. The hits on this
+machine are the extensionless npm shim and `claude.cmd`, neither of which
+`UseShellExecute = false` can start. So a hit is resolved to
+`<shim folder>\node_modules\@anthropic-ai\claude-code\bin\claude.exe` when
+that exists, or used as is when it already ends in `.exe`; otherwise it
+counts as not found (no `cmd.exe` is ever involved). A find is cached; a
+miss is not; a cached find that fails to start is discarded, as the Codex
+driver does.
 
 ### 5.4 Bounds, cost, and side effects
 
@@ -267,11 +297,16 @@ hit that fails to start is discarded, as the Codex driver does.
   `expiresAt` is treated as "try the live read now", never as success; the
   usage request decides.
 
-### 5.5 What stays
+### 5.5 What stays, and the plan label
 
 The local `expiresAt` pre-check stays, now as the ladder's trigger. The 401
 re-read-once rule stays. The 60 s cache, the no-retry on 429, and the
 `Retry-After` cooldown stay.
+
+When an `ok` read carries a null `Plan` (the tray app's rewrite nulls
+`subscriptionType` and drops `rateLimitTier`), the service keeps the plan
+from the stored last reading, so the caption does not blank between two
+of its rewrites.
 
 ## 6. Google: the Antigravity reader
 
@@ -311,13 +346,23 @@ internal static ProviderUsage Parse(string replyJson, DateTimeOffset now);
   in today's runs; it holds the account email and trace ids and no token
   (checked: the keyring line logs only the expiry). Nothing from it is
   read by the app.
-- Outcomes: timeout "Antigravity CLI timed out after 25 s"; could not
-  start "Antigravity CLI (agy) could not be started"; non-zero exit or a
+- Outcomes: timeout "Antigravity CLI timed out after 25 s"; the CLI's own
+  print timeout, recognised by the fixed marker `print timeout` in its
+  stderr (the only thing ever matched in stderr; its text is still never
+  surfaced): "Antigravity CLI timed out after 20 s"; could not start
+  "Antigravity CLI (agy) could not be started"; non-zero exit or a
   `status` other than `SUCCESS` or stdout that is not one JSON object:
   "Antigravity CLI did not report usage; run agy in a terminal to check its
   sign-in" with `Detail` = `Scrub.Message` of the first 200 characters of
-  stdout when it is not JSON, else of `response`. A failure sets a 10-minute
-  cooldown for the provider so a broken `agy` runs at most six times an hour.
+  stdout when it is not JSON, else of `response`.
+- Backoff: a failure sets a soft cooldown of 10 minutes; the third
+  consecutive failure and every one after it sets 60 minutes; a success
+  clears the count. A soft cooldown is skipped by `fresh` (the Refresh
+  button, the `claude-refresh` action), so signing in at a terminal and
+  clicking Refresh works at once. The service therefore keeps two cooldown
+  kinds: hard, from a server's `Retry-After`, never skipped; soft, the
+  app's own backoff, skipped by `fresh`. The Anthropic 5xx 10 s cooldown
+  and this one are soft; the 429 one is hard.
 
 ### 6.2 Parse
 
@@ -401,6 +446,9 @@ the plot box. Drawn with `createElementNS` and attributes only.
   stroke; a dot at the end; "now" under the dot; "reset" at the right.
 - The 30 s tick re-derives "to reset", the now x-position, and the flat
   tail from the clock; the history points are fixed once posted.
+- Every x is clamped to 0..1 and points are sorted by time before drawing,
+  so a point the service should not have sent still cannot draw outside
+  the plot box or run backwards.
 
 ### 7.4 Tooltip and keyboard
 
@@ -422,12 +470,18 @@ with the same lines.
   elapsed fraction at the reading's time, and "to reset" is still
   counted from now because the reset is a fact about the clock, not the
   reading.
-- Any meter whose `resetsAt` has passed shows "reset at <time> · waiting
-  for refresh" in place of "to reset", as today. For `ok` providers the
-  page posts `{type:"stale"}` under today's rules (once per meter per
-  snapshot, at most once per 60 s). For `stale` providers it does not post;
-  the timer, the Refresh button, and the end of a workflow are the ways
-  back.
+- An `ok` meter whose `resetsAt` has passed shows "reset at <time> ·
+  waiting for refresh" in place of "to reset", as today, and the page
+  posts `{type:"stale"}` under today's rules (once per meter per snapshot,
+  at most once per 60 s).
+- A `stale` meter whose `resetsAt` has passed is a finished window and
+  carries no information about the current one. It renders as a ghost
+  tile: name and window label, no percent, no severity chip, no pace, no
+  path, and the line "window reset at <time> since the last read · waiting
+  for a live read". Showing last night's 20% left with a warning wash for
+  a window that reset at 7 AM would be a false reading. `stale` providers
+  never post `stale`; the timer, the Refresh button, and the end of a
+  workflow are the ways back.
 
 ### 7.6 Browser fixture
 
@@ -439,19 +493,26 @@ checked in a browser. The host never loads it.
 
 ## 8. Form1 wiring
 
-- `OnUsageMessage` `action` case: `claude-refresh` calls
-  `_usage.RefreshClaudeTokenAsync(options, ct)` then a fresh read; the two
-  URL actions are unchanged; unknown ids are ignored as today.
+- `OnUsageMessage` `action` case: `claude-refresh` is one
+  `_usage.RefreshAsync(fresh: true, options with ForceClaudeRefresh = true, ct)`;
+  the ladder runs inside the Anthropic read (section 5.1). The two URL
+  actions are unchanged; unknown ids are ignored as today.
 - `ReadUsageAsync` passes `UsageOptions` built from settings.
+  `UsageOptions` gains `bool ForceClaudeRefresh`, false everywhere except
+  that action.
 - First read: when the usage tab is first shown while a scan or workflow
   is busy, mark it shown and skip the immediate read; the existing
   `SetBusy(false)` read runs it when the machine is quieter. This is the
   deploy-day timeout from the handoff.
 - Startup: construct `UsageStore` from the settings folder and pass it to
-  `UsageService`. `_usage.Last` at `ready` time may now carry `stale`
-  providers from the store before any live read, so the page shows last
-  night's numbers within a second of opening the tab. That is intended:
-  the first live read follows at once.
+  `UsageService`. The service seeds `Last` from the store before any live
+  read: each stored reading under 7 days old becomes a `stale` provider
+  with the fixed message "not read yet since the app started" and no
+  actions, so the page shows last night's numbers within a second of
+  opening the tab, dated. The first live read follows at once (or after
+  the scan, section above). The service logs a provider's `stale` result
+  distinctly from `unavailable` on each flip, as it logs ok and
+  unavailable today.
 
 ## 9. Tests
 
@@ -502,6 +563,22 @@ Anthropic ladder (no network; the credentials path is injected):
     read with the same value does not run it; the manual path does.
 15. The credentials fixture is byte-identical after every reader path the
     tests drive (valid, expired, rejected): the app never writes it.
+16. A fake step list where the token string changes but `expiresAt` does
+    not still counts as replaced; one where `expiresAt` moves but the
+    token string does not still counts as not replaced.
+
+Service, continued:
+17. Two concurrent `RefreshAsync` callers share one pending read and the
+    store gains one point per meter, not two.
+18. A soft cooldown is skipped by `fresh: true`; a hard one is not.
+19. An `ok` Anthropic reading with a null plan keeps the stored plan.
+20. The seeded `stale` providers at startup carry the fixed message and
+    an empty action list.
+
+Google, continued:
+21. A stand-in that writes the marker line `[agy] print timeout after 20s`
+    to stderr and exits 0 with a SUCCESS envelope lacking `command.data`
+    yields the 20 s timeout message, not the shape-change one.
 
 The existing Gemini empty-state test moves to the not-found path.
 
@@ -554,10 +631,14 @@ pointed at scratch while the login-launched exe holds `bin/Debug`:
 
 ## 12. Plan-review triage
 
-Astra (high effort, 99 s) and Argon (high effort) reviewed revision 1 of
-this spec with the first spec and `Usage.cs` as context; the raw answers
-are in `2026-10-18-burn-pace-gemini-token-spec.review/`. Rows marked
-"fixed" changed the section named.
+Astra (high effort, 99 s) reviewed revision 1 of this spec; Argon (high
+effort, 349 s) reviewed revision 2, which already carried Astra's triage,
+so Argon's read is not independent of Astra's. Both had the first spec and
+`Usage.cs` as context. Raw answers are in
+`2026-10-18-burn-pace-gemini-token-spec.review/` (Argon's first run was
+denied a file read in headless mode and produced nothing; the launcher
+now passes `--add-dir` for the repos involved). Rows marked "fixed"
+changed the section named.
 
 | # | Reviewer | Finding | Judgement | Outcome |
 |---|---|---|---|---|
@@ -571,3 +652,12 @@ are in `2026-10-18-burn-pace-gemini-token-spec.review/`. Rows marked
 | A8 | Astra | Parser cases: duplicate bucket ids, malformed field types, parser exceptions, every failure entering cooldown. | Real. | Fixed in 6.2. |
 | A9 | Astra | A cached read must not become a new observation. | Real. | Fixed in 4 and test 10. |
 | A10 | Astra | Two idle observations do not establish a zero-based consumption window for Antigravity. | Accepted as an open assumption; the store will record consecutive readings through a real window, which is the evidence. | 10 unchanged; 4 now draws an idle bucket as a one-point window so a wrong guess costs nothing. |
+| G1 | Argon | A `stale` provider keeps showing a depleted meter, its wash, and its pace verdict for up to 7 days after that window has reset. | Real: last night's 20% with a warning wash for a window that reset at 7 AM is a false reading. | Fixed in 7.5: a stale meter past its reset is a ghost tile with "window reset at <time> since the last read". |
+| G2 | Argon | Stopping the ladder on an advanced `expiresAt` fails the 401-with-future-expiry case, re-arms after a refreshed-then-rejected token, and has no key when `expiresAt` is null. | Real. | Fixed in 5.1 and 5.2: the token string is both the stop test and the once-per-token key; a 30-minute floor bounds automatic and forced runs; test 16. |
+| G3 | Argon | `--print-timeout 20s` makes an `agy` timeout look like a shape change, and the 10-minute cooldown blocks the manual Refresh after the user signs in. | Real on both. | Fixed in 6.1: the stderr marker maps to a timeout message (test 21); cooldowns split into hard and soft, and `fresh` skips soft (test 18). |
+| G4 | Argon | A 2-minute identity tolerance merges idle reads whose reset time moves, giving negative x. | Real. | Fixed in 4 (exact match, no tolerance) and 7.3 (clamp and sort). |
+| G5 | Argon | A manual `claude-refresh` as "ladder, then fresh read" overwrites the ladder's message with the pre-ladder one and runs outside `Busy`; startup `stale` seeding from stored `ok` records has a null message. | Real. | Fixed in 5.1 and 8: the ladder runs inside the Anthropic read under `ForceClaudeRefresh`; seeded providers carry a fixed message (test 20). |
+| G6 | Argon | `claude -p` with an open redirected stdin may block; killing `claude.exe` at the cap mid-refresh could strand a rotated refresh token. | Real on both; the second is the more dangerous. | Fixed in 5.2: stdin closed at once; ladder steps are waited for, never killed. |
+| G7 | Argon | `agy -p /usage` while logged out may open a browser tab per cooldown. | Accepted as unverifiable today (would need logging out). | 6.1: escalating backoff to one hour after three failures. Recorded in 10. |
+| G8 | Argon | `where.exe` returns shims `UseShellExecute = false` cannot start. | Real; the first draft already resolved to the native exe but did not say what happens without it. | Fixed in 5.3: a shim without the native exe beside it counts as not found. |
+| G9 | Argon | Test 12 races job assignment against a fast-exiting child; no criteria for stale-past-reset tiles, plan restoration after a tray-app rewrite, x clamping, one point per shared read, or distinct `stale` logging. | Real. | The job test's stand-in sleeps before spawning; the rest are 5.5, 7.3, 7.5, 8, and tests 17 to 20. |

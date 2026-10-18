@@ -71,6 +71,42 @@ Three unrelated causes, all reproduced and fixed:
 
 Plumbing that came with it: `GitWorkflowResult` → `WorkflowResult` (lives in `ProcessRunner.cs`); actions return `RepoActionResult(Git, Data)` and the grid has separate **Git** and **Data** status columns with per-side tooltips; `ProcessRunner` summarises failures by the first `fatal:`/`error:`/`CRITICAL`/`ERROR`/`[rejected]` line (rclone timestamps stripped, exit code appended) instead of the last line; rclone runs with `--stats-log-level NOTICE` so the success summary can report files transferred; the gitignore warning uses `git check-ignore` (honours globs).
 
+## AI usage and Tasks tabs (added 2026-10-17)
+
+Two tabs join the Repos view in the window's middle row. Design, contracts,
+tests, and the plan-review triage: [docs/2026-10-17-usage-and-tasks-tabs-spec.md](docs/2026-10-17-usage-and-tasks-tabs-spec.md).
+The rules that must survive any later change:
+
+- **Both tabs are HTML pages in `web/`, hosted by `WebHost.cs` (WebView2).**
+  C# is the single source of truth: pages render only what C# posts and every
+  user action is a message C# answers with full state. Navigation is pinned to
+  `https://inout.local/`; pages render data through `textContent`, never
+  `innerHTML`.
+- **Usage (`Usage.cs`).** Anthropic: one GET to the OAuth usage endpoint with
+  the token from Claude Code's `.credentials.json`, which is read on every
+  call and never written or refreshed; 60 s cache; no retry on 429, honour
+  `Retry-After`. OpenAI: `codex app-server` over stdio through
+  `JsonLineProcess`, so the app never touches a Codex token. Gemini: empty
+  state only (the Gemini CLI stopped serving AI Pro on 2026-06-18; the
+  follow-up is parsing `agy -p /usage`). Every external string passes
+  `Scrub.Message` before a page or the log sees it. Form1 owns all refresh
+  scheduling; a hidden tab never reads.
+- **Tasks (`Tasks.cs`).** `persistent-memory/tasks/tasks.json`, so sign-out
+  commits it and other machines pull it. Each task carries `rev`; the store
+  always reloads before writing and rejects a stale or resurrecting save
+  instead of merging. The page is read-only while any workflow is busy and
+  reloads when the workflow ends, so a save cannot land between `git add -A`
+  and the commit. Agents may edit the file under `tasks/README.md` there.
+- **Future work.** Caleb prefers the burn-pace usage view (candidate C) and
+  the Planner-by-progress tasks view (candidate A), both in
+  `docs/design/2026-10-17-candidates/`; rings and fuses (A) and three lanes
+  (B) shipped first. Both are page-only changes on the same message
+  contract.
+- **Building while the app runs.** The login-launched exe locks
+  `bin/Debug`; build and test with
+  `--artifacts-path <scratch>` and never a cleaning build in place. Ship by
+  closing the app, `dotnet build -c Debug`, relaunch.
+
 ## Implementation steps
 
 Each step should compile and run on its own, in this order:

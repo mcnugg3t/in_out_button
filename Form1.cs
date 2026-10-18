@@ -60,7 +60,8 @@ public sealed class Form1 : Form
     // tasks tab: the store waits for the first scan, which finds persistent-memory (spec 2.4)
     private const string TasksSyncingMessage = "Repositories are syncing; try again in a moment.";
     private TaskStore? _taskStore;
-    private bool _tasksFallback;
+    private Task _taskStoreChain = Task.CompletedTask;   // every store call queues here; ui thread only
+    private TaskPathSource _tasksSource;
     private bool _tasksShown;
     private string? _lastTasksError;
 
@@ -711,6 +712,11 @@ public sealed class Form1 : Form
     private async Task ScanReposAsync()
     {
         SetBusy(true, "Scanning repositories...");
+        if (!await DrainTaskWritesAsync())
+        {
+            SetBusy(false, "A task save is still running; try again in a moment");
+            return;
+        }
         _repos.Clear();
         _repoBinding.ResetBindings(false);
 
@@ -822,6 +828,11 @@ public sealed class Form1 : Form
         }
 
         SetBusy(true, $"Running {label}...");
+        if (!await DrainTaskWritesAsync())
+        {
+            SetBusy(false, "A task save is still running; try again in a moment");
+            return;
+        }
         AppendLog($"Starting {label} ({_repos.Count} repos).");
 
         var failures = 0;
@@ -903,6 +914,11 @@ public sealed class Form1 : Form
     {
         const int timeoutSeconds = 120;
         SetBusy(true);
+        if (!await DrainTaskWritesAsync())
+        {
+            SetBusy(false, "A task save is still running; try again in a moment");
+            return;
+        }
         try
         {
             var clone = _repos.FirstOrDefault(repo => string.Equals(repo.Name, "persistent-memory", StringComparison.OrdinalIgnoreCase))?.Path
@@ -976,6 +992,11 @@ public sealed class Form1 : Form
         }
 
         SetBusy(true, $"Running {label} for {repo.Name}...");
+        if (!await DrainTaskWritesAsync())
+        {
+            SetBusy(false, "A task save is still running; try again in a moment");
+            return;
+        }
         (repo.GitStatus, repo.GitMessage) = ("Running", "");
         _repoBinding.ResetBindings(false);
 
@@ -1040,6 +1061,11 @@ public sealed class Form1 : Form
 
         var label = pull ? "pull data" : "push data";
         SetBusy(true, $"Running {label} for {repo.Name}...");
+        if (!await DrainTaskWritesAsync())
+        {
+            SetBusy(false, "A task save is still running; try again in a moment");
+            return;
+        }
         (repo.DataStatus, repo.DataMessage) = ("Running", "");
         _repoBinding.ResetBindings(false);
 
@@ -1074,6 +1100,11 @@ public sealed class Form1 : Form
         }
 
         SetBusy(true, $"Testing remote {remote}...");
+        if (!await DrainTaskWritesAsync())
+        {
+            SetBusy(false, "A task save is still running; try again in a moment");
+            return;
+        }
         var result = await RcloneRunner.TestRemoteAsync(remote, _settings.RcloneTimeoutSeconds);
         AppendLog($"Test remote {remote}: {(result.Success ? "OK" : "FAILED")} - {result.Summary}");
         if (!string.IsNullOrWhiteSpace(result.FullOutput))
@@ -1147,7 +1178,7 @@ public sealed class Form1 : Form
                     _tasksShown = true;
                     await _tasksHost.EnsureAsync();
                 }
-                else if (_taskStore is { } store && await Task.Run(() => store.ChangedSinceLoad()))
+                else if (_taskStore is { } store && await RunStoreAsync(store.ChangedSinceLoad))
                 {
                     await PostTasksStateAsync();
                 }
@@ -1195,7 +1226,7 @@ public sealed class Form1 : Form
                 _ = ReadUsageAsync(fresh: true);
                 break;
             case "stale":
-                if (_usageShown && UsageVisible)
+                if (_usageShown && UsageVisible && ResetSinceLastRead())
                 {
                     _ = ReadUsageAsync(fresh: false);
                 }
@@ -1207,6 +1238,15 @@ public sealed class Form1 : Form
                 _usageHost.NoteIgnored();
                 break;
         }
+    }
+
+    // a meter reset after its provider's last read. not the snapshot time: every refresh stamps
+    // a new one even when each provider came from cache, so stale could force a read every minute
+    private bool ResetSinceLastRead()
+    {
+        var now = DateTimeOffset.UtcNow;
+        return _usage.Last?.Providers.Any(provider => provider.Meters.Any(
+            meter => meter.ResetsAt <= now && meter.ResetsAt > provider.UpdatedAt)) == true;
     }
 
     // the page names an action and C# owns the url, so the page never supplies one
@@ -1238,18 +1278,28 @@ public sealed class Form1 : Form
     {
         try
         {
-            var path = TaskPaths.Resolve(_settings.TasksFile, _repos, out var fallback);
-            if (_taskStore is not null && string.Equals(_taskStore.Path, path, StringComparison.OrdinalIgnoreCase))
+            var path = TaskPaths.Resolve(_settings.TasksFile, _repos, out var source);
+            var moved = _taskStore is null || !string.Equals(_taskStore.Path, path, StringComparison.OrdinalIgnoreCase);
+
+            // the source can change alone: ~\Tools\persistent-memory scanned, then its root removed
+            if (!moved && source == _tasksSource)
             {
                 return;
             }
 
-            _taskStore = new TaskStore(path);
-            _tasksFallback = fallback;
-            _lastTasksError = null;
-            AppendLog(fallback
-                ? $"tasks: persistent-memory not found; saving to {path}, which will not follow you to other machines"
-                : $"tasks: {path}");
+            if (moved)
+            {
+                _taskStore = new TaskStore(path);
+                _lastTasksError = null;
+            }
+
+            _tasksSource = source;
+            AppendLog(source switch
+            {
+                TaskPathSource.LocalFallback => $"tasks: persistent-memory not found; saving to {path}, which will not follow you to other machines",
+                TaskPathSource.DefaultClone => $"tasks: {path}; persistent-memory is not among the scanned repositories, so it will not sync until its folder is added to the scan roots",
+                _ => $"tasks: {path}",
+            });
         }
         catch (Exception ex)
         {
@@ -1314,7 +1364,7 @@ public sealed class Form1 : Form
 
         var result = task is null
             ? new TaskStoreResult(false, false, $"The page sent a task this app could not read: {unreadable}", new TaskDocument())
-            : await RunStoreAsync(() => store.Upsert(task, DateTimeOffset.UtcNow));
+            : await RunStoreResultAsync(() => store.Upsert(task, DateTimeOffset.UtcNow));
         ReportTaskMutation(id, result);
         await PostTasksStateAsync();
     }
@@ -1337,7 +1387,7 @@ public sealed class Form1 : Form
             return;
         }
 
-        ReportTaskMutation(id, await RunStoreAsync(() => store.Delete(id, rev)));
+        ReportTaskMutation(id, await RunStoreResultAsync(() => store.Delete(id, rev)));
         await PostTasksStateAsync();
     }
 
@@ -1371,7 +1421,7 @@ public sealed class Form1 : Form
             return;
         }
 
-        var result = await RunStoreAsync(store.Load);
+        var result = await RunStoreResultAsync(store.Load);
         if (store != _taskStore)
         {
             // a rescan moved the file meanwhile; its own reload follows
@@ -1395,24 +1445,50 @@ public sealed class Form1 : Form
             type = "state",
             today = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
             file = store.Path,
-            fallback = _tasksFallback,
+            fallback = _tasksSource == TaskPathSource.LocalFallback,
+            unsynced = _tasksSource == TaskPathSource.DefaultClone,
             repos = _repos.Select(repo => repo.Name).Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToList(),
             tasks = result.Ok ? result.Document.Tasks : new List<TaskItem>(),
             error,
         }, TaskStore.JsonOptions);
     }
 
-    // store calls are synchronous file i/o, kept off the ui thread
-    private static async Task<TaskStoreResult> RunStoreAsync(Func<TaskStoreResult> call)
+    // store calls are synchronous file i/o: off the ui thread, one at a time, in arrival order.
+    // the caller sees op's exception; the tail ignores it so the chain never faults
+    private Task<T> RunStoreAsync<T>(Func<T> op)
+    {
+        var next = _taskStoreChain.ContinueWith(_ => op(), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+        _taskStoreChain = next.ContinueWith(_ => { }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return next;
+    }
+
+    // an exception comes back as an error result, which every caller already reports
+    private async Task<TaskStoreResult> RunStoreResultAsync(Func<TaskStoreResult> call)
     {
         try
         {
-            return await Task.Run(call);
+            return await RunStoreAsync(call);
         }
         catch (Exception ex)
         {
             return new TaskStoreResult(false, false, ex.Message, new TaskDocument());
         }
+    }
+
+    // after SetBusy(true) closes admission: waits out a save already accepted, so git can't stage or reset under it.
+    // false means the save is still running after 10 s; the caller must abort rather than run git under it
+    // (sol review round 2, 2026-10-17). store calls are bounded by the 3 s lock retry plus one small file write,
+    // so a 10 s wait only ever hits when storage itself is stuck
+    private async Task<bool> DrainTaskWritesAsync()
+    {
+        var chain = _taskStoreChain;
+        if (await Task.WhenAny(chain, Task.Delay(10_000)) == chain)
+        {
+            return true;
+        }
+
+        AppendLog("tasks: a save was still running 10 s after a workflow started; the workflow was not run");
+        return false;
     }
 
     // ---- shared ui plumbing -----------------------------------------------

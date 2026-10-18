@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -34,12 +37,20 @@ public sealed class TaskItem
     public DateTimeOffset Created { get; set; }
     public DateTimeOffset Updated { get; set; }
     public DateTimeOffset? Completed { get; set; }
+
+    // fields this app doesn't know, kept from the file; the page's copy is never used
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Extra { get; set; }
 }
 
 public sealed class TaskDocument
 {
     public int Version { get; set; } = 1;
     public List<TaskItem> Tasks { get; set; } = [];
+
+    // top-level fields this app doesn't know, written back unchanged
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? Extra { get; set; }
 }
 
 /// <summary>
@@ -49,7 +60,7 @@ public sealed class TaskDocument
 public sealed record TaskStoreResult(bool Ok, bool Rejected, string? Message, TaskDocument Document);
 
 /// <summary>
-/// reads and writes the tasks json file. synchronous - Form1 calls it through Task.Run.
+/// reads and writes the tasks json file. synchronous - Form1 calls it off the ui thread, one call at a time.
 /// every write reloads the file first and checks the task's rev, so a stale page can't overwrite newer work
 /// </summary>
 public sealed class TaskStore
@@ -57,15 +68,28 @@ public sealed class TaskStore
     // spec 2.4
     private const string StaleMessage = "This task changed on disk. Your edit was not saved; reopen it to see the current version.";
 
+    private const int LockWaitMilliseconds = 3000;
+    private const int LockRetryMilliseconds = 50;
+
     private readonly object _gate = new();
     private FileStamp? _seen;
 
     public TaskStore(string path)
     {
         Path = path;
+
+        // one lock per file, whatever case the path is typed in
+        var full = System.IO.Path.GetFullPath(path).ToLowerInvariant();
+        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(full)), 0, 8).ToLowerInvariant();
+        LockPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"InOutButton-{hash}.lock");
     }
 
     public string Path { get; }
+
+    /// <summary>
+    /// held for each whole read-check-write, so a second app instance can't pass the same rev check
+    /// </summary>
+    public string LockPath { get; }
 
     // shared with Form1 so the page gets the same shape as the file
     public static JsonSerializerOptions JsonOptions { get; } = new()
@@ -88,10 +112,7 @@ public sealed class TaskStore
     /// </summary>
     public TaskStoreResult Load()
     {
-        lock (_gate)
-        {
-            return Read();
-        }
+        return Exclusive(Read);
     }
 
     /// <summary>
@@ -100,7 +121,7 @@ public sealed class TaskStore
     /// </summary>
     public TaskStoreResult Upsert(TaskItem incoming, DateTimeOffset now)
     {
-        lock (_gate)
+        return Exclusive(() =>
         {
             // always reload - the file is small and its last-write time doesn't catch every change
             var loaded = Read();
@@ -119,6 +140,7 @@ public sealed class TaskStore
                 stored.Rev = 1;
                 stored.Created = now;
                 stored.Completed = stored.Progress == TaskProgress.Complete ? now : null;
+                stored.Extra = null;
                 tasks.Add(stored);
             }
             else if (onDisk is not null && incoming.Rev == onDisk.Rev)
@@ -126,6 +148,7 @@ public sealed class TaskStore
                 stored.Id = onDisk.Id;
                 stored.Rev = onDisk.Rev + 1;
                 stored.Created = onDisk.Created;
+                stored.Extra = onDisk.Extra;
                 stored.Completed = stored.Progress != TaskProgress.Complete ? null
                     : onDisk.Progress == TaskProgress.Complete ? onDisk.Completed ?? now
                     : now;
@@ -138,8 +161,8 @@ public sealed class TaskStore
             }
 
             stored.Updated = now;
-            return Write(new TaskDocument { Tasks = tasks }, loaded.Document);
-        }
+            return Write(new TaskDocument { Tasks = tasks, Extra = loaded.Document.Extra }, loaded.Document);
+        });
     }
 
     /// <summary>
@@ -148,7 +171,7 @@ public sealed class TaskStore
     /// </summary>
     public TaskStoreResult Delete(string id, int rev)
     {
-        lock (_gate)
+        return Exclusive(() =>
         {
             var loaded = Read();
             if (!loaded.Ok)
@@ -163,8 +186,8 @@ public sealed class TaskStore
             }
 
             var tasks = loaded.Document.Tasks.Where(task => !ReferenceEquals(task, onDisk)).ToList();
-            return Write(new TaskDocument { Tasks = tasks }, loaded.Document);
-        }
+            return Write(new TaskDocument { Tasks = tasks, Extra = loaded.Document.Extra }, loaded.Document);
+        });
     }
 
     /// <summary>
@@ -176,6 +199,50 @@ public sealed class TaskStore
         lock (_gate)
         {
             return _seen is null || Stamp() != _seen;
+        }
+    }
+
+    // _gate for this instance, the lock file for other processes
+    private TaskStoreResult Exclusive(Func<TaskStoreResult> operation)
+    {
+        lock (_gate)
+        {
+            var held = OpenLockFile();
+            if (held is null)
+            {
+                return Failure($"{FileName} is in use by another process; try again in a moment.");
+            }
+
+            try
+            {
+                return operation();
+            }
+            finally
+            {
+                held.Dispose();
+            }
+        }
+    }
+
+    // null after LockWaitMilliseconds of sharing violations
+    private FileStream? OpenLockFile()
+    {
+        var clock = Stopwatch.StartNew();
+        while (true)
+        {
+            try
+            {
+                return new FileStream(LockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (clock.ElapsedMilliseconds >= LockWaitMilliseconds)
+                {
+                    return null;
+                }
+
+                Thread.Sleep(LockRetryMilliseconds);
+            }
         }
     }
 
@@ -301,7 +368,7 @@ public sealed class TaskStore
         }
     }
 
-    // the page's fields only; the caller sets Id, Rev and the timestamps
+    // the page's fields only; the caller sets Id, Rev, the timestamps and Extra
     private static TaskItem CopyEditable(TaskItem incoming) => new()
     {
         Title = incoming.Title ?? "",
@@ -347,29 +414,36 @@ public sealed class TaskStore
     }
 }
 
+/// <summary>
+/// where the tasks file came from. sign-in and sign-out sync only scanned repos, so a DefaultClone
+/// file never syncs and a LocalFallback file never leaves this machine
+/// </summary>
+public enum TaskPathSource { Override, ScannedRepo, DefaultClone, LocalFallback }
+
 public static class TaskPaths
 {
     /// <summary>
-    /// the override when set, else persistent-memory's tasks\tasks.json. with no persistent-memory
-    /// folder on this machine, %APPDATA%\InOutButton\tasks.json and fallback = true
+    /// the override when set, else persistent-memory's tasks\tasks.json - the scanned clone, else
+    /// ~\Tools\persistent-memory. with neither on this machine, %APPDATA%\InOutButton\tasks.json
     /// </summary>
-    public static string Resolve(string? tasksFileOverride, IEnumerable<RepoRow> repos, out bool fallback)
+    public static string Resolve(string? tasksFileOverride, IEnumerable<RepoRow> repos, out TaskPathSource source)
     {
-        fallback = false;
         if (!string.IsNullOrWhiteSpace(tasksFileOverride))
         {
+            source = TaskPathSource.Override;
             return tasksFileOverride.Trim();
         }
 
         // same lookup as Form1.RunMachineSyncAsync
-        var clone = repos.FirstOrDefault(repo => string.Equals(repo.Name, "persistent-memory", StringComparison.OrdinalIgnoreCase))?.Path
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Tools", "persistent-memory");
+        var scanned = repos.FirstOrDefault(repo => string.Equals(repo.Name, "persistent-memory", StringComparison.OrdinalIgnoreCase))?.Path;
+        var clone = scanned ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Tools", "persistent-memory");
         if (Directory.Exists(clone))
         {
+            source = scanned is null ? TaskPathSource.DefaultClone : TaskPathSource.ScannedRepo;
             return Path.Combine(clone, "tasks", "tasks.json");
         }
 
-        fallback = true;
+        source = TaskPathSource.LocalFallback;
         return Path.Combine(SettingsStore.SettingsDirectory, "tasks.json");
     }
 }

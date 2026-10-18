@@ -140,7 +140,10 @@ request; its fixture is copied to this repo as
   `<shim dir>\node_modules\@openai\codex\node_modules\@openai\codex-win32-x64\
   vendor\x86_64-pc-windows-msvc\bin\codex.exe`; else `node` with
   `<shim dir>\node_modules\@openai\codex\bin\codex.js`. Nothing found means
-  "Codex CLI not found on PATH".
+  "Codex CLI not found on PATH". Discovery runs inside the whole-call cap and
+  honours cancellation ("Codex discovery timed out" when the cap fires there);
+  a successful `where.exe` find is kept for the session, a miss is not, and the
+  override is checked on every read (Opus review, round 1).
 - Protocol: start `<exe> app-server` with stdin, stdout, and stderr all
   redirected, no shell, UTF-8, through a dedicated `JsonLineProcess` driver
   (not `ProcessRunner`, which has no stdin and merges stderr into stdout).
@@ -196,7 +199,10 @@ is not implemented yet." Follow-up, not in this cut: parse `agy -p /usage`.
   skipped, cooldowns kept). When a meter's `resetsAt` passes, the page shows
   "reset at 7:00 PM · waiting for refresh" and posts `{type:"stale"}` once
   per meter per snapshot; Form1 treats `stale` as a normal read subject to the
-  visibility gate and the cache.
+  visibility gate and the cache, and only when some meter's `resetsAt` has
+  passed and is later than its provider's `updatedAt`. Every refresh stamps a
+  new snapshot even when each provider came from cache, so without that check
+  a stale page could force a read every minute (Opus review, round 1).
 - "Last read" is the completion time of the last `RefreshAsync`, success or
   failure, so a failing provider cannot cause a tight loop.
 - None of this touches `SetBusy`.
@@ -255,7 +261,10 @@ and log once. The `tasks\` folder is created on first save.
 
 - `bucket`: projects | admin | misc. `progress`: notStarted | inProgress |
   complete. `priority`: normal | important | urgent. `due` is a date with no
-  time, local. `repo` is a repo name from the scan or free text. Nulls are
+  time, local. `repo` is a repo name from the scan or free text. Fields the app
+  does not know, on the document or on a task, are kept from the file and
+  written back unchanged; a task's come from the file, never from the page
+  (Opus review, round 1). Nulls are
   omitted on write; `id` is 16 hex characters from a GUID.
 - Serialization: `System.Text.Json`, camelCase, enums as strings, indented,
   tasks ordered by `created` then `id`, so git diffs stay small.
@@ -278,8 +287,16 @@ and log once. The `tasks\` folder is created on first save.
   overwrite. A failed write (access denied, disk full) leaves the previous
   file intact, is reported to the page with the scrubbed exception message,
   and keeps the draft.
-- All store I/O runs on a worker thread (`Task.Run`); results are marshalled
-  back by the usual `await` on the UI thread.
+- All store I/O runs on a worker thread through one serial chain in Form1
+  (`RunStoreAsync`), and every workflow entry point awaits
+  `DrainTaskWritesAsync` right after `SetBusy(true)`, so git never runs while
+  an accepted save is still flushing (Sol review, round 1, finding 2).
+- A cross-process lock file in `%TEMP%` (named from a hash of the tasks file's
+  full path, `TaskStore.LockPath`) is held for the whole read-check-write of
+  `Load`, `Upsert`, and `Delete`, retried for 3 s, so two app instances on one
+  machine cannot both pass the revision check and overwrite each other (Sol
+  review, round 1, finding 3). A locked file returns an error result with a
+  fixed message; nothing is written.
 - Git coordination: while any workflow is busy (`SetBusy(true)`), the page is
   told `{type:"busy", busy:true}`, disables editing, and shows "Syncing
   repositories…"; a mutation that arrives anyway is rejected with a state
@@ -297,11 +314,18 @@ and log once. The `tasks\` folder is created on first save.
   `%APPDATA%` is shown as a persistent banner in the page ("Saving to a local
   file because persistent-memory was not found; these tasks will not follow
   you to other machines"), not only as a log line.
+- `TaskPaths.Resolve` reports a `TaskPathSource`: `Override`, `ScannedRepo`,
+  `DefaultClone`, or `LocalFallback`. `DefaultClone` means no scanned repo is
+  named persistent-memory and `~\Tools\persistent-memory` was used; sign-in
+  and sign-out touch only scanned repos, so that file never syncs, and the
+  page shows a second persistent banner: "persistent-memory is not among the
+  scanned repositories, so these tasks will not sync until its folder is
+  added to the scan roots." (Opus review, round 1.)
 
 ### 2.5 Page contract: tasks
 
 C# to page: `{type:"state", today:"2026-10-17", file:"persistent-memory\\tasks\\tasks.json",
-fallback:false, repos:["in_out_button", ...], tasks:[...], error:null}`. Sent
+fallback:false, unsynced:false, repos:["in_out_button", ...], tasks:[...], error:null}`. Sent
 on ready, after every mutation (accepted or rejected), when the tab is shown
 and the file changed on disk, and whenever a workflow ends. A rejected
 mutation also carries `{type:"rejected", id, message}` so the page can keep
@@ -319,6 +343,13 @@ in-page confirmation. Enter in the lane's "+ Add task" box adds a notStarted
 task with that title and the lane's bucket. Drag a card onto a lane to change
 its bucket. The header's right side shows the file path in subtle text.
 
+While a card's save is in flight, its progress glyph, its drag, and the
+dialog's Save are disabled and dimmed, so two quick clicks cannot send two
+upserts on one `rev` and have the second refused as changed on disk. The lock
+lifts when a `state` carries that task at a higher `rev` than the one sent or
+no longer carries it, when a `rejected` for that id arrives, or on
+`busy:true` (Opus review, round 1).
+
 ### 2.6 Settings
 
 ```csharp
@@ -335,10 +366,18 @@ No new controls. These are edited in `settings.json` by hand.
 outside the app before it reaches a `ProviderUsage.Message`, a page, or the
 log: Codex error text, exception messages, HTTP reason phrases. It replaces
 with `[redacted]` any match of `Bearer\s+\S+`, `sk-[A-Za-z0-9_-]{8,}`, a JWT
-shape `eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`, a query string `\?\S+`, and
-`(?i)\b(token|key|secret|password|authorization)\b\s*[=:]\s*\S+`; collapses
-whitespace; and truncates to 200 characters with "…". Tested with injected
-synthetic secrets (section 3).
+shape `eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}`, a query string `\?\S+`, a
+key-value pair whose key ends in token, key, secret, password,
+authorization, cookie, or session after a prefix of up to 40 word characters
+or hyphens (so `access_token`, `client_secret`, and `x-api-key` match), with
+or without quotes around the key and the value (Sol review, round 1, finding
+1), the value taking an optional scheme word first so `Authorization: Basic
+<base64>` loses the credential (round 2); the prefix is capped because an
+unbounded one took 30 s on 20 KB of `a-a-a-`; and, as a last net, any
+run of 24 or more characters from `[A-Za-z0-9_-]` (opaque tokens look like
+that; a GUID or a long file name in an exception message is redacted too,
+which is accepted); collapses whitespace; and truncates to 200 characters
+with "…". Tested with injected synthetic secrets (section 3).
 
 ### 2.10 Public surface the builders code against
 

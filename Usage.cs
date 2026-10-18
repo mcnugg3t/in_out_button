@@ -48,7 +48,7 @@ public static partial class Scrub
     private const int MaxLength = 200;
     private const string Redacted = "[redacted]";
 
-    private static readonly Regex[] Secrets = [Bearer(), SkKey(), Jwt(), QueryString(), KeyValue()];
+    private static readonly Regex[] Secrets = [Bearer(), SkKey(), Jwt(), QueryString(), KeyValue(), Opaque()];
 
     public static string Message(string? text)
     {
@@ -92,8 +92,15 @@ public static partial class Scrub
     [GeneratedRegex(@"\?\S+")]
     private static partial Regex QueryString();
 
-    [GeneratedRegex(@"(?i)\b(token|key|secret|password|authorization)\b\s*[=:]\s*\S+")]
+    // quotes optional around the key and the value, so json's "token":"..." is caught too.
+    // the prefix covers client_secret and x-api-key, capped at 40 - unbounded it took 30 s on
+    // 20 KB of a-a-a- (2026-10-17). the optional word takes Basic's scheme, whose + / = break the opaque run
+    [GeneratedRegex(@"(?i)[""']?\b([\w-]{0,40}(?:token|key|secret|password|authorization|cookie|session))\b[""']?\s*[=:]\s*[""']?(?:\w+\s+)?[^\s""',}]+")]
     private static partial Regex KeyValue();
+
+    // safety net for opaque tokens, 24+ of these in a row - also catches a guid or a long file name
+    [GeneratedRegex(@"[A-Za-z0-9_\-]{24,}")]
+    private static partial Regex Opaque();
 
     [GeneratedRegex(@"\s+")]
     private static partial Regex Whitespace();
@@ -504,6 +511,10 @@ public static class CodexUsage
     private const string ExitedEarly = "Codex app-server exited early";
     private const string UnexpectedOutput = "Codex app-server sent unexpected output";
     private const string CouldNotStart = "Codex app-server could not be started";
+    private const string DiscoveryTimedOut = "Codex discovery timed out";
+
+    // the where.exe find, kept for the session. a miss isn't kept, so a later install is picked up
+    private static CodexLaunch? _discovered;
 
     private static readonly string InitializeRequest = JsonSerializer.Serialize(new
     {
@@ -516,7 +527,8 @@ public static class CodexUsage
     private const string RateLimitsRequest = """{"id":2,"method":"account/rateLimits/read","params":{"excludeResetCreditDetails":true}}""";
 
     /// <summary>
-    /// override first, then the npm install found by where.exe: its native exe, else node with codex.js
+    /// override first, checked on every call, then the npm install found by where.exe: its native
+    /// exe, else node with codex.js. cancelling ct abandons the where.exe wait
     /// </summary>
     public static async Task<CodexLaunch?> FindAsync(string? overridePath, CancellationToken ct)
     {
@@ -525,9 +537,25 @@ public static class CodexUsage
             return new CodexLaunch(overridePath, []);
         }
 
+        if (Volatile.Read(ref _discovered) is { } known)
+        {
+            return known;
+        }
+
         ct.ThrowIfCancellationRequested();
-        var (exitCode, output) = await ProcessRunner.CaptureAsync("where.exe", AppContext.BaseDirectory, 10, "codex").ConfigureAwait(false);
-        var first = exitCode == 0
+        var (exitCode, output) = await ProcessRunner.CaptureAsync("where.exe", AppContext.BaseDirectory, 10, "codex").WaitAsync(ct).ConfigureAwait(false);
+        var found = FromWhere(exitCode == 0 ? output : null);
+        if (found is not null)
+        {
+            Volatile.Write(ref _discovered, found);
+        }
+
+        return found;
+    }
+
+    private static CodexLaunch? FromWhere(string? output)
+    {
+        var first = output is not null
             ? ProcessRunner.SplitLines(output).FirstOrDefault(line => Path.IsPathRooted(line) && File.Exists(line))
             : null;
         if (first is null)
@@ -638,19 +666,17 @@ public static class CodexUsage
     public static async Task<ProviderUsage> ReadAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct)
         => (await ReadOutcomeAsync(launch, cap, ct).ConfigureAwait(false)).Usage;
 
-    internal static async Task<ReaderOutcome> ReadOutcomeAsync(string? overridePath, CancellationToken ct)
-    {
-        var launch = await FindAsync(overridePath, ct).ConfigureAwait(false);
-        return launch is null
-            ? new ReaderOutcome(ProviderUsage.Unavailable(Provider, null, NotFound, DateTimeOffset.UtcNow))
-            : await ReadOutcomeAsync(launch, DefaultCap, ct).ConfigureAwait(false);
-    }
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(string? overridePath, CancellationToken ct)
+        => ReadCoreAsync(overridePath, null, DefaultCap, ct);
+
+    internal static Task<ReaderOutcome> ReadOutcomeAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct)
+        => ReadCoreAsync(null, launch, cap, ct);
 
     /// <summary>
-    /// one cap covers every read and write; every exit path ends in the same finally,
-    /// which kills the tree. cancelling ct throws; the cap returns "timed out"
+    /// one cap covers discovery (when launch is null) and every read and write; every exit path
+    /// ends in the same finally, which kills the tree. cancelling ct throws; the cap returns "timed out"
     /// </summary>
-    internal static async Task<ReaderOutcome> ReadOutcomeAsync(CodexLaunch launch, TimeSpan cap, CancellationToken ct)
+    private static async Task<ReaderOutcome> ReadCoreAsync(string? overridePath, CodexLaunch? launch, TimeSpan cap, CancellationToken ct)
     {
         using var capSource = CancellationTokenSource.CreateLinkedTokenSource(ct);
         capSource.CancelAfter(cap);
@@ -668,6 +694,24 @@ public static class CodexUsage
 
         try
         {
+            if (launch is null)
+            {
+                try
+                {
+                    launch = await FindAsync(overridePath, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    return Failed(DiscoveryTimedOut);
+                }
+
+                if (launch is null)
+                {
+                    return Failed(NotFound);
+                }
+            }
+
+            token.ThrowIfCancellationRequested();
             process = JsonLineProcess.Start(launch.FileName, [.. launch.LeadingArgs, "app-server"]);
             await process.WriteLineAsync(InitializeRequest, token).ConfigureAwait(false);
             var init = await process.ReadReplyAsync(1, token).ConfigureAwait(false);
@@ -716,6 +760,8 @@ public static class CodexUsage
         }
         catch (Win32Exception)
         {
+            // a cached find that no longer starts is found again next read
+            Interlocked.CompareExchange(ref _discovered, null, launch);
             return Failed(CouldNotStart);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

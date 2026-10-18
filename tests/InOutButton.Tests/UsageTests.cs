@@ -246,6 +246,14 @@ public class UsageTests
     [InlineData("GET https://example.com/oauth?code=SYNTH123&state=xyz failed", "SYNTH123")]
     [InlineData("config token=SYNTHsecret99 rejected", "SYNTHsecret99")]
     [InlineData("password: hunter2SYNTH was wrong", "hunter2SYNTH")]
+    [InlineData("""codex said {"token":"SYNTHETIC_OPAQUE_0123456789"}""", "SYNTHETIC_OPAQUE_0123456789")]
+    [InlineData("""reply {"api_key":"SYNTH42xyz"} refused""", "SYNTH42xyz")]
+    [InlineData("config {'secret': 'abcSYNTH42'} rejected", "abcSYNTH42")]
+    [InlineData("opaque Zq7xK2mP9vR4tY8wB3nL6cH1sD5fG0jA in the text", "Zq7xK2mP9vR4tY8wB3nL6cH1sD5fG0jA")]
+    [InlineData("request failed: Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz")]
+    [InlineData("oauth client_secret=abc123 refused", "abc123")]
+    [InlineData("header x-api-key: SYNTHkey77 rejected", "SYNTHkey77")]
+    [InlineData("sent cookie: session=xyz789 to the server", "xyz789")]
     public void ScrubRedactsSecrets(string text, string secret)
     {
         var clean = Scrub.Message(text);
@@ -254,14 +262,31 @@ public class UsageTests
         Assert.Contains("[redacted]", clean);
     }
 
+    // an unbounded key prefix backtracks quadratically on hyphenated runs: 30 s for this 20 KB (2026-10-17)
+    [Fact]
+    public void ScrubStaysFastOnALongHyphenatedRun()
+    {
+        var text = string.Concat(Enumerable.Repeat("a-", 10_000));
+        var clock = Stopwatch.StartNew();
+
+        Scrub.Message(text);
+
+        clock.Stop();
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(2), $"took {clock.Elapsed.TotalSeconds:0.0} s");
+    }
+
     [Fact]
     public void ScrubPassesPlainTextAndCapsLength()
     {
         Assert.Equal("Codex app-server exited early", Scrub.Message("Codex app-server exited early"));
         Assert.Equal("two lines here", Scrub.Message("two\r\n lines \t here"));
         Assert.Equal("", Scrub.Message(null));
+        Assert.Equal("Codex CLI not found on PATH", Scrub.Message("Codex CLI not found on PATH"));
+        Assert.Equal(@"C:\Users\caleb\Tools\persistent-memory\tasks\tasks.json",
+            Scrub.Message(@"C:\Users\caleb\Tools\persistent-memory\tasks\tasks.json"));
 
-        var cut = Scrub.Message(new string('x', 1000));
+        // words, not one long run, which the opaque-token rule would redact
+        var cut = Scrub.Message(string.Concat(Enumerable.Repeat("word ", 200)));
         Assert.Equal(200, cut.Length);
         Assert.EndsWith("…", cut);
     }
@@ -333,6 +358,41 @@ public class UsageTests
         var meter = Assert.Single(outcome.Usage.Meters);
         Assert.Equal("Weekly", meter.Name);
         Assert.Equal(6.0, meter.UsedPercent);
+    }
+
+    // the where.exe find is kept for the session; it must never shadow an override
+    [Fact]
+    public async Task CodexFindChecksTheOverrideOnEveryCall()
+    {
+        var folder = Path.Combine(Path.GetTempPath(), "InOutButton.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var first = Path.Combine(folder, "codex-a.exe");
+            var second = Path.Combine(folder, "codex-b.exe");
+            File.WriteAllText(first, "");
+            File.WriteAllText(second, "");
+
+            // fills the cache when codex is installed here
+            await CodexUsage.FindAsync(null, CancellationToken.None);
+
+            Assert.Equal(first, (await CodexUsage.FindAsync(first, CancellationToken.None))?.FileName);
+            Assert.Equal(second, (await CodexUsage.FindAsync(second, CancellationToken.None))?.FileName);
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
+    }
+
+    // cached find or not, a cancelled read throws instead of reporting
+    [Fact]
+    public async Task CodexReadWithACancelledTokenThrows()
+    {
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => CodexUsage.ReadOutcomeAsync((string?)null, cancelled.Token));
     }
 
     [Fact]

@@ -16,6 +16,9 @@ public sealed class TaskStoreTests : IDisposable
 
     public void Dispose()
     {
+        // every store call leaves its lock file in %TEMP%
+        File.Delete(new TaskStore(FilePath).LockPath);
+
         if (!Directory.Exists(_folder))
         {
             return;
@@ -263,6 +266,87 @@ public sealed class TaskStoreTests : IDisposable
         Assert.False(store.ChangedSinceLoad());
     }
 
+    // a second app instance holding the lock file, played by this test
+    [Fact]
+    public void Upsert_WhileAnotherProcessHoldsTheLock_FailsAndLeavesTheFile_ThenSucceeds()
+    {
+        var store = new TaskStore(FilePath);
+        Assert.True(store.Upsert(new TaskItem { Title = "A" }, T0).Ok);
+        var before = File.ReadAllBytes(FilePath);
+        var task = new TaskItem { Title = "B", Bucket = TaskBucket.Admin };
+
+        using (new FileStream(store.LockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var blocked = store.Upsert(task, T0.AddHours(1));
+            clock.Stop();
+
+            Assert.False(blocked.Ok);
+            Assert.False(blocked.Rejected);
+            Assert.Contains("in use by another process", blocked.Message);
+            Assert.True(clock.Elapsed < TimeSpan.FromSeconds(5), $"took {clock.Elapsed.TotalSeconds:0.0} s");
+            Assert.Equal(before, File.ReadAllBytes(FilePath));
+        }
+
+        var released = store.Upsert(task, T0.AddHours(1));
+        Assert.True(released.Ok, released.Message);
+        Assert.Equal(new[] { "A", "B" }, new TaskStore(FilePath).Load().Document.Tasks.Select(t => t.Title));
+    }
+
+    // a file written by a newer app or by hand: no field this app doesn't know may be lost
+    [Fact]
+    public void Upsert_KeepsUnknownFields_OnTheDocumentAndOnEachTask()
+    {
+        Directory.CreateDirectory(TasksFolder);
+        File.WriteAllText(FilePath, """
+            {
+              "version": 1,
+              "owner": "caleb",
+              "tasks": [
+                {
+                  "id": "aaaaaaaaaaaaaaaa",
+                  "rev": 1,
+                  "title": "Has extras",
+                  "bucket": "projects",
+                  "progress": "notStarted",
+                  "priority": "normal",
+                  "checklist": [],
+                  "created": "2026-10-16T08:00:00Z",
+                  "updated": "2026-10-16T08:00:00Z",
+                  "link": "https://example.com/issue/7",
+                  "tags": ["soil", "gam"]
+                }
+              ]
+            }
+            """);
+        var store = new TaskStore(FilePath);
+
+        Assert.True(store.Upsert(new TaskItem { Title = "Another task", Bucket = TaskBucket.Admin }, T0).Ok);
+        AssertExtrasSurvive();
+
+        // the page's copy carries no extras; the file's must survive the edit
+        var edited = store.Upsert(new TaskItem { Id = "aaaaaaaaaaaaaaaa", Rev = 1, Title = "Has extras, edited" }, T0.AddMinutes(1));
+        Assert.True(edited.Ok, edited.Message);
+        var task = AssertExtrasSurvive();
+        Assert.Equal("Has extras, edited", task.GetProperty("title").GetString());
+        Assert.Equal(2, task.GetProperty("rev").GetInt32());
+
+        System.Text.Json.JsonElement AssertExtrasSurvive()
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(FilePath));
+            var root = json.RootElement;
+            Assert.Equal("caleb", root.GetProperty("owner").GetString());
+            var tasks = root.GetProperty("tasks").EnumerateArray().ToList();
+            Assert.Equal(2, tasks.Count);
+            var first = tasks.Single(t => t.GetProperty("id").GetString() == "aaaaaaaaaaaaaaaa");
+            Assert.Equal("https://example.com/issue/7", first.GetProperty("link").GetString());
+            Assert.Equal(["soil", "gam"], first.GetProperty("tags").EnumerateArray().Select(tag => tag.GetString()));
+            var other = tasks.Single(t => t.GetProperty("id").GetString() != "aaaaaaaaaaaaaaaa");
+            Assert.False(other.TryGetProperty("link", out _));
+            return first.Clone();
+        }
+    }
+
     [Fact]
     public void Resolve_PrefersTheOverride_ThenTheScannedPersistentMemoryClone()
     {
@@ -271,8 +355,29 @@ public sealed class TaskStoreTests : IDisposable
         var repos = new[] { new RepoRow(Path.Combine(_folder, "other")), new RepoRow(clone) };
 
         Assert.Equal(@"D:\elsewhere\tasks.json", TaskPaths.Resolve(@"D:\elsewhere\tasks.json", repos, out var overridden));
-        Assert.False(overridden);
-        Assert.Equal(Path.Combine(clone, "tasks", "tasks.json"), TaskPaths.Resolve(null, repos, out var fallback));
-        Assert.False(fallback);
+        Assert.Equal(TaskPathSource.Override, overridden);
+        Assert.Equal(Path.Combine(clone, "tasks", "tasks.json"), TaskPaths.Resolve(null, repos, out var scanned));
+        Assert.Equal(TaskPathSource.ScannedRepo, scanned);
+    }
+
+    // the clone sign-in and sign-out never touch, so the page warns that it won't sync
+    [Fact]
+    public void Resolve_WithNoScannedClone_UsesTheDefaultClone_AsDefaultClone()
+    {
+        var clone = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Tools", "persistent-memory");
+
+        var path = TaskPaths.Resolve(null, [], out var source);
+
+        // the machine decides which branch is reachable; both outcomes are asserted exactly (sol review round 2)
+        if (Directory.Exists(clone))
+        {
+            Assert.Equal(TaskPathSource.DefaultClone, source);
+            Assert.Equal(Path.Combine(clone, "tasks", "tasks.json"), path);
+        }
+        else
+        {
+            Assert.Equal(TaskPathSource.LocalFallback, source);
+            Assert.Equal(Path.Combine(SettingsStore.SettingsDirectory, "tasks.json"), path);
+        }
     }
 }

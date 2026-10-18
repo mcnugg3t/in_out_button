@@ -52,7 +52,9 @@ textarea.ctl { height: auto; padding: 5px 8px; line-height: 17px; resize: vertic
 body.busy .task { cursor: default; }
 .glyph { width: 16px; height: 16px; margin-top: 1px; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
 .glyph svg { display: block; width: 16px; height: 16px; }
-.glyph:disabled { cursor: default; }
+.glyph:disabled, .glyph[aria-disabled="true"] { cursor: default; }
+.task.saving { cursor: default; }
+.task.saving .glyph { opacity: 0.45; }
 .g-idle { fill: none; stroke: var(--glyph-idle); stroke-width: 1.5; }
 .g-ring { fill: none; stroke: var(--accent); stroke-width: 1.5; }
 .g-half { fill: var(--accent); }
@@ -122,6 +124,9 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
 <main class="b-body">
   <div class="banner warn" id="fallback" role="status" hidden>
     <span class="txt">Saving to a local file because persistent-memory was not found; these tasks will not follow you to other machines</span>
+  </div>
+  <div class="banner warn" id="unsynced" role="status" hidden>
+    <span class="txt">persistent-memory is not among the scanned repositories, so these tasks will not sync until its folder is added to the scan roots.</span>
   </div>
   <div class="banner fail" id="banner" role="alert" hidden>
     <span class="txt" id="banner-text"></span>
@@ -215,12 +220,16 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
 
   // page state; C# owns the tasks, the page owns only view state and the open draft
   const S = {
-    loaded: false, today: '', file: '', fallback: false, repos: [], tasks: [], error: null,
-    busy: false, filter: 'all', q: '', openDone: {}, adding: null, addText: '', banner: null
+    loaded: false, today: '', file: '', fallback: false, unsynced: false, repos: [], tasks: [], error: null,
+    busy: false, filter: 'all', q: '', openDone: {}, adding: null, addText: '', banner: null,
+    pendingAdd: null
   };
   let D = null;
   let dragId = null;
   let rendering = false;
+  // id -> rev sent, while that save is in flight. a second save on the same rev would be refused
+  // as changed on disk; cleared by a newer rev in state, a rejected for the id, or busy
+  const saving = new Map();
 
   // dom helpers; every data string goes through textContent or a property
   function el(tag, cls, text) {
@@ -306,25 +315,44 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
     Bridge.send(msg);
     return true;
   }
-  const upsert = task => send({ type: 'upsert', task });
+  function upsert(task) {
+    if (!send({ type: 'upsert', task })) return false;
+    // a quick add has no id yet and nothing to collide with
+    if (typeof task.id === 'string' && task.id) saving.set(task.id, task.rev);
+    return true;
+  }
+
+  // a quick add keeps its title in the box until a state shows the task, so a refusal loses nothing.
+  // pendingAdd: { bucket, title, before (matching tasks at send), held (box disabled) }. a refusal,
+  // an error state or a workflow starting hands the box back but keeps watching - the add may have saved
+  const addCount = (bucket, title) => S.tasks.filter(t => t.bucket === bucket && t.title === title).length;
+  const addHeld = () => !!(S.pendingAdd && S.pendingAdd.held);
+  function refocusAdd(key) {
+    const a = document.activeElement;
+    if (!D && (!a || a === document.body)) focusFk('i:' + key);
+  }
 
   // board
   function card(t, bucket) {
     const done = isDone(t);
-    const c = el('div', 'card task' + (done ? ' done' : ''));
-    c.draggable = !S.busy;
+    const inFlight = saving.has(t.id);
+    const c = el('div', 'card task' + (done ? ' done' : '') + (inFlight ? ' saving' : ''));
+    c.draggable = !S.busy && !inFlight;
     const prog = GLYPH[t.progress] ? t.progress : 'notStarted';
 
     const g = el('button', 'glyph');
     g.type = 'button';
     g.disabled = S.busy;
-    g.title = PROGRESS_NAME[prog] + ' · click to change';
+    // aria-disabled, not disabled, so keyboard focus stays on the glyph through the save
+    if (inFlight) g.setAttribute('aria-disabled', 'true');
+    g.title = PROGRESS_NAME[prog] + (inFlight ? ' · saving' : ' · click to change');
     g.setAttribute('aria-label', PROGRESS_NAME[prog] + ', change progress');
     g.dataset.fk = 'g:' + t.id;
     g.appendChild(svg(null, '0 0 16 16', GLYPH[prog]));
     g.addEventListener('click', () => {
+      if (saving.has(t.id)) return;
       const next = PROGRESS[(PROGRESS.indexOf(prog) + 1) % PROGRESS.length];
-      upsert(Object.assign(clone(t), { progress: next }));
+      if (upsert(Object.assign(clone(t), { progress: next }))) renderBoard();
     });
 
     const body = el('div', 'body');
@@ -359,7 +387,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
     c.append(g, body);
 
     c.addEventListener('dragstart', e => {
-      if (S.busy) { e.preventDefault(); return; }
+      if (S.busy || saving.has(t.id)) { e.preventDefault(); return; }
       dragId = t.id;
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', t.title || '');
@@ -377,7 +405,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
   function addButton(key, name) {
     const b = el('button', 'add');
     b.type = 'button';
-    b.disabled = S.busy;
+    b.disabled = S.busy || addHeld();
     b.dataset.fk = 'a:' + key;
     b.append(icon('plus'), document.createTextNode('Add task'));
     b.addEventListener('click', () => {
@@ -397,7 +425,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
     inp.setAttribute('aria-label', 'New ' + name + ' task');
     inp.autocomplete = 'off';
     inp.value = S.addText;
-    inp.disabled = S.busy;
+    inp.disabled = S.busy || addHeld();
     inp.dataset.fk = 'i:' + key;
     // swap back in place so a click elsewhere is not lost to a re-render
     const close = refocus => {
@@ -411,10 +439,11 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
       if (e.key === 'Enter') {
         e.preventDefault();
         const title = inp.value.trim();
-        if (!title) return;
+        if (!title || addHeld()) return;
+        const before = addCount(key, title);
         if (upsert({ rev: 0, title, bucket: key, progress: 'notStarted', priority: 'normal', checklist: [] })) {
-          S.addText = '';
-          inp.value = '';
+          S.pendingAdd = { bucket: key, title, before, held: true };
+          renderBoard();
         }
       } else if (e.key === 'Escape') {
         e.preventDefault();
@@ -464,7 +493,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
     // drop target: another lane changes the bucket
     const canDrop = () => {
       const t = dragId && find(dragId);
-      return t && !S.busy && t.bucket !== key ? t : null;
+      return t && !S.busy && !saving.has(t.id) && t.bucket !== key ? t : null;
     };
     sec.addEventListener('dragover', e => {
       if (!canDrop()) return;
@@ -480,7 +509,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
       endDrag();
       if (!t) return;
       e.preventDefault();
-      upsert(Object.assign(clone(t), { bucket: key }));
+      if (upsert(Object.assign(clone(t), { bucket: key }))) renderBoard();
     });
     return sec;
   }
@@ -513,6 +542,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
     $('file').textContent = S.file;
     $('file').title = S.file;
     $('fallback').hidden = !S.fallback;
+    $('unsynced').hidden = !S.unsynced;
     renderBanner();
 
     $('waiting').hidden = S.loaded;
@@ -552,7 +582,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
     if (!D) return;
     const lock = S.busy || !!D.pending;
     $('dlg-fs').disabled = lock;
-    $('dlg-save').disabled = lock;
+    $('dlg-save').disabled = lock || saving.has(D.id);
     $('dlg-del').disabled = lock;
     $('confirm-yes').disabled = lock;
     $('dlg-save').textContent = D.pending === 'save' ? 'Saving…' : 'Save';
@@ -633,7 +663,7 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
 
   // the rev sent back is the one the draft started from, so a newer disk edit is rejected
   function save() {
-    if (!D || S.busy || D.pending) return;
+    if (!D || S.busy || D.pending || saving.has(D.id)) return;
     const title = F.title.value.trim();
     if (!title) { showMsg('Title is required.'); F.title.focus(); return; }
     const task = Object.assign(clone(D.base), {
@@ -702,25 +732,56 @@ fieldset { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-d
 
   Bridge.on(msg => {
     switch (msg.type) {
-      case 'state':
+      case 'state': {
         S.loaded = true;
         S.today = isDate(msg.today) ? msg.today : localToday();
         S.file = typeof msg.file === 'string' ? msg.file : '';
         S.fallback = msg.fallback === true;
+        S.unsynced = msg.unsynced === true;
         S.repos = Array.isArray(msg.repos) ? msg.repos.filter(r => typeof r === 'string') : [];
         S.tasks = Array.isArray(msg.tasks)
           ? msg.tasks.filter(t => t && typeof t === 'object' && typeof t.id === 'string') : [];
         S.error = msg.error == null ? null : String(msg.error);
+        // a newer rev means the save landed; a task gone from the file has nothing left to save
+        saving.forEach((rev, id) => {
+          const t = find(id);
+          if (!t || t.rev > rev) saving.delete(id);
+        });
+        // the count rises when the add landed; a state from before it leaves the add pending
+        const added = S.pendingAdd;
+        let handBack = false;
+        if (added && addCount(added.bucket, added.title) > added.before) {
+          S.pendingAdd = null;
+          if (S.adding === added.bucket && S.addText.trim() === added.title) S.addText = '';
+          handBack = true;
+        } else if (addHeld() && S.error != null) {
+          added.held = false;
+          handBack = true;
+        }
         render();
         reconcileDialog();
+        syncDialog();
+        if (handBack) refocusAdd(added.bucket);
         break;
+      }
       case 'busy':
         S.busy = msg.busy === true;
+        if (S.busy && S.pendingAdd) S.pendingAdd.held = false;
+        if (S.busy) saving.clear();
         render();
         syncDialog();
         break;
       case 'rejected': {
         const text = typeof msg.message === 'string' && msg.message ? msg.message : 'The change was not saved.';
+        const wasSaving = typeof msg.id === 'string' && saving.delete(msg.id);
+        // any id: a quick add has none to match on
+        if (addHeld()) {
+          S.pendingAdd.held = false;
+          renderBoard();
+          refocusAdd(S.pendingAdd.bucket);
+        } else if (wasSaving) {
+          renderBoard();
+        }
         if (D && typeof msg.id === 'string' && msg.id === D.id) {
           D.pending = null;
           showMsg(text);

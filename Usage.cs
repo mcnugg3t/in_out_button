@@ -12,8 +12,12 @@ using System.Text.RegularExpressions;
 
 namespace InOutButton;
 
+public sealed record UsagePoint(DateTimeOffset At, double UsedPercent);
+
+// History is null from the readers; UsageStore.WithHistory fills it for the page
 public sealed record UsageMeter(string Key, string Name, int WindowMinutes, double UsedPercent,
-                                DateTimeOffset ResetsAt, string Severity, string? Note);
+                                DateTimeOffset ResetsAt, string Severity, string? Note,
+                                IReadOnlyList<UsagePoint>? History = null);
 
 public sealed record ProviderAction(string Id, string Label);
 

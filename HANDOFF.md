@@ -2,8 +2,8 @@
 
 Written 2026-10-18 at the end of the session that rebuilt the AI usage tab
 as the burn-pace view, added the Google reader, and made the Anthropic
-reader survive an expired token. Post-review commit: see the "Deploy state"
-line below. Read with the spec,
+reader survive an expired token. Post-review commit: `84822f6`. The app
+is not running at the end of the session: see "Deploy state". Read with the spec,
 `docs/2026-10-18-burn-pace-gemini-token-spec.md`, which is the design
 record and holds both review triages (section 12 for the plan, the
 `.review/code-round1/triage.md` beside it for the code), and this file,
@@ -61,17 +61,47 @@ two-layer expiry design (stale display plus the ladder) with the Haiku
 call as the last step; Argon added to the plan-review script as a standing
 reviewer. He did not rule on the `ClaudeUsage` tray app (below).
 
-## Deploy state
+## Deploy state: the app is not running, and Avast is why
 
-The login entry runs `bin\Debug\net8.0-windows\InOutButton.exe`. The
-pre-review build `47a4cb1` was shipped at 17:24 on 2026-10-18 and read all
-three providers live within 15 s of the scan finishing (log lines "usage:
-Anthropic ok, 3 meters", "OpenAI ok, 1 meter", "Google ok, 5 meters").
-Whether the post-review build was shipped is recorded in the closing
-message of the session and in `git log`; if the running app predates the
-post-review commit, close the window (no tray icon), `dotnet build -c
-Debug` in the repo, relaunch. Never a cleaning build beside the running
-exe; verify with `--artifacts-path <scratch>`.
+Post-review commit: `84822f6`. Read this section before anything else.
+
+- The pre-review build `47a4cb1` was shipped at 17:24 on 2026-10-18 and
+  ran for nineteen minutes: four timer reads, all three providers ok
+  ("usage: Anthropic ok, 3 meters", "OpenAI ok, 1 meter", "Google ok, 5
+  meters"), four history points per series in `usage-store.json`.
+- The post-review build `84822f6` was built in place at 17:43 (0 warnings)
+  and relaunched. Twenty-seven seconds after the window opened, Avast
+  quarantined `bin\Debug\net8.0-windows\InOutButton.exe` as `IDP.Generic`
+  (its behaviour-based catch-all), killed the process, deleted
+  `obj\Debug\net8.0-windows\apphost.exe` as well, and removed the
+  `InOutButton` value from `HKCU\...\CurrentVersion\Run`. Record: entry
+  00000008 in `C:\ProgramData\Avast Software\Avast\chest\index.xml`,
+  17:44:13. No post-review read happened; the store and the agy log are
+  still from 17:43:10.
+- The launcher exe is the SDK's app host with the dll name patched in, so
+  it was byte-identical between the two builds. The verdict is about
+  behaviour (a new unsigned exe that writes a Run key, reads
+  `.credentials.json`, and spawns `codex` and `agy`), and Avast's
+  AutoSandbox has been sandboxing every fresh build of this app (that is
+  why windows took about 30 s to appear). Why the second build and not
+  the first is not recorded anywhere Avast writes.
+- A rebuild now fails: `CreateAppHost` gets "Access to the path
+  '...\obj\Debug\net8.0-windows\apphost.exe' is denied". Avast is blocking
+  that path. The SDK's own templates under
+  `C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Host.win-x64\` are
+  intact. Nothing was launched after the quarantine.
+
+Recovery, in order, all Caleb's to do because they change the machine's
+antivirus settings: add an Avast exception for
+`C:\Users\caleb\Tools\in_out_button\` (at least `bin\` and `obj\`), then
+`dotnet build -c Debug` in the repo, launch
+`bin\Debug\net8.0-windows\InOutButton.exe`, and tick "Launch on startup"
+again to restore the login entry. Restoring from Avast's chest is the
+alternative (the entry says `Restore=no`, so it needs the Avast UI). Avast
+has flagged Caleb's own tools before (`Agronomy.exe`, persistent-memory's
+`session-start.ps1`), so an exception for `~/Tools` may be the durable
+answer. Never a cleaning build beside a running exe; verify builds with
+`--artifacts-path <scratch>`.
 
 ## Review record
 

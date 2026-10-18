@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+
 namespace InOutButton.Tests;
 
 // spec tests 10, 11 and 17 to 20 (docs/2026-10-18-burn-pace-gemini-token-spec.md, section 9),
@@ -19,18 +21,21 @@ public sealed class UsageServiceTests : IDisposable
         }
     }
 
+    private string StorePath => Path.Combine(_folder, "usage-store.json");
+
     private UsageStore NewStore()
     {
-        var store = new UsageStore(Path.Combine(_folder, "usage-store.json"));
+        var store = new UsageStore(StorePath);
         store.Load();
         return store;
     }
 
-    private UsageService NewService(UsageStore store, FakeReader? anthropic = null, FakeReader? openai = null, FakeReader? google = null)
+    private UsageService NewService(UsageStore store, FakeReader? anthropic = null, FakeReader? openai = null, FakeReader? google = null,
+                                    Func<DateTimeOffset>? clock = null)
         => new(store, Log, new UsageReaders(
             (anthropic ?? FakeReader.Failing("Anthropic")).ReadAsync,
             (openai ?? FakeReader.Failing("OpenAI")).ReadAsync,
-            (google ?? FakeReader.Failing("Google")).ReadAsync));
+            (google ?? FakeReader.Failing("Google")).ReadAsync), clock);
 
     private void Log(string line)
     {
@@ -65,6 +70,9 @@ public sealed class UsageServiceTests : IDisposable
         var history = Provider(service, "Anthropic").Meters[0].History;
         Assert.NotNull(history);
         Assert.Single(history);
+        // the saved series too, not only the window the post shows
+        var saved = JsonNode.Parse(File.ReadAllText(StorePath))!["history"]!["Anthropic/weekly"]!.AsArray();
+        Assert.Single(saved);
     }
 
     // test 11
@@ -148,6 +156,68 @@ public sealed class UsageServiceTests : IDisposable
         Assert.Single(Provider(service, "Anthropic").Meters[0].History!);
     }
 
+    // the store is sealed and swallows its own io failures, so a null provider is what makes RecordOk
+    // throw here (it keys a dictionary on it). the refresh completes with the reader's own reading
+    [Fact]
+    public async Task AStoreFaultIsLoggedAndTheReadingStillPosts()
+    {
+        var store = NewStore();
+        var anthropic = new FakeReader(() => new ReaderOutcome(Ok("Anthropic", 10) with { Provider = null! }));
+        var service = NewService(store, anthropic);
+
+        await service.RefreshAsync(true, Options, CancellationToken.None);
+
+        var usage = Provider(service, "Anthropic");
+        Assert.Equal("ok", usage.State);
+        Assert.Equal(10, usage.Meters[0].UsedPercent);
+        Assert.NotNull(usage.Meters[0].History);
+        Assert.Contains(_log, line => line.StartsWith("usage: Anthropic store failed: ", StringComparison.Ordinal));
+        Assert.False(File.Exists(StorePath));
+    }
+
+    // a reading with no meters list can't be posted either: unavailable, and the next refresh still reads
+    [Fact]
+    public async Task AnUnusableReadingIsUnavailableAndTheNextRefreshReads()
+    {
+        var store = NewStore();
+        var calls = 0;
+        var anthropic = new FakeReader(() => Interlocked.Increment(ref calls) == 1
+            ? new ReaderOutcome(Ok("Anthropic", 10) with { Meters = null! })
+            : new ReaderOutcome(Ok("Anthropic", 11)));
+        var service = NewService(store, anthropic);
+
+        await service.RefreshAsync(true, Options, CancellationToken.None);
+
+        var first = Provider(service, "Anthropic");
+        Assert.Equal("unavailable", first.State);
+        Assert.StartsWith("usage reading unusable: ", first.Message);
+        Assert.Empty(first.Meters);
+
+        await service.RefreshAsync(true, Options, CancellationToken.None);
+
+        Assert.Equal(2, anthropic.Calls);
+        Assert.Equal("ok", Provider(service, "Anthropic").State);
+        Assert.Equal(11, Provider(service, "Anthropic").Meters[0].UsedPercent);
+    }
+
+    // a cancelled read ends the refresh quietly and must not leave the slot pending
+    [Fact]
+    public async Task ACancelledReadDoesNotLeaveTheSlotPending()
+    {
+        var store = NewStore();
+        var calls = 0;
+        var anthropic = new FakeReader(() => Interlocked.Increment(ref calls) == 1
+            ? throw new OperationCanceledException()
+            : new ReaderOutcome(Ok("Anthropic", 11)));
+        var service = NewService(store, anthropic);
+
+        await service.RefreshAsync(true, Options, CancellationToken.None);
+        await service.RefreshAsync(true, Options, CancellationToken.None);
+
+        Assert.Equal(2, anthropic.Calls);
+        Assert.Equal("ok", Provider(service, "Anthropic").State);
+    }
+
     // test 18
     [Fact]
     public async Task FreshSkipsASoftCooldownButNotAHardOne()
@@ -156,9 +226,19 @@ public sealed class UsageServiceTests : IDisposable
         var soft = new FakeReader(() => new ReaderOutcome(Failed("Google", "Antigravity CLI timed out after 25 s"), TimeSpan.FromMinutes(10)));
         var hard = new FakeReader(() => new ReaderOutcome(
             Failed("Anthropic", "rate limited by the usage endpoint; next try in 600 s"), TimeSpan.FromMinutes(10), "HTTP 429", CooldownKind: CooldownKind.Hard));
-        var service = NewService(store, anthropic: hard, google: soft);
+        // no cooldown, so it reads again once the 60 s cache is past
+        var plain = FakeReader.Failing("OpenAI");
+        var now = DateTimeOffset.UtcNow;
+        var service = NewService(store, anthropic: hard, openai: plain, google: soft, clock: () => now);
 
         await service.RefreshAsync(false, Options, CancellationToken.None);
+        Assert.Equal(1, soft.Calls);
+        Assert.Equal(1, hard.Calls);
+
+        // past the cache, inside both cooldowns: only the cooldowns hold the readers back
+        now = now.AddMinutes(2);
+        await service.RefreshAsync(false, Options, CancellationToken.None);
+        Assert.Equal(2, plain.Calls);
         Assert.Equal(1, soft.Calls);
         Assert.Equal(1, hard.Calls);
 

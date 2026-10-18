@@ -24,6 +24,7 @@ public sealed class UsageStore
     };
 
     private static readonly IComparer<Point> ByTime = Comparer<Point>.Create((a, b) => a.AtMs.CompareTo(b.AtMs));
+    private static readonly TimeSpan ReadRetryDelay = TimeSpan.FromMilliseconds(500);
 
     private readonly object _gate = new();
     private readonly string _path;
@@ -31,7 +32,7 @@ public sealed class UsageStore
     // key is "<provider>/<meter key>"; each series oldest first
     private readonly Dictionary<string, List<Point>> _history = new(StringComparer.Ordinal);
     private bool _saveFailureLogged;
-    // a file we could not move aside is never overwritten - it may be a newer build's
+    // a file we could not read or move aside is never overwritten - it may be a newer build's, or whole
     private bool _saveBlocked;
 
     public UsageStore(string path)
@@ -48,7 +49,8 @@ public sealed class UsageStore
 
     /// <summary>
     /// once at startup. a missing file is an empty store; one that does not parse or carries
-    /// an unknown version moves to usage-store.bak.json and the store starts empty
+    /// an unknown version moves to usage-store.bak.json and the store starts empty. one it can't
+    /// read stays put, and nothing saves this run
     /// </summary>
     public void Load()
     {
@@ -59,19 +61,30 @@ public sealed class UsageStore
             _saveBlocked = false;
 
             string text;
-            try
+            for (var attempt = 1; ; attempt++)
             {
-                if (!File.Exists(_path))
+                try
                 {
+                    if (!File.Exists(_path))
+                    {
+                        return;
+                    }
+
+                    text = File.ReadAllText(_path);
+                    break;
+                }
+                catch (Exception ex) when (attempt == 1 && ex is IOException or UnauthorizedAccessException)
+                {
+                    // a lock is often brief: one more try
+                    Thread.Sleep(ReadRetryDelay);
+                }
+                catch (Exception ex)
+                {
+                    // a lock is not a parse failure: the file may be whole, so the next save must not replace it
+                    _saveBlocked = true;
+                    Log?.Invoke($"usage store: could not read {_path} ({Scrub.Message(ex.Message)}); not saving this run");
                     return;
                 }
-
-                text = File.ReadAllText(_path);
-            }
-            catch (Exception ex)
-            {
-                Log?.Invoke($"usage store: could not read {_path}: {Scrub.Message(ex.Message)}; starting empty");
-                return;
             }
 
             StoreFile? file;

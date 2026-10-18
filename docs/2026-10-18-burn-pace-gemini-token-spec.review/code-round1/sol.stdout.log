@@ -1,0 +1,72 @@
+1. Defects
+
+Medium — Usage.cs, JsonLineProcess.Start / ChildJob.TryAssign:
+“var job = ChildJob.TryCreate(log);”
+“if (job is not null && !job.TryAssign(process))”
+“job = null;”
+
+The child is already running before assignment. A fast launcher can spawn a descendant and exit before assignment completes. That descendant never enters the job; disposing the job cannot kill it, and the exited parent prevents the existing tree-kill fallback from finding it. A process holding stdout open can survive the timeout. The tests deliberately delay spawning, masking this production race. Traced, not reproduced.
+
+Medium — Usage.cs, RunLadderAsync, 30-minute-floor branch:
+“return (null, Refreshable(trigger.Plan, $"Claude Code token {word}; refresh ladder ran {minutes} min ago; try again later"));”
+
+Trigger: force claude-refresh within 30 minutes, with the same token still locally expired. This returns through “return refused!” before reaching HTTP. Section 5.1 explicitly requires that such a click “reads live without the ladder.” The app instead trusts the local expiry and cannot discover whether the endpoint accepts that token. Traced, not reproduced.
+
+Medium — UsageStore.cs, Load read-error handler:
+“Log?.Invoke($"usage store: could not read {_path}: …; starting empty");”
+“return;”
+
+Trigger: an existing store is temporarily unreadable at startup, for example because another process holds an exclusive handle. Load leaves empty dictionaries and _saveBlocked false. Once access recovers, the next successful reading replaces the original store with this incomplete state, losing previous provider readings and history without preserving a backup. Traced, not reproduced.
+
+Low — Usage.cs, ClaudeCli.RunStepAsync:
+“var exe = await FindAsync(overridePath, ct)”
+“await Task.WhenAll(stdout.Done, stderr.Done).WaitAsync(DrainWait, ct)”
+
+Discovery happens outside each step’s deadline, and completed processes can add another five seconds waiting for inherited pipes. Consequently the ladder can exceed the promised 150-second maximum even without an unusually slow filesystem. The cap bounds process waiting, not the complete ladder. Traced, not reproduced.
+
+2. Spec gaps
+
+Section 11: “Docs: CLAUDE.md usage section, README, HANDOFF.md … the persistent-memory project note, routing-log rows.”
+
+The diff only repairs HANDOFF.md’s path. Its quoted paragraph still says “Gemini: nothing read yet” and describes implementing the reader as future work. No updates to the other named documents or records appear.
+
+Section 10: “ten tiles at the 1060×750 launch size means the tab scrolls. Checked by screenshot before shipping.”
+
+Section 11: “checked in a browser against sample-data.js and then in the app” and “relaunch, confirm the three tiles live.”
+
+No screenshot, browser verification, app verification, or shipping evidence is supplied. These acceptance items remain unverified; their absence from the diff does not prove they were never performed.
+
+Section 7.5: “Everything on a stale tile is evaluated at the reading’s time” and “A stale meter whose resetsAt has passed … renders as a ghost tile.”
+
+The page implements these branches, but the supplied tests do not exercise their rendered numbers, pace verdict, accessibility text, or transition into a finished ghost.
+
+3. Tests that check less than they claim
+
+ClosingTheJobKillsAGrandchildWhoseParentExited and AGrandchildHoldingStdoutDiesWithTheJob: both delay descendant creation until assignment should have finished. They establish cleanup after successful assignment, not cleanup for the fast-launcher race.
+
+AClickInsideTheFloorReadsWithoutTheLadder: asserts step count and failure message, but never checks endpoint.Tokens. It passes when no HTTP read happens, which is the defect above.
+
+ThePromptStepLoadsNoSettingsAndNoMcp: checks argument construction only. It cannot detect hooks or servers actually starting, or behavior changes in the installed Claude executable.
+
+BackoffIsTenMinutesThenAnHourFromTheThirdFailure: tests the standalone mapping only. The driver timeout test accepts either cooldown, so neither establishes that consecutive failures increment correctly and success resets the sequence.
+
+LiveToolsTests: both tests return successfully when INOUT_LIVE_TOOLS is unset. An ordinary green test report provides no evidence that either installed CLI was exercised.
+
+4. Assumptions to verify in the repo before merging
+
+Traced, not reproduced:
+
+- Compilation and fixture packaging: build with --artifacts-path pointing outside the running app’s output, then run tests/InOutButton.Tests. Confirm agy-usage-2026-10-18.json is copied into the test output.
+- Deferred first read: inspect SetBusy(false) and exercise opening Usage during startup scanning. Verify seeded state appears immediately and exactly one pending live read starts when scanning ends.
+- Single-flight cleanup: inspect the complete ProviderSlot.ReadAndRecordAsync implementation. Verify cancellation and settlement failures cannot leave _pending permanently assigned.
+- Child cleanup: run a stand-in that immediately spawns a stdout-holding descendant and exits, without the tests’ initial sleep. Record the descendant PID and verify it is dead after the cap.
+- Credential/configuration alignment: with an explicit CLAUDE_CONFIG_DIR, verify the reader and launched executable use the same file. Exercise expired and rejected tokens in an isolated test login.
+- Live checks: explicitly set INOUT_LIVE_TOOLS=1 and retain executed-test output separately from ordinary test results.
+
+5. Checked and cleared
+
+Within the supplied diff, I found no direct app writes to Claude credentials, direct Google requests, shell invocation in the production CLI launch paths, or surfaced Claude step output.
+
+The diff preserves hard cooldowns across fresh requests, serializes store mutations, strips stored History, preserves stale reading timestamps and failure actions, and uses reset identity for history membership.
+
+The page sorts history, clamps chart coordinates, distinguishes inferred segments, uses textContent for displayed data, and suppresses stale notifications from stale providers. These are source checks, not runtime verification.

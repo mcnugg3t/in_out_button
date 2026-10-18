@@ -241,6 +241,35 @@ public sealed class UsageStoreTests : IDisposable
         Assert.True(File.Exists(BakPath));
     }
 
+    // a lock is not a parse failure: the file is never moved aside or overwritten, even once it frees
+    [Fact]
+    public void ALockedFileIsNeitherMovedNorOverwritten()
+    {
+        Directory.CreateDirectory(_folder);
+        const string original = "{\"version\":1,\"last\":{},\"history\":{\"Anthropic/weekly\":[[1792324800000,43,1792886400000]]}}";
+        File.WriteAllText(StorePath, original);
+        var before = File.ReadAllBytes(StorePath);
+        var log = new List<string>();
+        var store = new UsageStore(StorePath) { Log = log.Add };
+
+        using (new FileStream(StorePath, FileMode.Open, FileAccess.Read, FileShare.None))
+        {
+            store.Load();
+        }
+
+        // released before the save, so only the store's own rule keeps the file
+        store.RecordOk(Reading(T0, Meter(10.0, Reset)));
+
+        Assert.Equal(before, File.ReadAllBytes(StorePath));
+        Assert.False(File.Exists(BakPath));
+        Assert.False(File.Exists(StorePath + ".tmp"));
+        var line = Assert.Single(log);
+        Assert.StartsWith($"usage store: could not read {StorePath} (", line, StringComparison.Ordinal);
+        Assert.EndsWith("); not saving this run", line, StringComparison.Ordinal);
+        // the in-memory store keeps going
+        Assert.Single(HistoryOf(store, Reset));
+    }
+
     [Fact]
     public void AMissingFileIsAnEmptyStoreWithNoBak()
     {
@@ -261,6 +290,19 @@ public sealed class UsageStoreTests : IDisposable
         Assert.Null(store.LastOk(Provider, TimeSpan.FromDays(7), now));
         Assert.Equal(now.AddHours(-1), store.LastOk("OpenAI", TimeSpan.FromDays(7), now)?.UpdatedAt);
         Assert.Null(store.LastOk("Google", TimeSpan.FromDays(7), now));
+    }
+
+    // spec 3.1 keeps a reading "from the last 7 days" and drops one "older than that", so exactly
+    // 7 days is in. spec 8's "under 7 days" reads the other way at this one instant
+    [Fact]
+    public void LastOkKeepsAReadingExactlySevenDaysOldAndDropsOneATickOlder()
+    {
+        Assert.Equal(TimeSpan.FromDays(7), UsageService.StaleWindow);
+        var store = NewStore();
+        store.RecordOk(Reading(T0, Meter(10.0, Reset)));
+
+        Assert.Equal(T0, store.LastOk(Provider, UsageService.StaleWindow, T0.AddDays(7))?.UpdatedAt);
+        Assert.Null(store.LastOk(Provider, UsageService.StaleWindow, T0.AddDays(7).AddTicks(1)));
     }
 
     // test 10 at the store: a cache hit hands back the same UpdatedAt

@@ -21,7 +21,7 @@ public sealed class LiveToolsTests(ITestOutputHelper output)
         // file times are coarse; a little slack
         var started = DateTime.UtcNow.AddSeconds(-2);
 
-        var outcome = await GeminiUsage.ReadOutcomeAsync((string?)null, CancellationToken.None);
+        var outcome = await new GeminiUsage().ReadOutcomeAsync((string?)null, CancellationToken.None);
 
         output.WriteLine($"agy: {outcome.Usage.State} {outcome.Usage.Message}".TrimEnd());
         foreach (var meter in outcome.Usage.Meters)
@@ -50,8 +50,10 @@ public sealed class LiveToolsTests(ITestOutputHelper output)
         var path = AnthropicUsage.CredentialsPath;
         var before = File.ReadAllBytes(path);
 
-        output.WriteLine($"claude: {await ClaudeCli.FindAsync(null, CancellationToken.None)}");
-        var result = await ClaudeCli.RunStepAsync(ClaudeStep.AuthStatus, null, CancellationToken.None);
+        var exe = await ClaudeCli.FindAsync(null, CancellationToken.None);
+        output.WriteLine($"claude: {exe}");
+        Assert.NotNull(exe);
+        var result = await ClaudeCli.RunStepAsync(ClaudeStep.AuthStatus, exe, CancellationToken.None);
 
         var after = File.ReadAllBytes(path);
         output.WriteLine(ClaudeCli.Describe(ClaudeStep.AuthStatus, result));

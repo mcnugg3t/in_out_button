@@ -14,41 +14,43 @@
 .upd time { font-family: Consolas, ui-monospace, monospace; }
 .btn .gl { font-size: 13px; line-height: 1; }
 
-.pb { flex: 1; min-height: 0; overflow: auto; transition: opacity 0.2s; padding: 12px 16px 16px; }
+.pb { flex: 1; min-height: 0; overflow: auto; transition: opacity 0.2s; padding: 10px 12px 12px; }
 body.busy .pb { opacity: 0.5; }
 .waiting { margin: auto; color: var(--muted); }
 
-/* burn pace: a caption row per provider, then its tiles three to a row. the board scrolls, it never shrinks */
-.c-body { display: grid; grid-template-columns: repeat(3, minmax(230px, 1fr)); align-content: start; column-gap: 12px; row-gap: 10px; }
+/* burn pace: a caption row per provider, then its tiles three to a row. the columns share
+   the width and never hold it open, so the board scrolls down and never sideways */
+.c-body { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-content: start; column-gap: 10px; row-gap: 8px; }
 .c-body.empty { display: flex; }
-.c-cap { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 5px; min-width: 0; padding: 0 2px; }
-.c-cap:not(:first-child) { margin-top: 8px; }
+.c-cap { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px; min-width: 0; padding: 0 2px; }
+.c-cap:not(:first-child) { margin-top: 4px; }
 .c-cap-r { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .prov-name { flex: none; font-weight: 600; font-size: 13.5px; color: var(--fg-strong); }
-.prov-plan { min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.c-foot { flex: none; max-width: 60%; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
+.prov-plan { flex: 0 1 auto; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.c-foot { flex: 0 1 auto; min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
 .c-foot b { font-weight: 600; color: var(--fg); }
-.c-stale { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--warn-ink); }
+.c-stale { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; min-width: 0; font-size: 12px; color: var(--warn-ink); }
 .c-stale-b { display: flex; gap: 6px; }
 .c-stale .btn { height: 24px; padding: 0 9px; font-size: 12px; }
 
-.c-tile { min-width: 0; padding: 11px 14px 6px; display: flex; flex-direction: column; }
+.c-tile { min-width: 0; padding: 8px 12px 3px; display: flex; flex-direction: column; }
 .c-tile.tm { cursor: default; }
 .c-tile.tm:hover { border-color: var(--axis); }
-/* a long window note wraps under the name rather than cutting it */
-.c-top { display: flex; align-items: center; flex-wrap: wrap; gap: 2px 8px; min-width: 0; }
-.m-name { min-width: 0; font-weight: 600; font-size: 12.5px; line-height: 18px; color: var(--fg-strong); }
+/* one header line: the name keeps its room first, the window label takes what is left */
+.c-top { display: flex; align-items: center; gap: 6px; min-width: 0; height: 18px; }
+.m-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 12.5px; color: var(--fg-strong); }
+.c-top .chip { flex: none; }
 .c-ghost-t .m-name { color: var(--muted); }
-.c-win { margin-left: auto; font-size: 11.5px; color: var(--muted); }
-.c-nums { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 26px; margin-top: 4px; }
-.c-nums > div { display: flex; align-items: baseline; gap: 5px; }
-.c-nums b { font-size: 24px; line-height: 32px; font-weight: 600; letter-spacing: -0.3px; color: var(--fg-strong); }
-.c-nums span { font-size: 12px; color: var(--muted); }
+.c-win { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; font-size: 11.5px; color: var(--muted); }
+.c-nums { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: 14px; margin-top: 1px; }
+.c-nums > div { display: flex; align-items: baseline; gap: 4px; white-space: nowrap; }
+.c-nums b { font-size: 20px; line-height: 26px; font-weight: 600; letter-spacing: -0.3px; color: var(--fg-strong); }
+.c-nums span { font-size: 11.5px; color: var(--muted); }
 .c-tile.stale .c-nums b { color: var(--muted); }
 
 /* chart: x is time through the window, y is percent used; the dotted line is even burn */
-.c-chart { margin-top: auto; padding-top: 4px; overflow: hidden; }
-.c-chart svg { display: block; }
+.c-chart { margin-top: auto; padding-top: 2px; overflow: hidden; }
+.c-chart svg { display: block; width: 100%; height: 70px; }
 .cg { stroke: var(--grid); }
 .cax { stroke: var(--axis); }
 .cguide { stroke: var(--muted); stroke-width: 1.6; stroke-dasharray: 0.1 4; stroke-linecap: round; fill: none; }
@@ -64,16 +66,23 @@ body.busy .pb { opacity: 0.5; }
 .c-tile.stale .cline { stroke: var(--fuse); }
 .c-tile.stale .cdot { fill: var(--fuse); }
 .c-tile.passed .c-chart { opacity: 0.55; }
-.clab { fill: var(--muted); font-size: 11px; }
+.clab { fill: var(--muted); font-size: 10.5px; }
 .c-ghost { position: relative; margin-top: auto; }
-.c-ghost p { position: absolute; inset: 0 0 14px; display: flex; align-items: center; justify-content: center; padding: 0 18px; text-align: center; font-size: 12px; line-height: 1.4; color: var(--muted); }
+/* the text sits over the plot, clear of the reset gutter */
+.c-ghost p { position: absolute; inset: 0 36px 12px 6px; display: flex; align-items: center; justify-content: center; padding: 0 10px; text-align: center; font-size: 11.5px; line-height: 1.35; color: var(--muted); }
+
+/* untouched windows: one line per provider, the word standing for 100% left */
+.c-strip { grid-column: 1 / -1; min-width: 0; padding: 5px 12px; font-size: 12px; line-height: 1.5; color: var(--muted); }
+.c-strip-k { margin-right: 4px; font-weight: 600; color: var(--fg); }
+.c-strip .tm { cursor: default; border-radius: 3px; }
+.c-strip .tm:hover { color: var(--fg); }
 
 /* unavailable provider: one card across the row */
-.c-off { grid-column: 1 / -1; display: flex; min-height: 132px; padding: 14px 16px; }
-.c-empty { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; text-align: center; }
+.c-off { grid-column: 1 / -1; display: flex; min-height: 88px; padding: 10px 14px; }
+.c-empty { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; text-align: center; }
 .ghost {
-  width: 34px; height: 34px; margin-bottom: 2px; border-radius: 50%; border: 1.5px dashed var(--axis);
-  display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 16px;
+  width: 26px; height: 26px; margin-bottom: 2px; border-radius: 50%; border: 1.5px dashed var(--axis);
+  display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 14px;
 }
 .e1 { max-width: 100%; font-weight: 600; line-height: 1.3; color: var(--fg); }
 .e2 { font-size: 12px; line-height: 1.35; color: var(--muted); max-width: min(520px, 100%); }
@@ -99,9 +108,9 @@ body.busy .pb { opacity: 0.5; }
 
   const SVGNS = 'http://www.w3.org/2000/svg';
   const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  const NBSP = ' ';
-  // chart box from candidate C: plot from X0 to the reset edge, labels below it and right of it
-  const CH = 106, X0 = 8, RIGHT = 42, TOP = 8, BASE = 86;
+  const NBSP = '\u00a0';
+  // chart box from candidate C, compacted: plot from X0 to the reset edge, labels below it and right of it
+  const CH = 70, X0 = 6, RIGHT = 36, TOP = 5, BASE = 53;
 
   const board = document.getElementById('board');
   const refreshBtn = document.getElementById('refresh');
@@ -115,6 +124,7 @@ body.busy .pb { opacity: 0.5; }
   let ghosts = [];
   let ages = [];
   let finished = [];
+  let idles = [];
   const staleSent = new Set();
   let lastStaleAt = 0;
 
@@ -219,11 +229,13 @@ body.busy .pb { opacity: 0.5; }
     n.textContent = text;
     return n;
   }
-  // the chart is drawn at the host's width so its text never scales
+  // the viewBox is the host's measured width, so text draws at its own size; the svg itself
+  // is 100% wide, so a stale measurement scales a little and never widens the tile.
+  // the resize observer below redraws at the new width
   function frame(host, ghost) {
-    const w = Math.max(180, Math.floor(host.clientWidth || 318));
+    const w = host.clientWidth > 0 ? Math.max(120, Math.floor(host.clientWidth)) : 300;
     const x1 = w - RIGHT, mid = (TOP + BASE) / 2;
-    const svg = svgEl('svg', { width: w, height: CH, viewBox: '0 0 ' + w + ' ' + CH, 'aria-hidden': 'true' });
+    const svg = svgEl('svg', { width: '100%', height: CH, viewBox: '0 0 ' + w + ' ' + CH, 'aria-hidden': 'true' });
     svg.append(line('cg', X0, TOP, x1, TOP), line('cg', X0, mid, x1, mid), line('cg', x1, TOP, x1, BASE),
       line(ghost ? 'cg' : 'cax', X0, BASE, x1, BASE));
     return { svg, x1 };
@@ -233,7 +245,7 @@ body.busy .pb { opacity: 0.5; }
     const f = frame(k.chart), x1 = f.x1;
     f.svg.appendChild(line('cguide', X0, BASE, x1, TOP));
     if (k.guide) {
-      const gx = (X0 + 0.78 * (x1 - X0)).toFixed(1), gy = (BASE - 0.78 * (BASE - TOP) - 6).toFixed(1);
+      const gx = (X0 + 0.78 * (x1 - X0)).toFixed(1), gy = (BASE - 0.78 * (BASE - TOP) - 5).toFixed(1);
       const ang = (-Math.atan((BASE - TOP) / (x1 - X0)) * 180 / Math.PI).toFixed(1);
       f.svg.appendChild(label('even pace', { x: gx, y: gy, 'text-anchor': 'middle', transform: 'rotate(' + ang + ' ' + gx + ' ' + gy + ')' }));
     }
@@ -250,10 +262,10 @@ body.busy .pb { opacity: 0.5; }
         if (b.obs > 1) f.svg.appendChild(stroke(1, b.obs, false));
         if (n > b.obs) f.svg.appendChild(stroke(b.obs, n, true));
       }
-      f.svg.appendChild(svgEl('circle', { class: 'cdot ' + k.sev, cx: end[0], cy: end[1], r: 5 }));
-      const text = k.stale ? 'last read' : 'now', half = k.stale ? 23 : 11;
-      f.svg.append(label(text, { x: clamp(end[0], half + 1, x1 - half), y: BASE + 15, 'text-anchor': 'middle' }),
-        label('reset', { x: x1 + 6, y: BASE + 4 }));
+      f.svg.appendChild(svgEl('circle', { class: 'cdot ' + k.sev, cx: end[0], cy: end[1], r: 4 }));
+      const text = k.stale ? 'last read' : 'now', half = k.stale ? 22 : 10;
+      f.svg.append(label(text, { x: clamp(end[0], half + 1, x1 - half), y: BASE + 13, 'text-anchor': 'middle' }),
+        label('reset', { x: x1 + 5, y: BASE + 4 }));
     }
     k.chart.textContent = '';
     k.chart.appendChild(f.svg);
@@ -317,15 +329,22 @@ body.busy .pb { opacity: 0.5; }
     return cap;
   }
 
+  // a one-line span that may end in an ellipsis; the title keeps the whole text
+  function cut(cls, text) {
+    const n = el('span', cls, text);
+    n.title = text;
+    return n;
+  }
+
   function meterTile(p, m, first) {
     const sev = sevClass(m.severity), stale = p.state === 'stale';
     const box = el('div', 'card c-tile tm' + (stale ? ' stale' : ''));
     box.tabIndex = 0;
 
     const top = el('div', 'c-top');
-    top.append(el('span', 'm-name', m.name || m.key || 'Meter'),
+    top.append(cut('m-name', m.name || m.key || 'Meter'),
       el('span', 'chip' + (sev === 'normal' ? '' : ' ' + sev), String(m.severity || 'normal')),
-      el('span', 'c-win', m.note ? String(m.note) : windowLabel(num(m.windowMinutes))));
+      cut('c-win', m.note ? String(m.note) : windowLabel(num(m.windowMinutes))));
     const nums = el('div', 'c-nums');
     const left = el('div');
     const leftWord = el('span', null, 'left');
@@ -348,7 +367,7 @@ body.busy .pb { opacity: 0.5; }
   function ghostTile() {
     const box = el('div', 'card c-tile c-ghost-t');
     const top = el('div', 'c-top');
-    top.append(el('span', 'm-name', '5-hour'), el('span', 'c-win', '5-hour window'));
+    top.append(cut('m-name', '5-hour'), cut('c-win', '5-hour window'));
     const wrap = el('div', 'c-ghost');
     const chart = el('div', 'c-chart');
     wrap.append(chart, el('p', null, 'No 5-hour window reported'));
@@ -364,7 +383,7 @@ body.busy .pb { opacity: 0.5; }
     box.tabIndex = 0;
     const win = windowLabel(num(k.m.windowMinutes));
     const top = el('div', 'c-top');
-    top.append(el('span', 'm-name', k.m.name || k.m.key || 'Meter'), el('span', 'c-win', win));
+    top.append(cut('m-name', k.m.name || k.m.key || 'Meter'), cut('c-win', win));
     const wrap = el('div', 'c-ghost');
     const chart = el('div', 'c-chart');
     const text = el('p');
@@ -373,6 +392,26 @@ body.busy .pb { opacity: 0.5; }
     ghosts.push(chart);
     finished.push({ box, text, win, label: k.label, t: Date.parse(k.m.resetsAt) });
     return box;
+  }
+
+  // an untouched window has nothing to chart: no use and no reading above zero.
+  // only live providers strip them; a stale 0% meter keeps its dated tile
+  function untouched(m) {
+    return num(m.usedPercent) <= 0 && history(m).every(h => h.used <= 0);
+  }
+
+  function idleStrip(p, idle) {
+    const row = el('div', 'card c-strip');
+    row.appendChild(el('span', 'c-strip-k', 'Untouched:'));
+    const name = p.provider || 'Provider';
+    idle.forEach((m, i) => {
+      const item = el('span', 'tm', (m.name || m.key || 'Meter') + ' · ' + windowLabel(num(m.windowMinutes)));
+      item.tabIndex = 0;
+      if (i) row.appendChild(document.createTextNode(', '));
+      row.appendChild(item);
+      idles.push({ m, item, label: name + ' ' + (m.name || '') + ', untouched', id: name + '|' + (m.key || m.name) });
+    });
+    return row;
   }
 
   function provider(p) {
@@ -386,9 +425,11 @@ body.busy .pb { opacity: 0.5; }
       board.appendChild(card);
       return;
     }
-    meters.forEach((m, i) => board.appendChild(meterTile(p, m, i === 0)));
+    const idle = p.state === 'ok' ? meters.filter(untouched) : [];
+    meters.filter(m => idle.indexOf(m) < 0).forEach((m, i) => board.appendChild(meterTile(p, m, i === 0)));
     const has = target => meters.some(m => near(num(m.windowMinutes), target));
     if (has(10080) && !has(300)) board.appendChild(ghostTile());
+    if (idle.length) board.appendChild(idleStrip(p, idle));
   }
 
   function render() {
@@ -397,6 +438,7 @@ body.busy .pb { opacity: 0.5; }
     ghosts = [];
     ages = [];
     finished = [];
+    idles = [];
     board.textContent = '';
     const providers = snap && Array.isArray(snap.providers) ? snap.providers.filter(p => p && typeof p === 'object') : [];
     if (!providers.length) {
@@ -462,6 +504,16 @@ body.busy .pb { opacity: 0.5; }
       });
     }
     ghosts.forEach(drawGhost);
+    idles.forEach(s => {
+      const t = Date.parse(s.m.resetsAt), used = num(s.m.usedPercent);
+      const lines = [pct(used) + '% used · ' + pct(clamp(100 - used, 0, 100)) + '% left'];
+      if (isNaN(t)) lines.push('Reset time unknown');
+      else if (t <= nowMs) { lines.push('Reset at ' + when(new Date(t), now)); passed.push(s.id); }
+      else lines.push('Resets ' + when(new Date(t), now));
+      lines.push(windowLabel(num(s.m.windowMinutes)));
+      s.item.tipLines = lines;
+      s.item.setAttribute('aria-label', s.label + ': ' + lines.join('. '));
+    });
     finished.forEach(f => {
       const line = 'window reset at ' + when(new Date(f.t), now) + ' since the last read · waiting for a live read';
       f.text.textContent = line;

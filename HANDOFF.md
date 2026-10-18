@@ -1,92 +1,135 @@
 # Handoff: In / Out Button
 
-Written 2026-10-17 at the end of the session that added the AI usage and
-Tasks tabs. Post-review commit: `9a8ca7e`. Read with the spec,
-`docs/2026-10-17-usage-and-tasks-tabs-spec.md`, which is the design record,
-and this file, which is the state.
+Written 2026-10-18 at the end of the session that rebuilt the AI usage tab
+as the burn-pace view, added the Google reader, and made the Anthropic
+reader survive an expired token. Post-review commit: see the "Deploy state"
+line below. Read with the spec,
+`docs/2026-10-18-burn-pace-gemini-token-spec.md`, which is the design
+record and holds both review triages (section 12 for the plan, the
+`.review/code-round1/triage.md` beside it for the code), and this file,
+which is the state. The previous session's handoff is in git history at
+`9a8ca7e`.
 
 ## What shipped
 
-Two tabs beside Repos, hosted in WebView2 and driven entirely by C#:
+- **Burn-pace usage page** (design candidate C, Caleb's preference). One
+  tile per meter under a provider caption: percent left, time to reset,
+  and a chart of percent used against the fraction of the window elapsed
+  with a dotted even-pace guide. Observed history is solid; inferred
+  segments (origin to the first reading, the flat tail to now) are dashed.
+  Idle meters collapse into one "Untouched" strip; a provider with a
+  weekly window and no 5-hour one shows the ghost tile.
+- **History and stale readings.** `UsageStore` keeps
+  `%APPDATA%\InOutButton\usage-store.json`: the last ok reading per
+  provider and a per-meter history keyed by the window's reset time to the
+  second (no tolerance: idle Antigravity buckets move their reset on every
+  read). A failed read shows the stored reading dimmed and dated for up to
+  seven days; a stale meter whose window has reset since is a ghost tile.
+  At startup the tab shows the stored readings at once, marked "not read
+  yet since the app started".
+- **Google through the Antigravity CLI.** `agy -p /usage --output-format
+  json` through `JsonLineProcess`, 25 s cap, the CLI's own print timeout
+  read from its stderr marker, soft backoff 10 min then 60 min from the
+  third failure. Five meters: Gemini Models (weekly, 5-hour), Claude and
+  GPT models (weekly, 5-hour), Gemini 4 Argon (weekly). The CLI's per-run
+  log goes to `%APPDATA%\InOutButton\agy-usage.log`. Verified live.
+- **Anthropic refresh ladder.** When the token is expired or rejected the
+  read runs `claude auth status`, then a one-word Haiku call with
+  `--tools "" --strict-mcp-config --no-session-persistence
+  --setting-sources ""` (measured: 11.8 s, about a thousand input tokens,
+  no hook, no transcript). Keyed on the token string, once per token
+  automatically and never within 30 min; steps are waited for and never
+  killed. The app never writes the credentials file. A "Refresh via
+  Claude Code" button forces it. `ClaudeRefreshAuto = false` turns the
+  automatic part off.
+- **Hardening.** Every child process sits in a kill-on-close job object
+  (`ChildJob`), cooldowns are hard (a server's `Retry-After`) or soft (the
+  app's backoff, skipped by Refresh), a set `ClaudeExecutable` or
+  `AgyExecutable` is the only candidate, the first usage read waits for
+  the repo scan.
 
-- **AI usage** (rings and fuses, design candidate A). Anthropic reads the
-  Claude Code login's three meters over the OAuth usage endpoint; OpenAI reads
-  Codex's rate-limit windows through `codex app-server`; Google is an empty
-  state with two buttons. Verified live on this machine.
-- **Tasks** (three lanes, design candidate B). `persistent-memory/tasks/tasks.json`,
-  per-task revisions, stale-save rejection, a cross-process lock, atomic
-  writes, a busy gate during workflows. The add, progress, delete, and
-  rejected paths were exercised end to end through WebView2's debugging port.
+Tests: xunit, 140-odd cases; two of them run only with
+`INOUT_LIVE_TOOLS=1` because they call the real `agy` and `claude auth
+status`. Build and tests pass with zero warnings.
 
-Tests: xunit under `tests/InOutButton.Tests`, 60-odd cases over the parsers,
-the scrubber, the Codex driver, and the task store. Build and tests pass with
-zero warnings.
+## Caleb's rulings and the defaults this session took
 
-## Caleb's rulings this session
-
-- Storage: a JSON file in persistent-memory under a root `tasks/` folder.
-  Done; `tasks/README.md` there tells agents the schema and the revision rule.
-- Usage view: he prefers candidate C (burn pace tiles); A shipped because it
-  was built first. **Next session's first job**, page-only.
-- Tasks view: he prefers candidate A (Planner, grouped by progress); B
-  shipped. **Also next session**, page-only on the same message contract.
-  Both candidate pages are in `docs/design/2026-10-17-candidates/`.
-- Wrap-up was called after the weekly reset: no spare-compute work.
+Caleb set the three goals and asked for forks to be named. The defaults
+taken, all overridable: C replaces A (no toggle); a real per-meter history
+rather than the mock's single line; all five Google meters shown; the
+two-layer expiry design (stale display plus the ladder) with the Haiku
+call as the last step; Argon added to the plan-review script as a standing
+reviewer. He did not rule on the `ClaudeUsage` tray app (below).
 
 ## Deploy state
 
-Windows launches `bin\Debug\net8.0-windows\InOutButton.exe` at login. See the
-closing message of the session, or `git log`, for whether the in-place rebuild
-happened; if the running app predates `9a8ca7e`, ship by closing
-the window (no tray icon), `dotnet build -c Debug` in the repo, relaunch.
-Never a cleaning build beside the running exe; verify with
-`dotnet build --artifacts-path <scratch>`.
+The login entry runs `bin\Debug\net8.0-windows\InOutButton.exe`. The
+pre-review build `47a4cb1` was shipped at 17:24 on 2026-10-18 and read all
+three providers live within 15 s of the scan finishing (log lines "usage:
+Anthropic ok, 3 meters", "OpenAI ok, 1 meter", "Google ok, 5 meters").
+Whether the post-review build was shipped is recorded in the closing
+message of the session and in `git log`; if the running app predates the
+post-review commit, close the window (no tray icon), `dotnet build -c
+Debug` in the repo, relaunch. Never a cleaning build beside the running
+exe; verify with `--artifacts-path <scratch>`.
 
 ## Review record
 
-- Plan: Astra, `docs/2026-10-17-usage-and-tasks-tabs-spec.review/20261017-181714/`,
-  triage in the spec's section 7. Four blocking findings, all fixed in the
-  spec before building.
-- Code: Sol 6.1 and Opus 5.5, `.../code-round1/` with `triage.md`. Thirteen
-  findings, eleven fixed, two deferred (O4 nullable reset time, O8 the
-  timeout test's child-process claim).
-- Specimen stubs in persistent-memory `_candidates/`: the reload-before-write
-  rule that still lost updates (plan), and the task store that dropped fields
-  its own README told agents to keep (code).
+- Plan: Astra (99 s) and Argon (349 s, through the new `argon` launcher in
+  persistent-memory's `plan-review.ps1`), raw answers under
+  `docs/2026-10-18-burn-pace-gemini-token-spec.review/`. Nineteen findings
+  triaged in the spec's section 12; Argon read revision 2 and so saw
+  Astra's triage (not independent).
+- Code: Sol 6.1 (medium, 79 s) and Grok 4.7 (low) on the diff
+  `21ade4b..47a4cb1`, raw answers and `triage.md` in `.review/code-round1/`.
+  Three real defects, each found by both: the 30-minute-floor path skipped
+  the live read, a transiently unreadable store could be overwritten by an
+  empty one, and a set executable override fell back to PATH. Fixed with
+  tests in the post-review commit.
+- Specimen stubs in persistent-memory `_candidates/` (2026-10-18): Git
+  Bash rewriting `/usage` into a Windows path; `agy`'s print timeout
+  exiting 0 with status SUCCESS; `Select-Object -First 1` randomising a
+  native command's exit code; the cooldown-kind test that passed with the
+  real path on the wrong kind.
 
 ## Known limitations and debt
 
-- Gemini: nothing read yet. The Gemini CLI stopped serving AI Pro on
-  2026-06-18. Antigravity CLI 1.4.2 was installed at the end of this session
-  (`%LOCALAPPDATA%\agy\bin\agy.exe`, on the user PATH); Caleb's browser
-  sign-in with his personal account is pending. Next session: run
-  `agy -p /usage` once to capture the report's shape, then teach
-  `GeminiUsage` to parse it. The running app only sees `agy` on PATH after a
-  relaunch, when its tile will say "Antigravity CLI found; reading its usage
-  report is not implemented yet". The unofficial Antigravity endpoint stays
-  off the table (Google suspended accounts for third-party use in March 2026).
-- Codex reported only a weekly window and `planType` "prolite" today; the
-  reader labels by duration and assumes nothing.
-- Anthropic error paths have no fake-server tests.
-- No five-clone git merge drill for `tasks.json`; a real conflict surfaces as
-  a failed push for persistent-memory, as for any other file there.
-- The scrubber's 24-character opaque-run rule also redacts GUIDs and long file
-  names inside exception messages. Accepted.
-- TabControl styling is WinForms default. The form opens at 1060x750.
-- The first usage read runs as soon as the tab is first shown. On a
-  saturated machine (100% CPU at the 2026-10-17 deploy, with the repo scan
-  still probing) both readers hit their caps and showed "timed out"; the
-  next scheduled read five minutes later recovered both without a click.
-  Improvement: delay the first read until the scan has finished, or retry
-  once after 30 s when every provider timed out.
+- **The `ClaudeUsage` tray app** (`~/Tools/claudeusagewin`, in HKCU Run)
+  refreshes the Claude token five minutes before expiry without a client
+  id, overwrites `.credentials.json` without a temp-and-rename, drops
+  `refreshTokenExpiresAt`, `rateLimitTier` and `organizationUuid`, writes
+  `subscriptionType` as null, and logs the full tokens to debug output.
+  The usage tab replaces it. Retiring its Run entry is Caleb's call: it
+  is the only writer of that file other than Claude Code.
+- **Whether `claude auth status` refreshes an expired token** is unknown.
+  The ladder logs which step replaced the token ("token refresh: <step>
+  replaced the token"); the first morning's log answers it. If step 1 is
+  enough, step 2 is dead code to delete.
+- **`agy` with a lapsed Google sign-in** in headless mode is untested; it
+  might open a browser. The cap, the job object, and the backoff bound it.
+- **Snapshot waits for all three readers**, so a ladder run (usually 15 s,
+  at most about 150 s) holds the other tiles; the previous tiles show with
+  busy on meanwhile. Per-provider posting is the improvement.
+- **Job assignment race.** A child is assigned to its job just after it
+  starts; a launcher that spawned a descendant and exited within
+  milliseconds would leave it outside. Not the case for `agy` or `codex`.
+- **The real viewport is small**: about 990 by 290 px at the 1060×750
+  launch size. The page is compact and scrolls; a taller launch size or a
+  larger share for the tab row would help every tab.
+- **Nullable reset time (O4)** still drops a meter.
+- **The Tasks tab** is still three lanes (B); Caleb prefers Planner by
+  progress (A), page-only, in `docs/design/2026-10-17-candidates/`.
+- **First window** took about 37 s to appear after the relaunch at deploy;
+  not investigated (first launch of freshly built files is the guess).
 
 ## Settings added
 
-`UsageRefreshMinutes` (5), `CodexExecutable` (override), `TasksFile`
-(override), all hand-edited in `%APPDATA%\InOutButton\settings.json`.
+`ClaudeExecutable`, `AgyExecutable` (both null means discovered on PATH),
+`ClaudeRefreshAuto` (true), hand-edited in
+`%APPDATA%\InOutButton\settings.json`.
 
 ## Routing
 
 Rows for every model that touched this task are in persistent-memory's
 `agent-cooperation/routing-log/log.jsonl` under task id
-`2026-10-17-inout-usage-tasks-tabs`.
+`2026-10-18-inout-burn-pace-gemini-token`.

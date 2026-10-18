@@ -51,12 +51,62 @@ repository and dataset synchronization beyond the installer checks.
 
 ## AI usage and Tasks tabs
 
-The middle of the window has three tabs: **Repos** (the folders, rclone, and repo grid above), **AI usage**, and **Tasks**. The title, the Sign in / Sign out buttons, and the log stay visible on every tab. The two new tabs are local HTML pages from `web\` shown in WebView2 (Microsoft's embedded Edge browser control) and need the Evergreen WebView2 runtime; without it each tab shows a message and the Repos tab works as before. Design and contracts: [docs/2026-10-17-usage-and-tasks-tabs-spec.md](docs/2026-10-17-usage-and-tasks-tabs-spec.md).
+The middle of the window has three tabs: **Repos** (the folders, rclone, and repo grid above), **AI usage**, and **Tasks**. The title, the Sign in / Sign out buttons, and the log stay visible on every tab. The two new tabs are local HTML pages from `web\` shown in WebView2 (Microsoft's embedded Edge browser control) and need the Evergreen WebView2 runtime; without it each tab shows a message and the Repos tab works as before. Design and contracts: [docs/2026-10-17-usage-and-tasks-tabs-spec.md](docs/2026-10-17-usage-and-tasks-tabs-spec.md), and for the burn-pace view, the Antigravity reader, and the token refresh, [docs/2026-10-18-burn-pace-gemini-token-spec.md](docs/2026-10-18-burn-pace-gemini-token-spec.md).
 
-- **AI usage** reads the Claude Code login's usage meters, Codex's rate-limit windows through `codex app-server`, and shows an empty state for Google. It reads on first open, every `UsageRefreshMinutes` while the tab is showing, after each batch action, and on **Refresh**.
+- **AI usage** shows how much of each Anthropic, OpenAI, and Google usage limit is left and how fast it is being spent. See [AI usage tab](#ai-usage-tab).
 - **Tasks** is a three-lane board (Projects, Admin, Misc) saved to `persistent-memory\tasks\tasks.json`, so sign-out commits it with everything else. When no persistent-memory clone is found the board saves to `%APPDATA%\InOutButton\tasks.json` and says so in a banner. Editing is locked while a batch action runs, and the board reloads when it ends.
 
-Settings for these tabs have no controls; edit `settings.json` by hand: `UsageRefreshMinutes` (default 5), `CodexExecutable` (path override; found on `PATH` when unset), and `TasksFile` (path override).
+Settings for these tabs have no controls; edit `settings.json` by hand:
+
+- `UsageRefreshMinutes` (default 5): minutes between reads while the AI usage tab is showing.
+- `CodexExecutable`: path to `codex`. When unset, the app finds it on `PATH`.
+- `ClaudeExecutable`: path to Claude Code's `claude.exe`. When unset, the app finds `claude` on `PATH` and resolves the npm shim to the native `claude.exe`.
+- `AgyExecutable`: path to the Antigravity CLI, `agy`. When unset, the app finds it on `PATH`.
+- `ClaudeRefreshAuto` (default `true`): refresh an expired Claude Code token without a click. Set it to `false` to refresh only from the button.
+- `TasksFile`: path to the task board file, overriding the default.
+
+### AI usage tab
+
+The tab is a burn-pace view. Each provider gets a caption row with its name and plan, followed by one tile per usage meter. A tile shows the meter's severity (normal, warning, or critical) and, in large numbers, the percent left and the time to reset. A provider that reports a weekly meter and no 5-hour meter gets a placeholder tile that says so.
+
+Below the numbers, a chart plots percent used against the fraction of the window that has elapsed. A dotted diagonal marks even pace: the rate that reaches 100% exactly at the reset. Observed history draws as a solid line. Inferred segments draw dashed: the climb from zero to the first reading, and the flat line from the last reading to now. To see the exact numbers, the reset time, and whether usage is above or below even pace, hover over a tile or move keyboard focus to it. The page scrolls when the tiles outgrow the tab.
+
+The tab reads on first open, every `UsageRefreshMinutes` while it is showing, after each batch action, and when you click **Refresh**. If a scan or batch action is running when you first open the tab, the first read waits until it ends. The tab reads three providers:
+
+- Anthropic: the Claude Code login's usage meters, read with the access token in Claude Code's `.credentials.json` file.
+- OpenAI: Codex's rate-limit windows, read through `codex app-server`.
+- Google: five meters in three groups, read with `agy -p /usage --output-format json`. The groups are Gemini Models (weekly and 5-hour), Claude and GPT models (weekly and 5-hour), and Gemini 4 Argon (weekly). The plan label is "Antigravity CLI". The Claude and GPT models group is capacity inside Antigravity, separate from the Anthropic subscription.
+
+### Provider setup
+
+Each provider is read through a command-line tool that is already signed in on this machine. The running app sees a `PATH` change only after you relaunch it.
+
+- Anthropic needs Claude Code signed in. The [Claude Code token refresh](#claude-code-token-refresh) also needs `claude` on `PATH` or set in `ClaudeExecutable`.
+- OpenAI needs `codex` on `PATH` or set in `CodexExecutable`.
+- Google needs `agy` on `PATH` or set in `AgyExecutable`. Sign in once by running `agy` in a terminal. Each read overwrites the CLI's log at `%APPDATA%\InOutButton\agy-usage.log`. The log holds the account email but no token.
+
+### Failed reads and stored readings
+
+The app keeps each provider's last good reading, and the history behind each chart, in `%APPDATA%\InOutButton\usage-store.json`. When a read fails, the provider's caption shows the error and the age of the last good reading. Its tiles show that reading dimmed and dated as stale, for up to seven days. A stale meter whose window has reset since the last read shows `window reset at <time> since the last read` instead of its old numbers. Without a reading from the last seven days, the provider shows one card with the error. At startup the tab shows the stored readings at once, marked `not read yet since the app started`, and then reads live.
+
+When a Google read fails, the app waits 10 minutes before the next try, and an hour once three reads in a row have failed. If `agy` ran but reported no usage, the message is `Antigravity CLI did not report usage; run agy in a terminal to check its sign-in`. To skip the wait after you fix the sign-in, click **Refresh**. Refresh doesn't skip a wait that a provider's server asks for after a rate-limit error.
+
+### Claude Code token refresh
+
+Claude Code's access token lasts eight hours. When the token has expired, or Anthropic rejects it, the app asks Claude Code to refresh it. It runs these steps in order and stops as soon as the token in `.credentials.json` changes:
+
+1. `claude auth status`, which makes no model call.
+2. A request to Haiku for a one-word reply, with tools, MCP (Model Context Protocol) servers, hooks, and transcripts turned off. It takes about 12 seconds and about 1,000 input tokens.
+
+Each step writes a `token refresh:` line to the log. While the token is expired or rejected and not yet replaced, the tab shows the error with a **Refresh via Claude Code** button.
+
+The automatic refresh runs at most once per token and never within 30 minutes of the last run. The button skips the once-per-token limit but not the 30-minute one: a click inside those 30 minutes reads without refreshing and says when the last refresh ran. Set `ClaudeRefreshAuto` to `false` to turn off the automatic refresh and keep the button. The app never writes `.credentials.json`. Only Claude Code does.
+
+### Known limits
+
+- A meter that reports no reset time doesn't appear.
+- The tab updates all three providers together, after the slowest read finishes. A token refresh can hold the other tiles for up to 150 seconds, usually about 15. The tab keeps showing the previous tiles meanwhile.
+- What `agy -p` does when its Google sign-in has lapsed hasn't been tested. It might try to open a browser. Each read is capped at 25 seconds, and the backoff limits how often it runs.
 
 ## Dataset sync (rclone)
 
@@ -108,6 +158,16 @@ Each folder maps deterministically to `<remote>:<RcloneRemoteRoot>/<repo-name>/<
 ```powershell
 dotnet run
 ```
+
+To run the tests:
+
+```powershell
+dotnet test tests/InOutButton.Tests
+```
+
+Two tests call the real `agy` and `claude auth status`. They run only when the environment variable `INOUT_LIVE_TOOLS` is `1` (in PowerShell, `$env:INOUT_LIVE_TOOLS = '1'`).
+
+The copy of the app launched at Windows sign-in locks `bin\Debug`. While it runs, build and test with `--artifacts-path` set to a scratch folder, and never run a cleaning build in place. To ship a change, close the app, run `dotnet build -c Debug`, and relaunch it.
 
 ## Publish
 

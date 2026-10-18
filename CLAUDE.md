@@ -84,24 +84,44 @@ The rules that must survive any later change:
   `innerHTML`.
 - **Usage (`Usage.cs`).** Anthropic: one GET to the OAuth usage endpoint with
   the token from Claude Code's `.credentials.json`, which is read on every
-  call and never written or refreshed; 60 s cache; no retry on 429, honour
+  call and never written; 60 s cache; no retry on 429, honour
   `Retry-After`. OpenAI: `codex app-server` over stdio through
-  `JsonLineProcess`, so the app never touches a Codex token. Gemini: empty
-  state only (the Gemini CLI stopped serving AI Pro on 2026-06-18; the
-  follow-up is parsing `agy -p /usage`). Every external string passes
+  `JsonLineProcess`, so the app never touches a Codex token. Google:
+  `agy -p /usage --output-format json` (the Antigravity CLI) through the
+  same process class; never pass `--disable-slash-commands`, which turns
+  `/usage` into a model prompt. Every external string passes
   `Scrub.Message` before a page or the log sees it. Form1 owns all refresh
   scheduling; a hidden tab never reads.
+- **Added 2026-10-18** (spec and triage:
+  [docs/2026-10-18-burn-pace-gemini-token-spec.md](docs/2026-10-18-burn-pace-gemini-token-spec.md)).
+  The page is the burn-pace view. `UsageStore` keeps
+  `%APPDATA%\InOutButton\usage-store.json`: the last ok reading per provider
+  and a per-meter history keyed by the window's reset time (exact to the
+  second, no tolerance: idle Antigravity buckets move their reset every
+  read). A failed read shows the stored reading as `state: "stale"`, dated;
+  a stale meter past its reset is a ghost tile. When the Claude token is
+  expired or rejected the Anthropic read runs the refresh ladder: `claude
+  auth status`, then a one-word Haiku call with `--tools "" --strict-mcp-config
+  --no-session-persistence --setting-sources ""` so no hook, MCP server, or
+  transcript runs; keyed on the token string, once per token and never
+  within 30 min, steps are waited for and never killed (a kill mid-refresh
+  could strand a rotated refresh token). The app still never writes the
+  credentials file. Cooldowns are hard (a server's `Retry-After`) or soft
+  (the app's own backoff, skipped by Refresh). Every child process sits in a
+  kill-on-close job object (`ChildJob`). Settings: `ClaudeExecutable`,
+  `AgyExecutable`, `ClaudeRefreshAuto`. Two tests run only with
+  `INOUT_LIVE_TOOLS=1` because they call the real `agy` and `claude`.
 - **Tasks (`Tasks.cs`).** `persistent-memory/tasks/tasks.json`, so sign-out
   commits it and other machines pull it. Each task carries `rev`; the store
   always reloads before writing and rejects a stale or resurrecting save
   instead of merging. The page is read-only while any workflow is busy and
   reloads when the workflow ends, so a save cannot land between `git add -A`
   and the commit. Agents may edit the file under `tasks/README.md` there.
-- **Future work.** Caleb prefers the burn-pace usage view (candidate C) and
-  the Planner-by-progress tasks view (candidate A), both in
-  `docs/design/2026-10-17-candidates/`; rings and fuses (A) and three lanes
-  (B) shipped first. Both are page-only changes on the same message
-  contract.
+- **Future work.** The Tasks tab's switch to the Planner-by-progress view
+  (candidate A in `docs/design/2026-10-17-candidates/`) is still open;
+  page-only on the same message contract. Usage: post the snapshot per
+  provider so a slow ladder does not hold the other tiles; the nullable
+  reset time (O4).
 - **Building while the app runs.** The login-launched exe locks
   `bin/Debug`; build and test with
   `--artifacts-path <scratch>` and never a cleaning build in place. Ship by

@@ -277,7 +277,9 @@ driver does.
 ### 5.4 Bounds, cost, and side effects
 
 - Duration: the two steps are waited for at most 60 s and 90 s, so the
-  ladder holds the Anthropic read for at most 150 s. The other providers'
+  ladder holds the Anthropic read for about 150 s at most (finding the
+  executable and draining a finished step's pipes add a few seconds
+  outside those waits). The other providers'
   reads run in parallel and are not held, but the snapshot posts when all
   three readers have finished, so their tiles wait with it; the page shows
   the seeded or previous tiles with busy on meanwhile. The usual cost is
@@ -346,7 +348,12 @@ internal static ProviderUsage Parse(string replyJson, DateTimeOffset now);
   case where a child holding stdout open makes the read wait for the cap.
   This covers the Codex driver too. A browser `agy` might open through an
   already running browser is outside any job; the cap and cooldown bound
-  how often that could happen.
+  how often that could happen. One gap stays open: the child starts before
+  it is assigned, so a launcher that spawns a descendant and exits within
+  the first milliseconds would leave that descendant outside the job.
+  `System.Diagnostics.Process` cannot start a process suspended; closing
+  the gap needs raw `CreateProcess` with a job attribute list, which is
+  not worth it for `agy` and `codex`, neither of which exits that fast.
 - The redirected `agy` log is overwritten on every run and was 19 to 28 KB
   in today's runs; it holds the account email and trace ids and no token
   (checked: the keyring line logs only the expiry). Nothing from it is
@@ -419,6 +426,20 @@ additive fields in section 3.
 - A provider with a weekly meter and no 5-hour meter gets a ghost tile
   "No 5-hour window reported" after its meters, as the mock shows. No
   other absence is invented.
+- Idle meters (0% used and every history point at 0: an untouched window,
+  which Antigravity reports four of; the current reading is always a
+  history point, so "no history" would never match) have nothing to chart
+  and render together
+  as one full-width strip after the provider's tiles: "Untouched:
+  <name> · <window>, …", each with the normal tooltip. A meter that gains
+  usage becomes a tile on the next snapshot. Stale providers keep tiles.
+- The real viewport is small: about 990 by 290 px at the 1060×750 launch
+  size (measured in the app on 2026-10-18). Columns are `minmax(0, 1fr)`,
+  tiles and captions have `min-width: 0`, the chart SVG scales with its
+  tile, and long labels truncate with an ellipsis, so the board never
+  scrolls horizontally. Tiles are compact: one-line header, 20 px
+  figures, a 70 px chart, about 150 px tall. The board still scrolls
+  vertically; two to three screens at the launch size is the target.
 
 ### 7.2 Tile
 
@@ -511,7 +532,8 @@ checked in a browser. The host never loads it.
   deploy-day timeout from the handoff.
 - Startup: construct `UsageStore` from the settings folder and pass it to
   `UsageService`. The service seeds `Last` from the store before any live
-  read: each stored reading under 7 days old becomes a `stale` provider
+  read: each stored reading 7 days old or newer (the same bound as 3.1)
+  becomes a `stale` provider
   with the fixed message "not read yet since the app started" and no
   actions, so the page shows last night's numbers within a second of
   opening the tab, dated. The first live read follows at once (or after

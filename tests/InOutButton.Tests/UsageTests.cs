@@ -360,6 +360,23 @@ public class UsageTests
         Assert.Equal(6.0, meter.UsedPercent);
     }
 
+    // a set CodexExecutable is the only candidate. a cancelled token makes where.exe throw, and the
+    // session cache may hold a real codex, so a null find means the override alone decided
+    [Fact]
+    public async Task AMissingCodexExecutableNeverFallsBackToPath()
+    {
+        var missing = Path.Combine(Path.GetTempPath(), "InOutButton.Tests", Guid.NewGuid().ToString("N"), "codex.exe");
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        Assert.Null(await CodexUsage.FindAsync(missing, cancelled.Token));
+
+        var outcome = await CodexUsage.ReadOutcomeAsync(missing, CancellationToken.None);
+
+        Assert.Equal("unavailable", outcome.Usage.State);
+        Assert.Equal("Codex (codex) not found; CodexExecutable points at a missing file", outcome.Usage.Message);
+    }
+
     // the where.exe find is kept for the session; it must never shadow an override
     [Fact]
     public async Task CodexFindChecksTheOverrideOnEveryCall()
@@ -402,7 +419,7 @@ public class UsageTests
     {
         var launch = new AgyLaunch("agy-not-installed-" + Guid.NewGuid().ToString("N")[..8], []);
 
-        var outcome = await GeminiUsage.ReadOutcomeAsync(launch, TimeSpan.FromSeconds(10), CancellationToken.None);
+        var outcome = await new GeminiUsage().ReadOutcomeAsync(launch, TimeSpan.FromSeconds(10), CancellationToken.None);
 
         var usage = outcome.Usage;
         Assert.Equal("Google", usage.Provider);

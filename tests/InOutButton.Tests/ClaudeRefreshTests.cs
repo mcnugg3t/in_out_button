@@ -11,6 +11,7 @@ public sealed class ClaudeRefreshTests : IDisposable
     // 2025-10-09, long past; 2100-01-01, far off
     private const long PastMs = 1_760_000_000_000;
     private const long FutureMs = 4_102_444_800_000;
+    private const string FakeExe = @"C:\fake\claude.exe";
     private const string ExpiredNotReplaced = "Claude Code token expired; the refresh ladder did not replace it";
     private const string RejectedNotReplaced = "Claude Code token rejected; the refresh ladder did not replace it";
 
@@ -20,7 +21,12 @@ public sealed class ClaudeRefreshTests : IDisposable
 
     private readonly string _folder = Path.Combine(Path.GetTempPath(), "InOutButton.Tests", Guid.NewGuid().ToString("N"));
     private readonly List<ClaudeStep> _steps = [];
+    // the exe each step was started with
+    private readonly List<string> _started = [];
     private readonly List<string> _log = [];
+    // what the fake find returns; null is claude missing
+    private string? _exe = FakeExe;
+    private int _finds;
     private DateTimeOffset _now = new(2026, 10, 19, 7, 0, 0, TimeSpan.Zero);
 
     public ClaudeRefreshTests()
@@ -41,12 +47,20 @@ public sealed class ClaudeRefreshTests : IDisposable
 
     // a fake Claude Code: each step may rewrite the file, as a real refresh would
     private ClaudeRefreshLadder Ladder(Action<ClaudeStep>? effect = null, StepStatus status = StepStatus.Exited)
-        => new((step, _, _) =>
+        => new((_, _) =>
+        {
+            _finds++;
+            return Task.FromResult(_exe);
+        }, Steps(effect, status), () => _now);
+
+    private ClaudeStepRunner Steps(Action<ClaudeStep>? effect = null, StepStatus status = StepStatus.Exited)
+        => (step, exe, _) =>
         {
             _steps.Add(step);
+            _started.Add(exe);
             effect?.Invoke(step);
             return Task.FromResult(new StepResult(status, status == StepStatus.Exited ? 0 : null));
-        }, () => _now);
+        };
 
     private Task<ReaderOutcome> ReadAsync(ClaudeRefreshLadder ladder, FakeEndpoint endpoint, UsageOptions options)
         => AnthropicUsage.ReadOutcomeAsync(new HttpClient(endpoint), CredentialsPath, ladder, options, _log.Add, CancellationToken.None);
@@ -136,8 +150,28 @@ public sealed class ClaudeRefreshTests : IDisposable
         AssertRefreshable(clicked, ExpiredNotReplaced);
     }
 
+    // spec 5.1: inside the floor the endpoint decides, not the local expiresAt
     [Fact]
     public async Task AClickInsideTheFloorReadsWithoutTheLadder()
+    {
+        WriteCredentials(OldToken, PastMs);
+        var ladder = Ladder();
+        var endpoint = new FakeEndpoint(_ => HttpStatusCode.Unauthorized);
+        await ReadAsync(ladder, endpoint, Auto);
+        Assert.Equal(2, _steps.Count);
+        Assert.Empty(endpoint.Tokens);
+
+        _now = _now.AddMinutes(12);
+        var clicked = await ReadAsync(ladder, endpoint, Forced);
+
+        // no step in the click, one live request
+        Assert.Equal(2, _steps.Count);
+        Assert.Equal([OldToken], endpoint.Tokens);
+        AssertRefreshable(clicked, "Claude Code token expired; refresh ladder ran 12 min ago; try again later");
+    }
+
+    [Fact]
+    public async Task AClickInsideTheFloorThatTheEndpointAcceptsIsOk()
     {
         WriteCredentials(OldToken, PastMs);
         var ladder = Ladder();
@@ -147,8 +181,10 @@ public sealed class ClaudeRefreshTests : IDisposable
         _now = _now.AddMinutes(12);
         var clicked = await ReadAsync(ladder, endpoint, Forced);
 
+        Assert.Equal("ok", clicked.Usage.State);
+        Assert.Equal(3, clicked.Usage.Meters.Count);
         Assert.Equal(2, _steps.Count);
-        AssertRefreshable(clicked, "Claude Code token expired; refresh ladder ran 12 min ago; try again later");
+        Assert.Equal([OldToken], endpoint.Tokens);
     }
 
     [Fact]
@@ -171,7 +207,8 @@ public sealed class ClaudeRefreshTests : IDisposable
     public async Task AMissingClaudeSkipsTheLadderAndSpendsNoRun()
     {
         WriteCredentials(OldToken, PastMs);
-        var ladder = Ladder(status: StepStatus.NotFound);
+        _exe = null;
+        var ladder = Ladder();
         var endpoint = new FakeEndpoint(_ => HttpStatusCode.OK);
 
         var first = await ReadAsync(ladder, endpoint, Auto);
@@ -180,8 +217,54 @@ public sealed class ClaudeRefreshTests : IDisposable
         AssertRefreshable(first, "Claude Code (claude) not found; set ClaudeExecutable");
         AssertRefreshable(second, "Claude Code (claude) not found; set ClaudeExecutable");
         // looked for again each time, so installing claude is picked up
-        Assert.Equal([ClaudeStep.AuthStatus, ClaudeStep.AuthStatus], _steps);
+        Assert.Equal(2, _finds);
+        Assert.Empty(_steps);
         Assert.Null(ladder.LastRun);
+    }
+
+    // discovery once per ladder, not once per step (Sol's code review, 2026-10-18)
+    [Fact]
+    public async Task ClaudeIsFoundOncePerLadder()
+    {
+        WriteCredentials(OldToken, PastMs);
+
+        await ReadAsync(Ladder(), new FakeEndpoint(_ => HttpStatusCode.OK), Auto);
+
+        Assert.Equal(1, _finds);
+        Assert.Equal([FakeExe, FakeExe], _started);
+    }
+
+    // spec 5.3: a set ClaudeExecutable is the only candidate. the real find, which returns before where.exe
+    [Theory]
+    [InlineData("missing", "Claude Code (claude) not found; ClaudeExecutable points at a missing file")]
+    [InlineData("claude.cmd", "Claude Code (claude) not found; ClaudeExecutable is not an exe or an npm shim beside claude.exe")]
+    public async Task AClaudeExecutableThatDoesNotResolveNamesTheSetting(string name, string message)
+    {
+        WriteCredentials(OldToken, PastMs);
+        var path = Path.Combine(_folder, name);
+        if (name != "missing")
+        {
+            // a shim with no node_modules beside it
+            File.WriteAllText(path, "");
+        }
+
+        var ladder = new ClaudeRefreshLadder(ClaudeCli.FindAsync, Steps(), () => _now);
+
+        var outcome = await ReadAsync(ladder, new FakeEndpoint(_ => HttpStatusCode.OK), Auto with { ClaudeExecutable = path });
+
+        AssertRefreshable(outcome, message);
+        Assert.Empty(_steps);
+        Assert.Null(ladder.LastRun);
+    }
+
+    // a cancelled token makes where.exe throw, so a null means the override alone decided
+    [Fact]
+    public async Task AMissingClaudeExecutableNeverFallsBackToPath()
+    {
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        Assert.Null(await ClaudeCli.FindAsync(Path.Combine(_folder, "claude.exe"), cancelled.Token));
     }
 
     [Fact]

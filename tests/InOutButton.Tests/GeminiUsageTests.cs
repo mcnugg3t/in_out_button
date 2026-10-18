@@ -194,7 +194,7 @@ public class GeminiUsageTests
     {
         var launch = PowerShell($"[Console]::Out.Write([IO.File]::ReadAllText('{FixturePath}')); exit 0");
 
-        var outcome = await GeminiUsage.ReadOutcomeAsync(launch, TimeSpan.FromSeconds(15), CancellationToken.None);
+        var outcome = await new GeminiUsage().ReadOutcomeAsync(launch, TimeSpan.FromSeconds(15), CancellationToken.None);
 
         Assert.Equal("ok", outcome.Usage.State);
         Assert.Equal(5, outcome.Usage.Meters.Count);
@@ -212,14 +212,14 @@ public class GeminiUsageTests
         var launch = PowerShell("Start-Sleep 60");
         var clock = Stopwatch.StartNew();
 
-        var outcome = await GeminiUsage.ReadOutcomeAsync(launch, TimeSpan.FromSeconds(2), CancellationToken.None);
+        var outcome = await new GeminiUsage().ReadOutcomeAsync(launch, TimeSpan.FromSeconds(2), CancellationToken.None);
 
         clock.Stop();
         Assert.True(clock.Elapsed < TimeSpan.FromSeconds(5), $"took {clock.Elapsed.TotalSeconds:0.0} s");
         Assert.Equal("unavailable", outcome.Usage.State);
         Assert.Equal("Antigravity CLI timed out after 2 s", outcome.Usage.Message);
-        // soft backoff, 10 min or 60 by the run of failures before it
-        Assert.Contains(outcome.Cooldown, new TimeSpan?[] { TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(60) });
+        // a new instance's first failure: the soft 10 min
+        Assert.Equal(TimeSpan.FromMinutes(10), outcome.Cooldown);
         Assert.Equal(CooldownKind.Soft, outcome.CooldownKind);
         Assert.NotNull(outcome.ProcessId);
         Assert.False(IsAlive(outcome.ProcessId.Value, "powershell"));
@@ -235,7 +235,7 @@ public class GeminiUsageTests
         var stderr = marker ? "[Console]::Error.WriteLine('[agy] print timeout after 20s with turn in progress; returning partial output'); " : "";
         var launch = PowerShell($"{stderr}[Console]::Out.Write('{envelope}'); exit 0");
 
-        var outcome = await GeminiUsage.ReadOutcomeAsync(launch, TimeSpan.FromSeconds(15), CancellationToken.None);
+        var outcome = await new GeminiUsage().ReadOutcomeAsync(launch, TimeSpan.FromSeconds(15), CancellationToken.None);
 
         Assert.Equal("unavailable", outcome.Usage.State);
         Assert.Equal(message, outcome.Usage.Message);
@@ -257,7 +257,7 @@ public class GeminiUsageTests
             var line = $"ping -n 3 127.0.0.1 >nul & start /b powershell -NoProfile -Command $PID^|Out-File -Encoding ascii {pidFile};Start-Sleep 60 & echo started";
             var launch = new AgyLaunch("cmd.exe", ["/c", line]);
 
-            var outcome = await GeminiUsage.ReadOutcomeAsync(launch, TimeSpan.FromSeconds(8), CancellationToken.None);
+            var outcome = await new GeminiUsage().ReadOutcomeAsync(launch, TimeSpan.FromSeconds(8), CancellationToken.None);
 
             Assert.Equal("Antigravity CLI timed out after 8 s", outcome.Usage.Message);
             Assert.True(File.Exists(pidFile), "the grandchild never wrote its pid");
@@ -290,6 +290,89 @@ public class GeminiUsageTests
         Assert.Equal(TimeSpan.FromMinutes(10), GeminiUsage.Backoff(2));
         Assert.Equal(TimeSpan.FromMinutes(60), GeminiUsage.Backoff(3));
         Assert.Equal(TimeSpan.FromMinutes(60), GeminiUsage.Backoff(9));
+    }
+
+    // spec 6.1 through the driver. the count lives on the instance, so a new one starts at zero
+    [Fact]
+    public async Task FailuresInARowBackOffTenTenSixtyAndASuccessStartsOver()
+    {
+        var gemini = new GeminiUsage();
+        var failing = PowerShell("[Console]::Out.Write('agy: not signed in'); exit 1");
+        var succeeding = PowerShell($"[Console]::Out.Write([IO.File]::ReadAllText('{FixturePath}')); exit 0");
+
+        async Task<ReaderOutcome> Read(AgyLaunch launch) => await gemini.ReadOutcomeAsync(launch, TimeSpan.FromSeconds(15), CancellationToken.None);
+
+        var first = await Read(failing);
+        Assert.Equal(DidNotReport, first.Usage.Message);
+        Assert.Equal(TimeSpan.FromMinutes(10), first.Cooldown);
+        Assert.Equal(TimeSpan.FromMinutes(10), (await Read(failing)).Cooldown);
+        Assert.Equal(TimeSpan.FromMinutes(60), (await Read(failing)).Cooldown);
+
+        var ok = await Read(succeeding);
+        Assert.Equal("ok", ok.Usage.State);
+        Assert.Null(ok.Cooldown);
+
+        Assert.Equal(TimeSpan.FromMinutes(10), (await Read(failing)).Cooldown);
+    }
+
+    // the stand-ins above comment out what the driver appends, so the argv is pinned here (spec 6.1)
+    [Fact]
+    public void TheDriverAppendsTheUsageArgumentsAfterTheLaunchsOwn()
+    {
+        const string log = @"C:\Users\someone\AppData\Roaming\InOutButton\agy-usage.log";
+
+        var bare = GeminiUsage.Arguments(new AgyLaunch(@"C:\tools\agy.exe", []), log);
+        var led = GeminiUsage.Arguments(new AgyLaunch("node.exe", ["agy.js"]), log);
+
+        Assert.Equal(["-p", "/usage", "--output-format", "json", "--print-timeout", "20s", "--log-file", log], bare);
+        Assert.Equal(["agy.js", "-p", "/usage", "--output-format", "json", "--print-timeout", "20s", "--log-file", log], led);
+        Assert.DoesNotContain("--disable-slash-commands", bare);
+    }
+
+    // and what a child actually receives: a script run with -File gets the driver's arguments as $args
+    [Fact]
+    public async Task AStandInReceivesExactlyTheUsageArguments()
+    {
+        var folder = Path.Combine(Path.GetTempPath(), "InOutButton.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(folder);
+        try
+        {
+            var argsFile = Path.Combine(folder, "args.txt");
+            var script = Path.Combine(folder, "agy.ps1");
+            File.WriteAllText(script, $"[IO.File]::WriteAllLines('{argsFile}', [string[]]$args)\n[Console]::Out.Write([IO.File]::ReadAllText('{FixturePath}'))\nexit 0\n");
+            var launch = new AgyLaunch("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script]);
+
+            var outcome = await new GeminiUsage().ReadOutcomeAsync(launch, TimeSpan.FromSeconds(15), CancellationToken.None);
+
+            Assert.Equal("ok", outcome.Usage.State);
+            Assert.Equal(["-p", "/usage", "--output-format", "json", "--print-timeout", "20s", "--log-file", GeminiUsage.LogPath],
+                File.ReadAllLines(argsFile));
+        }
+        finally
+        {
+            Directory.Delete(folder, recursive: true);
+        }
+    }
+
+    // spec 6.1: a set AgyExecutable is the only candidate. a cancelled token makes where.exe throw,
+    // so a null find means the override alone decided
+    [Fact]
+    public async Task AMissingAgyExecutableIsNotFoundWithoutLookingOnPath()
+    {
+        var missing = Path.Combine(Path.GetTempPath(), "InOutButton.Tests", Guid.NewGuid().ToString("N"), "agy.exe");
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        Assert.Null(await new GeminiUsage().FindAsync(missing, cancelled.Token));
+
+        var outcome = await new GeminiUsage().ReadOutcomeAsync(missing, CancellationToken.None);
+
+        Assert.Equal("unavailable", outcome.Usage.State);
+        Assert.Equal("Antigravity CLI (agy) not found; AgyExecutable points at a missing file", outcome.Usage.Message);
+        Assert.Null(outcome.Usage.Detail);
+        Assert.Equal(["gemini-usage", "antigravity-setup"], outcome.Usage.Actions.Select(a => a.Id));
+        // the empty state, not a failure: no backoff
+        Assert.Null(outcome.Cooldown);
     }
 
     private static bool IsAlive(int pid, string name)
